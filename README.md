@@ -19,12 +19,17 @@ AI4PumpRoom/
 
 ## 快速开始
 
+本项目使用 [uv](https://docs.astral.sh/uv/) 管理 Python 环境与依赖。
+
 ```bash
-# 安装依赖
-pip install -e ".[dev]"
+# 安装依赖（自动创建虚拟环境）
+uv sync
 
 # 运行测试
-pytest
+uv run pytest
+
+# 代码检查
+uv run ruff check .
 ```
 
 ## 许可证
