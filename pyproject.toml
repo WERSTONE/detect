@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "ai4pumproom"
 version = "0.1.0"
-description = "AI-driven intelligent pump room management system"
+description = "AI-driven intelligent pump room monitoring system"
 readme = "README.md"
 requires-python = ">=3.10"
 license = {text = "TBD"}
