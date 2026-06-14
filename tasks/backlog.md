@@ -1,3 +1,1 @@
-- TASK-20260609-001: 搭建项目骨架结构（目录、pyproject.toml、初始模块）
-- TASK-20260609-002: 在英伟达GPU上跑通YOLOv8和YOLOv8-pose（截止 2026-06-16）
-- TASK-20260609-003: 搞清楚YOLOv8和YOLOv8-pose是否共用backbone（截止 2026-06-16）
+（当前无未开始任务）

@@ -1,0 +1,115 @@
+# Vigil 训练配置
+
+# ── 模型 (name 对应 registry 注册名, kwargs 透传给模型工厂) ──
+model:
+  name: "vigil_v2"
+  kwargs:
+    backbone_w: 1.5        # larger v2 backbone for stronger pose/attribute features
+    neck_ch: 320           # wider neck, about 16M parameters
+    w_box: 7.5
+    w_cls: 3.0
+    w_dfl: 5.0
+    w_kpt: 6.0
+    w_smoke: 5.0           # 10→5, 小数据集降低损失权重
+    w_helm: 5.0            # 10→5, 同上
+
+# ── 训练超参数 ──
+training:
+  device: "cuda"
+  batch_size: 16
+  val_ratio: 0.2           # 验证集比例 (0.3→0.2, 保留更多训练数据)
+  grad_clip: 20.0          # 梯度裁剪
+  log_interval: 100         # 多少 batch 输出一次训练日志
+  val_interval:  3         # 多少 epoch 验证一次
+  save_interval: 5        # 多少 epoch 存一次 checkpoint
+  save_best_by: "loss"     # "loss" 或 "score"; 选择 "score" 时必须设置 map.enabled: true
+
+# ── AMP 混合精度 (不影响 resume) ──
+amp:
+  enabled: true             # 是否启用自动混合精度
+  dtype: "bfloat16"          # "float16" 或 "bfloat16" 
+
+# ── cuDNN 优化 ──
+cudnn:
+  benchmark: true           # 自动搜索最优卷积算法 
+
+# ── DataLoader 优化 ──
+dataloader:
+  num_workers: 8           # 子进程数 (5 数据集 × 2 < 默认 fd 上限)
+  pin_memory: true          # 锁页内存 → GPU 传输更快
+  persistent_workers: true  # 复用子进程, 避免每 epoch 重启 (num_workers>0 时有效)
+  prefetch_factor: 2
+
+# ── TensorBoard ──
+tensorboard:
+  enabled: true            # 是否启用
+  log_dir: "logs/train_logs"  # 日志保存目录
+
+# ── 数据增强 ──
+augmentation:
+  hsv:
+    enabled: true
+    hgain: 0.015
+    sgain: 0.7
+    vgain: 0.4
+  flip:
+    enabled: true
+    prob: 0.5
+  mosaic:
+    enabled: true
+    prob: 0.5              # 0.2→0.5, 更强的 mosaic 正则化
+
+# ── mAP 验证 ──
+map:
+  enabled: false             # 是否在验证时计算 mAP@0.5
+  val_samples: 0          # 每次验证采样的图片数 (越大越精确也越慢, 0=全部)
+
+# ── COCO person/pose 预训练阶段 ──
+coco_pose_pretrain:
+  epochs: 300
+  datasets:
+    coco_person_pose: {path: "data/processed/coco_person_pose"}
+  freeze: []
+  # 这里的 w_helm/w_smoke 是 loss 权重，不是标签取值。
+  # helmet 标签仍然是 0=戴帽, 1=未戴帽。
+  model_kwargs:
+    cls_weights: [1.0, 0.0, 0.0]  # COCO 阶段只监督 person 分类，不压低 fire/water 通道
+    w_helm: 0.0
+    w_smoke: 0.0
+  optimizer:
+    lr: 0.001
+    weight_decay: 0.0005
+    warmup_epochs: 5
+  pretrained: null
+
+# ── 多任务预训练阶段 ──
+pretrain:
+  epochs: 250
+  datasets:
+    person:     {path: "data/processed/person"}
+    helmet:     {path: "data/processed/helmet"}
+    fire_smoke: {path: "data/processed/fire_smoke"}
+    smoking:    {path: "data/processed/smoking", weight: 1.5}   # weight 3→1.5, 减缓小数据集过拟合
+    water_leak: {path: "data/processed/water_leak"}
+  freeze: []
+  optimizer:
+    lr: 0.001             # 0.0015→0.0008, 降低学习率防过拟合
+    weight_decay: 0.0005  # 0.0001→0.0005, 增强 L2 正则化
+    warmup_epochs: 5       # 3→5, 更平滑的预热
+  pretrained: null         # 默认自动接 checkpoints/{model_name}/coco_pose_pretrain_best.pt
+
+# ── 微调阶段 ──
+finetune:
+  epochs: 60
+  datasets:
+    person:     {path: "data/processed/person"}
+    helmet:     {path: "data/processed/helmet"}
+    fire_smoke: {path: "data/processed/fire_smoke"}
+    smoking:    {path: "data/processed/smoking", weight: 1.5}
+    water_leak: {path: "data/processed/water_leak"}
+  freeze: []
+  optimizer:
+    lr: 0.0002
+    weight_decay: 0.0005
+    warmup_epochs: 2
+  pretrained: null         # 默认自动接 checkpoints/{model_name}/pretrain_best.pt

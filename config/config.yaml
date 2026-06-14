@@ -1,0 +1,37 @@
+# Vigil inference config
+
+# Model architecture must match the checkpoint used for inference.
+# Keep backbone_w and neck_ch aligned with config/train.yaml model.kwargs.
+model:
+  name: "vigil_v2"
+  kwargs:
+    backbone_w: 1.5
+    neck_ch: 320
+
+# ── 推理配置 ──
+inference:
+  device: "cuda"
+  conf_threshold_person: 0.8
+  conf_threshold_anomaly: 0.8
+  iou_threshold: 0.5
+# ── 后处理参数 ──
+postprocess:
+  roi_zones: []
+  boundary_lines: []
+  fall_drop_ratio: 0.15
+  fall_duration: 5.0
+  wave_amplitude: 0.08
+  wave_frequency: 1.5
+  wave_duration: 2.0
+  fire_smoke_smooth: 3
+  water_leak_confirm: 10
+
+# ── 管道配置 ──
+pipeline:
+  source: "rtsp://"
+  fps: 15
+  buffer_size: 30
+
+# ── 日志 ──
+logging:
+  level: "INFO"
