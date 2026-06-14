@@ -1,0 +1,4 @@
+path: "D:\\Vigil\\data\\processed\\fire_smoke"
+train: images
+val: images
+names: {"0": "person", "1": "fire"}

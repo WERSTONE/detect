@@ -1,0 +1,4 @@
+path: "D:\\Vigil\\data\\processed\\helmet"
+train: images
+val: images
+names: {"0": "person"}

@@ -1,0 +1,8 @@
+{
+  "source": "COCO 2017 person_keypoints",
+  "split": "train2017",
+  "max_images": 8000,
+  "written": 8000,
+  "min_visible_kpts": 8,
+  "max_persons_per_image": 6
+}
