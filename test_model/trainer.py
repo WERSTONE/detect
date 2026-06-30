@@ -44,7 +44,8 @@ class Trainer:
                  warmup_epochs=3, grad_clip=10.0,
                  log_interval=20, save_interval=20, val_interval=5,
                  save_dir='checkpoints', use_amp=True,
-                 ema_decay=0.9999, save_best_by='loss'):
+                 ema_decay=0.9999, save_best_by='loss',
+                 use_tensorboard=False):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.grad_clip = grad_clip
@@ -53,6 +54,14 @@ class Trainer:
         self.val_interval = val_interval
         self.save_dir = Path(save_dir)
         self.save_dir.mkdir(parents=True, exist_ok=True)
+
+        # TensorBoard
+        self.writer = None
+        if use_tensorboard:
+            from torch.utils.tensorboard import SummaryWriter
+            tb_dir = self.save_dir / 'tensorboard'
+            tb_dir.mkdir(parents=True, exist_ok=True)
+            self.writer = SummaryWriter(log_dir=str(tb_dir))
 
         # Fused SGD for ~20% faster optimizer step (CUDA only)
         optim_kw = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
@@ -198,6 +207,10 @@ class Trainer:
                 parts = [f"{k}={running[k] / self.log_interval:.4f}" for k in sorted(running)]
                 parts.append(f"lr={lr:.2e}")
                 print(f"  [{step}/{n_batches} {pct:.0f}%] " + " ".join(parts))
+                if self.writer:
+                    for k in running:
+                        self.writer.add_scalar(f'train/{k}', running[k] / self.log_interval, self.global_step)
+                    self.writer.add_scalar('train/lr', lr, self.global_step)
                 running.clear()
 
         for k in metrics:
@@ -314,6 +327,13 @@ class Trainer:
 
             print(log)
 
+            if self.writer:
+                for k, v in train_m.items():
+                    self.writer.add_scalar(f'epoch/train_{k}', v, epoch)
+                if do_val:
+                    for k, v in val_m.items():
+                        self.writer.add_scalar(f'epoch/{k}', v, epoch)
+
             if (epoch + 1) % self.save_interval == 0:
                 self.save(self.save_dir / f"{save_prefix}_epoch{epoch + 1}.pt")
 
@@ -321,3 +341,5 @@ class Trainer:
         self.save(self.save_dir / f"{save_prefix}_last.pt")
         print(f"\nBest val_loss: {self.best_metric:.4f}")
         print(f"Checkpoints saved to: {self.save_dir}")
+        if self.writer:
+            self.writer.close()
