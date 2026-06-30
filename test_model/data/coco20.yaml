@@ -1,0 +1,36 @@
+# COCO 20-class subset configuration
+
+path: /data/coco2017
+train: images/train2017
+val: images/val2017
+test: images/val2017  # test2017 has no public labels, use val for test
+
+# Number of classes
+nc: 20
+
+# Class names
+names:
+  0: person
+  1: bicycle
+  2: car
+  3: motorcycle
+  4: bus
+  5: truck
+  6: dog
+  7: cat
+  8: horse
+  9: bird
+  10: cow
+  11: sheep
+  12: chair
+  13: dining table
+  14: laptop
+  15: backpack
+  16: sports ball
+  17: bottle
+  18: cup
+  19: cell phone
+
+# Keypoints (only for person class)
+kpt_shape: [17, 3]
+flip_idx: [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
