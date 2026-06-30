@@ -1,4 +1,0 @@
-path: "D:\\Vigil\\data\\processed\\water_leak"
-train: images
-val: images
-names: {"0": "person", "2": "water"}
