@@ -184,6 +184,7 @@ def main():
         use_amp=(not opts['no_amp']) and device == 'cuda',
         ema_decay=t_cfg.get('ema_decay', 0.9999),
         save_best_by=t_cfg.get('save_best_by', 'loss'),
+        use_tensorboard=t_cfg.get('tensorboard', True),
     )
 
     if resume:
