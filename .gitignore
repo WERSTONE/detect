@@ -42,3 +42,4 @@ outputs/
 outputs_vis_preview*.jpg
 run*/
 yolo_cpu_demo/runs/
+data/
