@@ -1,0 +1,95 @@
+# Multi-Head Verification Training Config
+# All training parameters can be adjusted here.
+#
+# Usage:
+#   uv run python test_model/scripts/run_train.py --config test_model/config.yaml
+#   uv run python test_model/scripts/run_train.py --config test_model/config.yaml --model dual_head --epochs 100
+
+# ---- Model ----
+model: dual_head        # dual_head | unified_head | dual_neck | attn_dual | bifpn_dual
+num_classes: 20         # total classes (including person)
+num_det_classes: 19     # non-person detection classes (20 - 1 person)
+num_kpts: 17            # COCO keypoints
+reg_max: 16             # DFL max bin
+
+# ---- Data ----
+data:
+  # AutoDL: /root/autodl-tmp/coco2017 (fast SSD)
+  # Local:   /data/coco2017
+  root: /root/autodl-tmp/coco2017
+  train_img: images/train2017
+  train_label: labels/train2017
+  val_img: images/val2017
+  val_label: labels/val2017
+  input_size: 640
+
+# ---- Training ----
+training:
+  epochs: 300
+  batch_size: 24            # 24GB GPU: 24 works well with AMP, ~14-16GB VRAM usage
+  workers: 8
+
+  # Optimizer (SGD matches YOLOv8 official recipe)
+  optimizer: sgd           # sgd | adamw
+  lr0: 0.01                # initial learning rate
+  lrf: 0.01                # final LR = lr0 * lrf = 1e-4
+  momentum: 0.937
+  weight_decay: 0.0005     # 5e-4
+  nesterov: true
+
+  # LR schedule
+  warmup_epochs: 3
+  cos_lr: true             # cosine annealing
+
+  # Regularization
+  grad_clip: 10.0          # max gradient norm (0 = disabled)
+  ema_decay: 0.9999        # EMA decay (0 = disabled)
+
+  # Mixed precision
+  amp: true
+
+  # Validation & checkpoint
+  val_interval: 5          # validate every N epochs
+  save_interval: 50        # save intermediate checkpoint every N epochs
+  save_best_by: loss       # loss | score
+  # AutoDL: /root/autodl-fs/checkpoints (persistent disk)
+  # Local:  checkpoints
+  save_dir: /root/autodl-fs/checkpoints
+
+  # Mosaic augmentation
+  close_mosaic_epochs: 10  # disable mosaic for last N epochs
+  no_mosaic: false         # completely disable mosaic
+
+# ---- Loss Weights ----
+loss:
+  w_box: 7.5               # CIoU box loss
+  w_cls: 0.5               # classification loss (Focal BCE)
+  w_dfl: 1.5               # DFL distribution loss
+  w_pose: 12.0             # keypoint OKS loss (person only)
+  w_kobj: 1.0              # keypoint visibility loss
+
+# ---- Augmentation ----
+augmentation:
+  hsv_h: 0.015             # hue
+  hsv_s: 0.7               # saturation
+  hsv_v: 0.4               # value
+  flip_lr: 0.5             # horizontal flip probability
+  scale: 0.5               # scale
+  translate: 0.1           # translation
+
+# ---- Evaluation ----
+eval:
+  auto_after_train: true   # automatically evaluate after training
+  checkpoints:             # which checkpoints to evaluate
+    - last
+    - best
+  score_thresh: 0.01       # NMS score threshold
+  iou_thresh: 0.6          # NMS IoU threshold
+  batch_size: 16
+
+# ---- Device ----
+device: cuda               # cuda | cpu
+gpu_id: 0                  # GPU index
+
+# ---- Debug ----
+debug: false               # quick smoke test (3 epochs, no val)
