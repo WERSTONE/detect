@@ -1,0 +1,30 @@
+{
+  "permissions": {
+    "allow": [
+      "WebSearch",
+      "WebFetch(domain:docs.ultralytics.com)",
+      "WebFetch(domain:raw.githubusercontent.com)",
+      "WebFetch(domain:github.com)",
+      "Bash(python -c ' *)",
+      "Bash(python -m test_model.train --model dual_head --data _smoke_test_data --epochs 3 --batch 2 --device cpu --workers 0 --no-mosaic --no-amp --save-dir _smoke_test_ckpt)",
+      "Bash(python -m test_model.eval --model dual_head --weights _smoke_test_ckpt/dual_head/dual_head_last.pt --data _smoke_test_data --device cpu --batch 2)",
+      "Bash(uv run python -c ' *)",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('test_model/data/prepare_coco20.py', doraise=True\\); print\\('Syntax OK'\\)\")",
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)",
+      "Bash(git push *)",
+      "Bash(git pull *)",
+      "Bash(git stash *)",
+      "Bash(du -sh data/processed/)",
+      "Bash(grep -n \"data\" .gitignore)",
+      "Bash(git rm *)",
+      "Bash(git remote *)",
+      "Bash(git branch *)",
+      "Bash(git rev-list *)",
+      "Bash(git filter-branch *)",
+      "Bash(git count-objects *)",
+      "Bash(git reflog *)",
+      "Bash(git gc *)"
+    ]
+  }
+}
