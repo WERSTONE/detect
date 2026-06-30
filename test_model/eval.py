@@ -18,7 +18,12 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
-from tqdm import tqdm
+
+try:
+    from tqdm import tqdm
+except ImportError:
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 
 def compute_iou(box1, box2):
@@ -86,19 +91,17 @@ def compute_ap_by_class(predictions, ground_truths, iou_thresh=0.5):
                 continue
 
             gt_boxes_cls = gt_boxes_all[mask]
-            local_to_global = np.where(mask)[0]
             ious = compute_iou(np.array(det_box), gt_boxes_cls)
 
             best_iou, best_local = 0.0, -1
             for li in range(len(gt_boxes_cls)):
-                gi = local_to_global[li]
-                if not gt_matched[img_idx][gi] and ious[li] > best_iou:
+                if not gt_matched[img_idx][li] and ious[li] > best_iou:
                     best_iou = float(ious[li])
                     best_local = li
 
             if best_iou >= iou_thresh:
                 tp[det_idx] = 1
-                gt_matched[img_idx][local_to_global[best_local]] = True
+                gt_matched[img_idx][best_local] = True
             else:
                 fp[det_idx] = 1
 
@@ -197,7 +200,6 @@ def compute_pose_ap(predictions, ground_truths):
 
         gt_boxes_person = gt['boxes'][person_mask]
         gt_kpts_person = gt['kpts'][person_mask]
-        local_to_global = np.where(person_mask)[0]
 
         # Compute OKS
         oks = compute_pose_oks(
@@ -209,14 +211,13 @@ def compute_pose_ap(predictions, ground_truths):
         # Find best unmatched GT
         best_oks, best_local = 0.0, -1
         for li in range(len(gt_boxes_person)):
-            gi = local_to_global[li]
-            if not gt_matched[img_idx][gi] and oks[li] > best_oks:
+            if not gt_matched[img_idx][li] and oks[li] > best_oks:
                 best_oks = float(oks[li])
                 best_local = li
 
         if best_oks >= oks_thresh:
             tp[det_idx] = 1
-            gt_matched[img_idx][local_to_global[best_local]] = True
+            gt_matched[img_idx][best_local] = True
         else:
             fp[det_idx] = 1
 
@@ -231,7 +232,7 @@ def compute_pose_ap(predictions, ground_truths):
     return float(ap)
 
 
-def evaluate(model, dataloader, device='cuda'):
+def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6):
     """Run inference and collect predictions + ground truths."""
     model.eval()
     model.to(device)
@@ -244,7 +245,8 @@ def evaluate(model, dataloader, device='cuda'):
             images = batch['image'].to(device)
 
             # Forward pass
-            predictions = model.predict_val(images, score_thresh=0.01, iou_thresh=0.6)
+            predictions = model.predict_val(
+                images, score_thresh=score_thresh, iou_thresh=iou_thresh)
 
             for i in range(len(images)):
                 pred = predictions[i]
@@ -322,41 +324,94 @@ def compute_all_metrics(all_preds, all_gts):
 
 def main():
     p = argparse.ArgumentParser()
+    p.add_argument('--config', type=str, default=None, help='Training config path')
     p.add_argument('--weights', type=str, required=True, help='Model checkpoint path')
     p.add_argument('--model', type=str, required=True,
                    choices=['dual_head', 'unified_head', 'dual_neck', 'attn_dual', 'bifpn_dual'])
     p.add_argument('--data', type=str, required=True, help='Dataset directory')
     p.add_argument('--device', type=str, default='cuda')
-    p.add_argument('--batch', type=int, default=16)
-    p.add_argument('--workers', type=int, default=4)
+    p.add_argument('--batch', type=int, default=None)
+    p.add_argument('--workers', type=int, default=None)
+    p.add_argument('--img-dir', type=str, default=None, help='Validation image directory under data root')
+    p.add_argument('--label-dir', type=str, default=None, help='Validation label directory under data root')
+    p.add_argument('--input-size', type=int, default=None, help='Evaluation input size')
+    p.add_argument('--class-id-format', type=str, default=None,
+                   choices=['yolo80', 'coco', 'auto'],
+                   help='Label class id format')
+    p.add_argument('--score-thresh', type=float, default=None, help='Prediction score threshold')
+    p.add_argument('--iou-thresh', type=float, default=None, help='NMS IoU threshold')
     p.add_argument('--output', type=str, default=None, help='JSON output path')
     args = p.parse_args()
 
     from test_model.models import create_model
     from test_model.dataset import create_dataloader
 
+    cfg = {}
+    if args.config:
+        config_path = Path(args.config)
+        if config_path.exists():
+            with open(config_path, encoding='utf-8') as f:
+                cfg = yaml.safe_load(f) or {}
+
+    d_cfg = cfg.get('data', {})
+    e_cfg = cfg.get('eval', {})
+
     # Load model
-    model = create_model(args.model)
+    model_kwargs = {
+        'num_kpts': cfg.get('num_kpts', 17),
+        'reg_max': cfg.get('reg_max', 16),
+    }
+    if args.model == 'unified_head':
+        model_kwargs['num_classes'] = cfg.get('num_classes', 20)
+    else:
+        model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 19)
+    model = create_model(args.model, **model_kwargs)
     ckpt = torch.load(args.weights, map_location='cpu', weights_only=False)
     model.load_state_dict(ckpt['model_state_dict'])
     print(f"Loaded checkpoint: {args.weights}")
     print(f"Model params: {model.num_params / 1e6:.2f}M")
 
     # Create dataloader
+    data_root = Path(args.data)
+    img_dir = args.img_dir
+    if img_dir is None:
+        img_dir = d_cfg.get(
+            'val_img',
+            'images/val2017' if (data_root / 'images/val2017').exists() else 'val2017')
+    label_dir = args.label_dir
+    if label_dir is None:
+        label_dir = d_cfg.get('val_label', 'labels/val2017')
+
+    batch = args.batch or e_cfg.get('batch_size', 16)
+    workers = args.workers if args.workers is not None else cfg.get('training', {}).get('workers', 4)
+    input_size = args.input_size or d_cfg.get('input_size', 640)
+    class_id_format = args.class_id_format or d_cfg.get('class_id_format', 'yolo80')
+    score_thresh = args.score_thresh if args.score_thresh is not None else e_cfg.get('score_thresh', 0.01)
+    iou_thresh = args.iou_thresh if args.iou_thresh is not None else e_cfg.get('iou_thresh', 0.6)
+
+    device = args.device
+    if device == 'cuda' and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        device = 'cpu'
+
     loader = create_dataloader(
-        data_dir=Path(args.data),
-        img_dir='images/val2017',
-        label_dir='labels/val2017',
-        batch_size=args.batch,
+        data_dir=data_root,
+        img_dir=img_dir,
+        label_dir=label_dir,
+        input_size=input_size,
+        batch_size=batch,
         use_mosaic=False,
         augment=False,
         shuffle=False,
-        num_workers=args.workers,
+        num_workers=workers,
+        class_id_format=class_id_format,
     )
-    print(f"Eval samples: {len(loader.dataset)}")
+    print(f"Eval samples: {len(loader.dataset)} | input_size={input_size} | "
+          f"class_id_format={class_id_format}")
 
     # Evaluate
-    all_preds, all_gts = evaluate(model, loader, args.device)
+    all_preds, all_gts = evaluate(
+        model, loader, device, score_thresh=score_thresh, iou_thresh=iou_thresh)
     metrics = compute_all_metrics(all_preds, all_gts)
 
     # Report

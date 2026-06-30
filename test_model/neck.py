@@ -110,7 +110,7 @@ class BiFPN(nn.Module):
 
         self.w_p4_bu = nn.Parameter(torch.ones(3))
         self.p4_out_conv = C2f(self.out_ch, self.out_ch, n=_n(1), shortcut=False)
-        self.w_p5_bu = nn.Parameter(torch.ones(3))
+        self.w_p5_bu = nn.Parameter(torch.ones(2))
         self.p5_out_conv = C2f(self.out_ch, self.out_ch, n=_n(1), shortcut=False)
 
         self.out_channels = [self.out_ch] * 3
@@ -142,7 +142,7 @@ class BiFPN(nn.Module):
         p4_out = self.p4_out_conv(p4_out)
 
         p4_d = F.avg_pool2d(p4_out, 2, 2)
-        p5_out = self._fuse(self.w_p5_bu, p5, p5, p4_d)
+        p5_out = self._fuse(self.w_p5_bu, p5, p4_d)
         p5_out = self.p5_out_conv(p5_out)
 
         return [p3_out, p4_out, p5_out]

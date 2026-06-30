@@ -44,10 +44,15 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=None)
     p.add_argument('--batch', type=int, default=None)
     p.add_argument('--lr', type=float, default=None)
+    p.add_argument('--optimizer', type=str, default=None, choices=['sgd', 'adamw'])
     p.add_argument('--device', type=str, default=None)
     p.add_argument('--gpu-id', type=int, default=None)
     p.add_argument('--save-dir', type=str, default=None)
     p.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    p.add_argument('--no-mosaic', action='store_true', default=None,
+                   help='Disable mosaic augmentation')
+    p.add_argument('--no-amp', action='store_true', default=None,
+                   help='Disable AMP mixed precision')
     p.add_argument('--debug', action='store_true', default=None,
                    help='Quick smoke test (overrides config)')
     return p.parse_args()
@@ -74,6 +79,8 @@ def load_config(args):
         overrides.setdefault('training', {})['batch_size'] = args.batch
     if args.lr is not None:
         overrides.setdefault('training', {})['lr0'] = args.lr
+    if args.optimizer is not None:
+        overrides.setdefault('training', {})['optimizer'] = args.optimizer
     if args.device is not None:
         cfg['device'] = args.device
     if args.gpu_id is not None:
@@ -82,6 +89,10 @@ def load_config(args):
         overrides.setdefault('training', {})['save_dir'] = args.save_dir
     if args.debug is not None:
         cfg['debug'] = args.debug
+    if args.no_mosaic is not None:
+        overrides.setdefault('training', {})['no_mosaic'] = args.no_mosaic
+    if args.no_amp is not None:
+        overrides.setdefault('training', {})['amp'] = not args.no_amp
     if args.data is not None:
         cfg.setdefault('data', {})['root'] = args.data
 
@@ -133,12 +144,15 @@ def main():
     batch = t.get('batch_size', 16)
 
     # Build train command
+    config_path = args.config
     train_args = [
         sys.executable, '-m', 'test_model.train',
         '--model', model_name,
+        '--config', config_path,
         '--data', data_root,
         '--epochs', str(epochs),
         '--batch', str(batch),
+        '--optimizer', t.get('optimizer', 'sgd'),
         '--device', device,
         '--workers', str(t.get('workers', 8)),
         '--save-dir', str(save_dir),
@@ -146,7 +160,7 @@ def main():
 
     if resume_path:
         train_args.extend(['--resume', resume_path])
-    if t.get('no_mosaic') or (t.get('close_mosaic_epochs', 10) == 0 and epochs < 10):
+    if t.get('no_mosaic'):
         train_args.append('--no-mosaic')
     if not t.get('amp', True):
         train_args.append('--no-amp')
@@ -176,17 +190,27 @@ def main():
             eval_args = [
                 sys.executable, '-m', 'test_model.eval',
                 '--model', model_name,
+                '--config', config_path,
                 '--weights', str(ckpt_path),
                 '--data', data_root,
                 '--device', device,
                 '--batch', str(eval_batch),
+                '--img-dir', cfg.get('data', {}).get('val_img', 'images/val2017'),
+                '--label-dir', cfg.get('data', {}).get('val_label', 'labels/val2017'),
+                '--input-size', str(cfg.get('data', {}).get('input_size', 640)),
+                '--class-id-format', cfg.get('data', {}).get('class_id_format', 'yolo80'),
+                '--score-thresh', str(eval_cfg.get('score_thresh', 0.01)),
+                '--iou-thresh', str(eval_cfg.get('iou_thresh', 0.6)),
                 '--output', str(metrics_path),
             ]
 
             print(f"\n{'='*60}")
             print(f"Evaluating: {ckpt_path}")
             print(f"{'='*60}")
-            subprocess.run(eval_args, cwd=str(PROJECT_ROOT))
+            eval_result = subprocess.run(eval_args, cwd=str(PROJECT_ROOT))
+            if eval_result.returncode != 0:
+                print(f"  Evaluation failed with exit code {eval_result.returncode}")
+                continue
 
             # Print key metrics
             if metrics_path.exists():

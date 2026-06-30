@@ -34,6 +34,7 @@ def parse_args():
     p.add_argument('--epochs', type=int, default=None)
     p.add_argument('--batch', type=int, default=None)
     p.add_argument('--lr', type=float, default=None)
+    p.add_argument('--optimizer', type=str, default=None, choices=['sgd', 'adamw'])
     p.add_argument('--device', type=str, default=None)
     p.add_argument('--workers', type=int, default=None)
     p.add_argument('--save-dir', type=str, default=None)
@@ -55,20 +56,30 @@ def load_config(args):
                 cfg = yaml.safe_load(f)
 
     # Merge: CLI > config > defaults
-    def _get(key, default, cfg_section=None):
+    def _get(key, default, cfg_section=None, aliases=()):
         section = cfg.get(cfg_section, {}) if cfg_section else cfg
-        return getattr(args, key) if getattr(args, key) is not None else section.get(key, default)
+        arg_val = getattr(args, key)
+        if arg_val is not None:
+            return arg_val
+        for name in (key, *aliases):
+            if name in section:
+                return section[name]
+        return default
 
     model_name = args.model or cfg.get('model', 'dual_head')
     data_root = args.data or cfg.get('data', {}).get('root', '/data/coco2017')
     epochs = _get('epochs', 300, 'training')
-    batch = _get('batch', 16, 'training')
-    lr = _get('lr', 0.01, 'training')
+    batch = _get('batch', 16, 'training', aliases=('batch_size',))
+    lr = _get('lr', 0.01, 'training', aliases=('lr0',))
+    optimizer = _get('optimizer', 'sgd', 'training')
     device = args.device or cfg.get('device', 'cuda')
     workers = _get('workers', 4, 'training')
     save_dir = _get('save_dir', 'checkpoints', 'training')
     no_mosaic = _get('no_mosaic', False, 'training')
-    no_amp = _get('no_amp', False, 'training')
+    no_amp = args.no_amp if args.no_amp is not None else (
+        cfg.get('training', {}).get('no_amp', False) or
+        not cfg.get('training', {}).get('amp', True)
+    )
     debug = args.debug if args.debug is not None else cfg.get('debug', False)
 
     return {
@@ -77,6 +88,7 @@ def load_config(args):
         'epochs': epochs,
         'batch': batch,
         'lr': lr,
+        'optimizer': optimizer,
         'device': device,
         'workers': workers,
         'save_dir': save_dir,
@@ -93,6 +105,8 @@ def main():
     cfg = opts['config']
     t_cfg = cfg.get('training', {})
     l_cfg = cfg.get('loss', {})
+    a_cfg = cfg.get('augmentation', {})
+    d_cfg = cfg.get('data', {})
 
     # Device setup
     device = opts['device']
@@ -145,24 +159,34 @@ def main():
     data_root = Path(opts['data_root'])
     train_loader = create_dataloader(
         data_dir=data_root,
-        img_dir=cfg.get('data', {}).get('train_img', 'images/train2017'),
-        label_dir=cfg.get('data', {}).get('train_label', 'labels/train2017'),
+        img_dir=d_cfg.get('train_img', 'images/train2017'),
+        label_dir=d_cfg.get('train_label', 'labels/train2017'),
+        input_size=d_cfg.get('input_size', 640),
         batch_size=opts['batch'],
         use_mosaic=not opts['no_mosaic'],
         augment=True,
         shuffle=True,
         num_workers=opts['workers'],
+        drop_last=True,
+        class_id_format=d_cfg.get('class_id_format', 'yolo80'),
+        hsv_h=a_cfg.get('hsv_h', 0.015),
+        hsv_s=a_cfg.get('hsv_s', 0.7),
+        hsv_v=a_cfg.get('hsv_v', 0.4),
+        flip_lr=a_cfg.get('flip_lr', 0.5),
     )
 
     val_loader = create_dataloader(
         data_dir=data_root,
-        img_dir=cfg.get('data', {}).get('val_img', 'images/val2017'),
-        label_dir=cfg.get('data', {}).get('val_label', 'labels/val2017'),
+        img_dir=d_cfg.get('val_img', 'images/val2017'),
+        label_dir=d_cfg.get('val_label', 'labels/val2017'),
+        input_size=d_cfg.get('input_size', 640),
         batch_size=opts['batch'],
         use_mosaic=False,
         augment=False,
         shuffle=False,
         num_workers=opts['workers'],
+        drop_last=False,
+        class_id_format=d_cfg.get('class_id_format', 'yolo80'),
     )
 
     print(f"Train: {len(train_loader.dataset)} samples | Val: {len(val_loader.dataset)} samples")
@@ -173,11 +197,15 @@ def main():
         model=model,
         device=device,
         lr=opts['lr'],
+        optimizer=opts['optimizer'],
         momentum=t_cfg.get('momentum', 0.937),
         weight_decay=t_cfg.get('weight_decay', 5e-4),
+        nesterov=t_cfg.get('nesterov', True),
+        final_lr_ratio=t_cfg.get('lrf', 0.01),
+        cos_lr=t_cfg.get('cos_lr', True),
         warmup_epochs=t_cfg.get('warmup_epochs', 3),
         grad_clip=t_cfg.get('grad_clip', 10.0),
-        log_interval=20 if not opts['debug'] else 1,
+        log_interval=t_cfg.get('log_interval', 20 if not opts['debug'] else 1),
         save_interval=t_cfg.get('save_interval', 50),
         val_interval=t_cfg.get('val_interval', 5),
         save_dir=str(save_path),

@@ -6,10 +6,15 @@ Head types:
     UnifiedHead: cls(20) + reg(4*reg_max) + kpt(17*3) — all-in-one
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
 from test_model.common import Conv
+
+CLS_PRIOR_PROB = 0.01
+CLS_BIAS_INIT = math.log(CLS_PRIOR_PROB / (1 - CLS_PRIOR_PROB))
 
 
 def _make_tower(in_ch, mid_ch, depth):
@@ -48,7 +53,7 @@ class DetectHead(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        nn.init.constant_(self.cls_pred.bias, -1.0)
+        nn.init.constant_(self.cls_pred.bias, CLS_BIAS_INIT)
         # DFL bias: slight tilt toward center bins
         reg_bias = torch.zeros(4 * self.reg_max)
         for e in range(4):
@@ -98,7 +103,9 @@ class PoseHead(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        nn.init.constant_(self.cls_pred.bias, -1.0)
+        nn.init.normal_(self.cls_pred.weight, 0, 0.01)
+        nn.init.constant_(self.cls_pred.bias, CLS_BIAS_INIT)
+        nn.init.normal_(self.reg_pred.weight, 0, 0.01)
         nn.init.normal_(self.kpt_pred.weight, 0, 0.001)
         nn.init.constant_(self.kpt_pred.bias, 0)
         reg_bias = torch.zeros(4 * self.reg_max)
@@ -151,7 +158,9 @@ class UnifiedHead(nn.Module):
                 nn.init.normal_(m.weight, 0, 0.01)
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
-        nn.init.constant_(self.cls_pred.bias, -1.0)
+        nn.init.normal_(self.cls_pred.weight, 0, 0.01)
+        nn.init.constant_(self.cls_pred.bias, CLS_BIAS_INIT)
+        nn.init.normal_(self.reg_pred.weight, 0, 0.01)
         nn.init.normal_(self.kpt_pred.weight, 0, 0.001)
         nn.init.constant_(self.kpt_pred.bias, 0)
         reg_bias = torch.zeros(4 * self.reg_max)

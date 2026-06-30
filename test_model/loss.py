@@ -22,17 +22,21 @@ KPT_SIGMAS = torch.tensor([
 
 
 def _iou_xyxy(pred, target):
+    pred = torch.nan_to_num(pred, nan=0.0, posinf=1e4, neginf=-1e4)
+    target = torch.nan_to_num(target, nan=0.0, posinf=1e4, neginf=-1e4)
     lt = torch.max(pred[:, :2], target[:, :2])
     rb = torch.min(pred[:, 2:], target[:, 2:])
     wh = (rb - lt).clamp(min=0)
     inter = wh[:, 0] * wh[:, 1]
-    area_p = (pred[:, 2] - pred[:, 0]) * (pred[:, 3] - pred[:, 1])
-    area_t = (target[:, 2] - target[:, 0]) * (target[:, 3] - target[:, 1])
+    area_p = (pred[:, 2] - pred[:, 0]).clamp(min=1e-7) * (pred[:, 3] - pred[:, 1]).clamp(min=1e-7)
+    area_t = (target[:, 2] - target[:, 0]).clamp(min=1e-7) * (target[:, 3] - target[:, 1]).clamp(min=1e-7)
     iou = inter / (area_p + area_t - inter + 1e-16)
     return iou, inter, area_p + area_t - inter
 
 
 def _ciou_loss(pred_xyxy, target_xyxy, eps=1e-7):
+    pred_xyxy = torch.nan_to_num(pred_xyxy.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    target_xyxy = torch.nan_to_num(target_xyxy.float(), nan=0.0, posinf=1e4, neginf=-1e4)
     iou, inter, union = _iou_xyxy(pred_xyxy, target_xyxy)
 
     px = (pred_xyxy[:, 0] + pred_xyxy[:, 2]) / 2
@@ -59,6 +63,8 @@ def _ciou_loss(pred_xyxy, target_xyxy, eps=1e-7):
 
 def _cls_loss(pred, target, alpha=0.5, gamma=2.0):
     """Focal BCE classification loss (sum, not mean)."""
+    pred = torch.nan_to_num(pred.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+    target = torch.nan_to_num(target.float(), nan=0.0).clamp(0.0, 1.0)
     bce = F.binary_cross_entropy_with_logits(pred, target, reduction='none')
     pt = torch.exp(-bce)
     pos_mask = target > 0
@@ -69,6 +75,8 @@ def _cls_loss(pred, target, alpha=0.5, gamma=2.0):
 
 def _dfl_loss(pred_dist, target, weight=None, reg_max=16):
     """Distribution Focal Loss."""
+    pred_dist = torch.nan_to_num(pred_dist.float(), nan=0.0, posinf=20.0, neginf=-20.0).clamp(-20.0, 20.0)
+    target = torch.nan_to_num(target.float(), nan=0.0, posinf=reg_max - 1, neginf=0.0)
     target = target.clamp(0, reg_max - 1 - 1e-6)
     tl = target.long()
     tr = (tl + 1).clamp(0, reg_max - 1)
@@ -115,7 +123,8 @@ class MultiTaskLoss(nn.Module):
         self.register_buffer('sigmas', KPT_SIGMAS)
 
     def forward(self, head_outs, assign_targets, strides, feat_sizes,
-                head_type='det'):
+                head_type='det', norm_pos=None, cls_norm=None,
+                box_norm=None, dfl_norm=None, kpt_norm=None):
         """Compute loss for one head.
 
         Args:
@@ -124,6 +133,8 @@ class MultiTaskLoss(nn.Module):
             strides: List[int]
             feat_sizes: List[(H, W)]
             head_type: 'det', 'pose', or 'unified'
+            norm_pos: Optional shared normalizer for cls/box/dfl. This keeps
+                dual-head losses comparable with unified-head losses.
         """
         device = head_outs['cls'][0].device
         B = head_outs['cls'][0].shape[0]
@@ -137,6 +148,7 @@ class MultiTaskLoss(nn.Module):
 
         total_pos = 0
         total_person_pos = 0
+        total_cls_items = 0
         loss_cls = torch.tensor(0.0, device=device)
         loss_ciou = torch.tensor(0.0, device=device)
         loss_dfl = torch.tensor(0.0, device=device)
@@ -149,6 +161,7 @@ class MultiTaskLoss(nn.Module):
 
             cls_p_all = head_outs['cls'][lvl].permute(0, 2, 3, 1).reshape(B, N_lvl, -1)
             cls_tgt_all = torch.zeros(B, N_lvl, cls_p_all.shape[-1], device=device)
+            total_cls_items += cls_tgt_all.numel()
 
             if targets is None:
                 loss_cls += _cls_loss(cls_p_all.reshape(-1, cls_p_all.shape[-1]),
@@ -186,11 +199,10 @@ class MultiTaskLoss(nn.Module):
             # Classification targets
             for i in range(N_pos):
                 c = gt_classes[i].item()
-                if head_type == 'det' and c > 0:
-                    # Map original class 1..19 to 0..18
-                    c_mapped = c - 1
-                    if c_mapped < cls_tgt_all.shape[-1]:
-                        cls_tgt_all[batch_idx[i], gy[i] * W + gx[i], c_mapped] = 1.0
+                if head_type == 'det':
+                    # Dual-head detection classes are already shifted to 0..18.
+                    if 0 <= c < cls_tgt_all.shape[-1]:
+                        cls_tgt_all[batch_idx[i], gy[i] * W + gx[i], c] = 1.0
                 elif head_type == 'pose' and c == 0:
                     cls_tgt_all[batch_idx[i], gy[i] * W + gx[i], 0] = 1.0
                 elif self.unified_head:
@@ -228,9 +240,20 @@ class MultiTaskLoss(nn.Module):
 
                 if targets['gt_kpts'] is not None:
                     gt_k_idx = targets['gt_kpts'].to(device)
-                    pk = kpt_p[p_idx].view(-1, 17, 3)
+                    if gt_k_idx.shape[0] != n_person:
+                        if gt_k_idx.shape[0] > n_person:
+                            gt_k_idx = gt_k_idx[:n_person]
+                        else:
+                            pad = torch.zeros(
+                                n_person - gt_k_idx.shape[0], 17, 3,
+                                device=device, dtype=gt_k_idx.dtype)
+                            gt_k_idx = torch.cat([gt_k_idx, pad], dim=0)
+                    pk = torch.nan_to_num(
+                        kpt_p[p_idx].view(-1, 17, 3).float(),
+                        nan=0.0, posinf=1e4, neginf=-1e4)
                     pk_xy = pk[..., :2] * stride + p_locs.unsqueeze(1)
-                    pk_vis = pk[..., 2]
+                    pk_vis = pk[..., 2].clamp(-20.0, 20.0)
+                    gt_k_idx = torch.nan_to_num(gt_k_idx.float(), nan=0.0, posinf=1e4, neginf=-1e4)
                     gk_xy = gt_k_idx[..., :2]
                     gk_vis = (gt_k_idx[..., 2] > 0).float()
 
@@ -243,22 +266,38 @@ class MultiTaskLoss(nn.Module):
                     oks = (d2 / (-2 * k2)).exp()
                     visible = gk_vis
                     per_sample_oks = (oks * visible).sum(dim=1) / visible.sum(dim=1).clamp(min=1)
-                    loss_kpt += (1 - per_sample_oks).sum()
+                    has_visible = visible.sum(dim=1) > 0
+                    if has_visible.any():
+                        loss_kpt += (1 - per_sample_oks[has_visible]).sum()
 
                     # Keypoint visibility supervision
                     loss_kobj += 0.1 * F.binary_cross_entropy_with_logits(
                         pk_vis.reshape(-1), gk_vis.reshape(-1), reduction='sum')
 
         # Normalize
+        shared_norm = norm_pos if norm_pos is not None and norm_pos > 0 else None
+        cls_norm = cls_norm or shared_norm
+        box_norm = box_norm or shared_norm
+        dfl_norm = dfl_norm or shared_norm
+        kpt_norm = kpt_norm if kpt_norm is not None and kpt_norm > 0 else total_person_pos
+
+        if cls_norm is None:
+            cls_norm = max(total_pos, 1) if total_pos > 0 else max(total_cls_items, 1)
+        else:
+            cls_norm = max(cls_norm, 1)
+        box_norm = max(box_norm if box_norm is not None else total_pos, 1)
+        dfl_norm = max(dfl_norm if dfl_norm is not None else total_pos, 1)
+        kpt_norm = max(kpt_norm, 1)
+
         out = {
-            'cls': self.w_cls * (loss_cls / max(total_pos, 1)),
-            'ciou': self.w_box * loss_ciou / max(total_pos, 1),
-            'dfl': self.w_dfl * loss_dfl / max(total_pos, 1),
+            'cls': self.w_cls * (loss_cls / cls_norm),
+            'ciou': self.w_box * loss_ciou / box_norm,
+            'dfl': self.w_dfl * loss_dfl / dfl_norm,
             'num_pos': total_pos,
         }
 
         if head_type in ('pose', 'unified'):
-            out['kpt'] = self.w_pose * (loss_kpt / max(total_person_pos, 1))
-            out['kobj'] = self.w_kobj * (loss_kobj / max(total_person_pos, 1))
+            out['kpt'] = self.w_pose * (loss_kpt / kpt_norm)
+            out['kobj'] = self.w_kobj * (loss_kobj / kpt_norm)
 
         return out

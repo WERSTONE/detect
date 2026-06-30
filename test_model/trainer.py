@@ -1,7 +1,7 @@
-"""Training loop with SGD + cosine LR + EMA + AMP.
+"""Training loop with SGD/AdamW + cosine LR + EMA + AMP.
 
 Key features:
-- SGD optimizer with momentum (matching YOLOv8 official recipe)
+- SGD optimizer with momentum or AdamW
 - Cosine LR schedule with linear warmup
 - EMA (exponential moving average)
 - AMP mixed precision
@@ -41,6 +41,8 @@ class Trainer:
 
     def __init__(self, model, device='cuda',
                  lr=0.01, momentum=0.937, weight_decay=5e-4,
+                 optimizer='sgd', nesterov=True, final_lr_ratio=0.01,
+                 cos_lr=True,
                  warmup_epochs=3, grad_clip=10.0,
                  log_interval=20, save_interval=20, val_interval=5,
                  save_dir='checkpoints', use_amp=True,
@@ -63,17 +65,20 @@ class Trainer:
             tb_dir.mkdir(parents=True, exist_ok=True)
             self.writer = SummaryWriter(log_dir=str(tb_dir))
 
-        # Fused SGD for ~20% faster optimizer step (CUDA only)
-        optim_kw = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=True)
-        if device == 'cuda':
-            try:
-                self.optimizer = torch.optim.SGD(model.parameters(), fused=True, **optim_kw)
-            except (TypeError, RuntimeError):
-                self.optimizer = torch.optim.SGD(model.parameters(), **optim_kw)
-        else:
+        self.optimizer_name = str(optimizer).lower()
+        if self.optimizer_name in ('adamw', 'adam'):
+            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+        elif self.optimizer_name == 'sgd':
+            # Use regular SGD. Fused SGD can fail when multi-head batches leave
+            # some head parameters without gradients.
+            optim_kw = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
             self.optimizer = torch.optim.SGD(model.parameters(), **optim_kw)
+        else:
+            raise ValueError(f"Unsupported optimizer: {optimizer}")
         self.warmup_epochs = warmup_epochs
         self.base_lr = lr
+        self.final_lr_ratio = final_lr_ratio
+        self.cos_lr = cos_lr
 
         self.current_epoch = 0
         self.global_step = 0
@@ -120,9 +125,12 @@ class Trainer:
     def _get_lr(self, epoch, max_epochs):
         if epoch < self.warmup_epochs:
             progress = epoch / max(1, self.warmup_epochs)
-            return self.base_lr * max(progress, 0.01)
+            return self.base_lr * (0.1 + 0.9 * progress)  # start at 0.1*lr
         progress = (epoch - self.warmup_epochs) / max(1, max_epochs - self.warmup_epochs)
-        return self.base_lr * 0.5 * (1 + math.cos(math.pi * progress))
+        final_lr = self.base_lr * self.final_lr_ratio
+        if self.cos_lr:
+            return final_lr + (self.base_lr - final_lr) * 0.5 * (1 + math.cos(math.pi * progress))
+        return self.base_lr + (final_lr - self.base_lr) * progress
 
     def _set_lr(self, lr):
         for pg in self.optimizer.param_groups:
@@ -148,8 +156,11 @@ class Trainer:
         running = defaultdict(float)
         n_batches = len(loader)
         step = 0
+        seen_step = 0
+        skipped = 0
 
         for batch in loader:
+            seen_step += 1
             lr = self._get_lr(epoch, max_epochs)
             self._set_lr(lr)
 
@@ -174,10 +185,12 @@ class Trainer:
 
             # Check for NaN
             if torch.isnan(total_loss) or torch.isinf(total_loss):
-                print(f"  WARNING: NaN/Inf loss at step {step}, skipping batch")
+                skipped += 1
+                self.optimizer.zero_grad(set_to_none=True)
+                print(f"  WARNING: NaN/Inf loss at batch {seen_step}/{n_batches}, skipping batch")
                 continue
 
-            self.optimizer.zero_grad()
+            self.optimizer.zero_grad(set_to_none=True)
             if self.scaler:
                 self.scaler.scale(total_loss).backward()
                 if self.grad_clip > 0:
@@ -213,8 +226,13 @@ class Trainer:
                     self.writer.add_scalar('train/lr', lr, self.global_step)
                 running.clear()
 
+        if skipped:
+            metrics['skipped'] = float(skipped)
+        if step == 0:
+            return metrics
         for k in metrics:
-            metrics[k] /= step
+            if k != 'skipped':
+                metrics[k] /= step
         return metrics
 
     @torch.no_grad()
@@ -295,7 +313,7 @@ class Trainer:
         print(f"\n{'='*60}")
         print(f"Training: {save_prefix} | Epochs: {epochs} | "
               f"Device: {self.device} | Base LR: {self.base_lr}")
-        print(f"AMP: {self.use_amp} | EMA: {self.ema_enabled} "
+        print(f"Optimizer: {self.optimizer_name} | AMP: {self.use_amp} | EMA: {self.ema_enabled} "
               f"(decay={self.ema_decay})")
         print(f"Save dir: {self.save_dir}")
         print(f"{'='*60}")

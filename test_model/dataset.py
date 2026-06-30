@@ -18,7 +18,7 @@ import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 
-# COCO 20-class mapping (orig_id -> 0..19 label)
+# COCO 20-class mapping.
 COCO20_CLASSES = [
     'person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck',
     'dog', 'cat', 'horse', 'bird', 'cow', 'sheep',
@@ -26,19 +26,42 @@ COCO20_CLASSES = [
     'backpack', 'sports ball', 'bottle', 'cup', 'cell phone',
 ]
 
-COCO_ORIG_ID_TO_20 = {
+YOLO80_ID_TO_20 = {
     0: 0,    # person
+    1: 1,    # bicycle
+    2: 2,    # car
+    3: 3,    # motorcycle
+    5: 4,    # bus
+    7: 5,    # truck
+    16: 6,   # dog
+    15: 7,   # cat
+    17: 8,   # horse
+    14: 9,   # bird
+    19: 10,  # cow
+    18: 11,  # sheep
+    56: 12,  # chair
+    60: 13,  # dining table
+    63: 14,  # laptop
+    24: 15,  # backpack
+    32: 16,  # sports ball
+    39: 17,  # bottle
+    41: 18,  # cup
+    67: 19,  # cell phone
+}
+
+COCO_CATEGORY_ID_TO_20 = {
+    1: 0,    # person
     2: 1,    # bicycle
     3: 2,    # car
     4: 3,    # motorcycle
     6: 4,    # bus
     8: 5,    # truck
-    17: 6,   # dog
-    15: 7,   # cat
-    14: 8,   # horse
+    18: 6,   # dog
+    17: 7,   # cat
+    19: 8,   # horse
     16: 9,   # bird
     21: 10,  # cow
-    19: 11,  # sheep
+    20: 11,  # sheep
     62: 12,  # chair
     67: 13,  # dining table
     73: 14,  # laptop
@@ -65,13 +88,21 @@ class COCOMultiTaskDataset(Dataset):
     """
 
     def __init__(self, data_dir, img_dir, label_dir=None,
-                 input_size=640, use_mosaic=True, augment=True):
+                 input_size=640, use_mosaic=True, augment=True,
+                 class_id_format='yolo80',
+                 hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+                 flip_lr=0.5):
         self.data_dir = Path(data_dir)
         self.img_dir = self.data_dir / img_dir
         self.label_dir = self.data_dir / label_dir if label_dir else None
         self.input_size = input_size
         self.use_mosaic = use_mosaic and augment
         self.augment = augment
+        self.class_id_format = class_id_format
+        self.hsv_h = hsv_h
+        self.hsv_s = hsv_s
+        self.hsv_v = hsv_v
+        self.flip_lr = flip_lr
 
         # Collect image-label pairs
         self.samples = []
@@ -121,6 +152,7 @@ class COCOMultiTaskDataset(Dataset):
 
         # Letterbox resize
         img, boxes, kpts, (pad_l, pad_t), scale = self._letterbox(img, boxes, kpts)
+        boxes, classes, kpts = self._sanitize_targets(boxes, classes, kpts)
 
         # Normalize
         img = img.astype(np.float32) / 255.0
@@ -201,29 +233,39 @@ class COCOMultiTaskDataset(Dataset):
             # Transform boxes
             for b, boxes_l in enumerate(boxes_i):
                 new_box = [
-                    boxes_l[0] * scale * w0 + ox,
-                    boxes_l[1] * scale * h0 + oy,
-                    boxes_l[2] * scale * w0 + ox,
-                    boxes_l[3] * scale * h0 + oy,
+                    boxes_l[0] * scale + ox,
+                    boxes_l[1] * scale + oy,
+                    boxes_l[2] * scale + ox,
+                    boxes_l[3] * scale + oy,
                 ]
                 new_box[0] = max(ox, min(ox + w_place, new_box[0]))
                 new_box[1] = max(oy, min(oy + h_place, new_box[1]))
                 new_box[2] = max(ox, min(ox + w_place, new_box[2]))
                 new_box[3] = max(oy, min(oy + h_place, new_box[3]))
 
-                if new_box[2] > new_box[0] and new_box[3] > new_box[1]:
+                bw, bh = new_box[2] - new_box[0], new_box[3] - new_box[1]
+                if bw > 2 and bh > 2:  # filter tiny boxes from mosaic artifacts
                     mosaic_boxes.append(new_box)
                     mosaic_classes.append(classes_i[b])
 
                     if kpts_i and b < len(kpts_i):
                         k = kpts_i[b].copy()
-                        k[..., 0] = k[..., 0] * scale * w0 + ox
-                        k[..., 1] = k[..., 1] * scale * h0 + oy
+                        k[..., 0] = k[..., 0] * scale + ox
+                        k[..., 1] = k[..., 1] * scale + oy
+                        visible = k[..., 2] > 0
+                        outside = (
+                            (k[..., 0] < ox) | (k[..., 0] > ox + w_place) |
+                            (k[..., 1] < oy) | (k[..., 1] > oy + h_place)
+                        )
+                        k[outside & visible, 2] = 0
                         mosaic_kpts.append(k)
 
         # HSV augment on mosaic
         if self.augment:
-            mosaic_img = self._hsv_augment(mosaic_img)
+            mosaic_img = self._hsv_augment(mosaic_img, self.hsv_h, self.hsv_s, self.hsv_v)
+
+        mosaic_boxes, mosaic_classes, mosaic_kpts = self._sanitize_targets(
+            mosaic_boxes, mosaic_classes, mosaic_kpts)
 
         # Normalize
         mosaic_img = mosaic_img.astype(np.float32) / 255.0
@@ -232,7 +274,8 @@ class COCOMultiTaskDataset(Dataset):
 
         boxes_t = torch.tensor(mosaic_boxes, dtype=torch.float32) if mosaic_boxes else torch.zeros(0, 4)
         classes_t = torch.tensor(mosaic_classes, dtype=torch.long) if mosaic_classes else torch.zeros(0, dtype=torch.long)
-        kpts_t = torch.tensor(mosaic_kpts, dtype=torch.float32) if mosaic_kpts else torch.zeros(0, 17, 3)
+        kpts_t = (torch.from_numpy(np.asarray(mosaic_kpts, dtype=np.float32))
+                  if mosaic_kpts else torch.zeros(0, 17, 3))
 
         return {
             'image': mosaic_img,
@@ -261,9 +304,10 @@ class COCOMultiTaskDataset(Dataset):
                 if len(parts) < 5:
                     continue
                 cls = int(float(parts[0]))
-                if cls not in COCO_ORIG_ID_TO_20:
+                has_kpts = len(parts) > 5
+                cls_20 = self._map_class_id(cls, has_kpts)
+                if cls_20 is None:
                     continue
-                cls_20 = COCO_ORIG_ID_TO_20[cls]
 
                 xc, yc, w, h = map(float, parts[1:5])
                 # Convert normalized xywh -> pixel xyxy
@@ -278,7 +322,7 @@ class COCOMultiTaskDataset(Dataset):
 
                 # Keypoints
                 kpt = np.zeros((17, 3), dtype=np.float32)
-                if len(parts) > 5 and cls == 0:
+                if has_kpts and cls_20 == 0:
                     kpt_data = parts[5:]
                     for j in range(min(17, len(kpt_data) // 3)):
                         px = float(kpt_data[j * 3]) * img_w
@@ -289,12 +333,79 @@ class COCOMultiTaskDataset(Dataset):
 
         return boxes, classes, kpts
 
+    def _map_class_id(self, cls, has_kpts=False):
+        """Map source class id to internal 20-class id.
+
+        label format:
+          - yolo80: standard YOLO COCO ids, person=0, car=2, ...
+          - coco: COCO category ids, person=1, car=3, ...
+          - auto: prefer yolo80, except keypoint person annotations may be 0 or 1.
+        """
+        fmt = str(self.class_id_format).lower()
+        if fmt == 'coco':
+            return COCO_CATEGORY_ID_TO_20.get(cls)
+        if fmt == 'auto':
+            if has_kpts and cls in (0, 1):
+                return 0
+            if cls in YOLO80_ID_TO_20:
+                return YOLO80_ID_TO_20[cls]
+            return COCO_CATEGORY_ID_TO_20.get(cls)
+        return YOLO80_ID_TO_20.get(cls)
+
+    def _sanitize_targets(self, boxes, classes, kpts):
+        """Clip targets to the training image and drop invalid annotations."""
+        if not boxes:
+            return [], [], []
+
+        boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        classes_np = np.asarray(classes, dtype=np.int64).reshape(-1)
+        if kpts:
+            kpts_np = np.asarray(kpts, dtype=np.float32).reshape(-1, 17, 3)
+        else:
+            kpts_np = np.zeros((len(boxes_np), 17, 3), dtype=np.float32)
+
+        n = min(len(boxes_np), len(classes_np), len(kpts_np))
+        boxes_np = boxes_np[:n]
+        classes_np = classes_np[:n]
+        kpts_np = kpts_np[:n]
+
+        finite_boxes = np.isfinite(boxes_np).all(axis=1)
+        boxes_np[:, [0, 2]] = np.clip(boxes_np[:, [0, 2]], 0, self.input_size - 1)
+        boxes_np[:, [1, 3]] = np.clip(boxes_np[:, [1, 3]], 0, self.input_size - 1)
+        valid_boxes = (
+            finite_boxes &
+            (boxes_np[:, 2] - boxes_np[:, 0] > 2) &
+            (boxes_np[:, 3] - boxes_np[:, 1] > 2)
+        )
+
+        boxes_np = boxes_np[valid_boxes]
+        classes_np = classes_np[valid_boxes]
+        kpts_np = kpts_np[valid_boxes]
+        if len(boxes_np) == 0:
+            return [], [], []
+
+        xy = kpts_np[..., :2]
+        vis = kpts_np[..., 2]
+        finite_xy = np.isfinite(xy).all(axis=-1)
+        finite_vis = np.isfinite(vis)
+        outside = (
+            (xy[..., 0] < 0) | (xy[..., 0] > self.input_size - 1) |
+            (xy[..., 1] < 0) | (xy[..., 1] > self.input_size - 1)
+        )
+        keep_vis = (vis > 0) & finite_xy & finite_vis & ~outside
+        kpts_np[..., 0] = np.clip(np.nan_to_num(xy[..., 0], nan=0.0), 0, self.input_size - 1)
+        kpts_np[..., 1] = np.clip(np.nan_to_num(xy[..., 1], nan=0.0), 0, self.input_size - 1)
+        kpts_np[..., 2] = np.where(keep_vis, vis, 0.0)
+        kpts_np[classes_np != 0] = 0.0
+
+        return boxes_np.tolist(), classes_np.tolist(), [k for k in kpts_np]
+
     def _augment(self, img, boxes, kpts):
         """Apply HSV + flip augmentations."""
-        img = self._hsv_augment(img)
+        img = self._hsv_augment(img, self.hsv_h, self.hsv_s, self.hsv_v)
 
         # Horizontal flip
-        if random.random() < 0.5:
+        if random.random() < self.flip_lr:
             img = img[:, ::-1].copy()
             w = img.shape[1]
             for i, box in enumerate(boxes):
@@ -369,7 +480,10 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       input_size=640, batch_size=16,
                       use_mosaic=True, augment=True,
                       shuffle=True, num_workers=4,
-                      distributed=False, rank=0, world_size=1):
+                      distributed=False, rank=0, world_size=1,
+                      drop_last=True, class_id_format='yolo80',
+                      hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
+                      flip_lr=0.5):
     """Create DataLoader for COCO dataset."""
     dataset = COCOMultiTaskDataset(
         data_dir=data_dir,
@@ -378,6 +492,11 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
         input_size=input_size,
         use_mosaic=use_mosaic,
         augment=augment,
+        class_id_format=class_id_format,
+        hsv_h=hsv_h,
+        hsv_s=hsv_s,
+        hsv_v=hsv_v,
+        flip_lr=flip_lr,
     )
 
     sampler = None
@@ -394,7 +513,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
         num_workers=num_workers,
         collate_fn=collate_fn,
         pin_memory=True,
-        drop_last=True,
+        drop_last=drop_last,
         persistent_workers=num_workers > 0,
         prefetch_factor=2 if num_workers > 0 else None,
     )

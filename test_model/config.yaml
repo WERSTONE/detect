@@ -17,22 +17,23 @@ data:
   # AutoDL: /root/autodl-tmp/coco2017 (fast SSD)
   # Local:   /data/coco2017
   root: /root/autodl-tmp/coco2017
-  train_img: images/train2017
+  train_img: train2017
   train_label: labels/train2017
-  val_img: images/val2017
+  val_img: val2017
   val_label: labels/val2017
   input_size: 640
+  class_id_format: yolo80   # yolo80 for standard YOLO COCO labels; coco for raw COCO category_id labels
 
 # ---- Training ----
 training:
   epochs: 300
-  batch_size: 24            # 24GB GPU: 24 works well with AMP, ~14-16GB VRAM usage
+  batch_size: 24            # 24GB GPU: start with 24; reduce to 16/12 if OOM
   workers: 8
 
   # Optimizer (SGD matches YOLOv8 official recipe)
   optimizer: sgd           # sgd | adamw
-  lr0: 0.01                # initial learning rate
-  lrf: 0.01                # final LR = lr0 * lrf = 1e-4
+  lr0: 0.005               # stable initial LR for dual-head training at batch 24
+  lrf: 0.01                # final LR = lr0 * lrf
   momentum: 0.937
   weight_decay: 0.0005     # 5e-4
   nesterov: true
@@ -52,12 +53,12 @@ training:
   val_interval: 5          # validate every N epochs
   save_interval: 50        # save intermediate checkpoint every N epochs
   save_best_by: loss       # loss | score
-  # AutoDL: /root/autodl-fs/checkpoints (persistent disk)
-  # Local:  checkpoints
-  save_dir: /root/autodl-fs/checkpoints
+  # Saved as checkpoints/<model_name>/ inside the project directory.
+  save_dir: checkpoints
 
   # Logging
   tensorboard: true         # write TensorBoard logs to save_dir/tensorboard/
+  log_interval: 50          # console log every N optimizer steps
 
   # Mosaic augmentation
   close_mosaic_epochs: 10  # disable mosaic for last N epochs

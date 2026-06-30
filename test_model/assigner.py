@@ -12,12 +12,14 @@ import torch
 
 def _box_iou(box1, box2):
     """Batch IoU: box1 [N,4], box2 [M,4] -> [N,M]."""
+    box1 = torch.nan_to_num(box1.float(), nan=0.0, posinf=1e4, neginf=-1e4)
+    box2 = torch.nan_to_num(box2.float(), nan=0.0, posinf=1e4, neginf=-1e4)
     lt = torch.max(box1[:, None, :2], box2[None, :, :2])
     rb = torch.min(box1[:, None, 2:], box2[None, :, 2:])
     wh = (rb - lt).clamp(min=0)
     inter = wh[..., 0] * wh[..., 1]
-    area1 = (box1[:, 2] - box1[:, 0]) * (box1[:, 3] - box1[:, 1])
-    area2 = (box2[:, 2] - box2[:, 0]) * (box2[:, 3] - box2[:, 1])
+    area1 = (box1[:, 2] - box1[:, 0]).clamp(min=1e-7) * (box1[:, 3] - box1[:, 1]).clamp(min=1e-7)
+    area2 = (box2[:, 2] - box2[:, 0]).clamp(min=1e-7) * (box2[:, 3] - box2[:, 1]).clamp(min=1e-7)
     return inter / (area1[:, None] + area2[None, :] - inter + 1e-16)
 
 
@@ -103,8 +105,6 @@ class TaskAlignedAssigner:
             all_centers.append(torch.stack([cx.flatten(), cy.flatten()], dim=1))
         all_centers = torch.cat(all_centers, dim=0)
 
-        person_count = 0
-
         for gt_i in range(num_gts):
             gt_box = gt_boxes[gt_i]
             gt_cls_i = gt_classes[gt_i].item()
@@ -184,9 +184,8 @@ class TaskAlignedAssigner:
             _, topk_local = align_valid.topk(topk)
 
             gt_kpt_val = None
-            if gt_cls_i == 0 and gt_kpts is not None:
-                gt_kpt_val = gt_kpts[person_count]
-                person_count += 1
+            if gt_cls_i == 0 and gt_kpts is not None and gt_i < len(gt_kpts):
+                gt_kpt_val = gt_kpts[gt_i]
 
             for k in range(topk):
                 global_idx = valid_indices[topk_local[k]].item()
