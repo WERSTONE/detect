@@ -134,7 +134,7 @@ def main():
 
     # Build train command
     train_args = [
-        'uv', 'run', 'python', '-m', 'test_model.train',
+        sys.executable, '-m', 'test_model.train',
         '--model', model_name,
         '--data', data_root,
         '--epochs', str(epochs),
@@ -174,7 +174,7 @@ def main():
 
             metrics_path = model_dir / f'{model_name}_{ckpt_type}_metrics.json'
             eval_args = [
-                'uv', 'run', 'python', '-m', 'test_model.eval',
+                sys.executable, '-m', 'test_model.eval',
                 '--model', model_name,
                 '--weights', str(ckpt_path),
                 '--data', data_root,
