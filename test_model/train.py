@@ -155,26 +155,8 @@ def main():
         model.loss_fn.w_pose = l_cfg.get('w_pose', 12.0)
         model.loss_fn.w_kobj = l_cfg.get('w_kobj', 1.0)
 
-    # Create dataloaders
+    # Create val dataloader (shared)
     data_root = Path(opts['data_root'])
-    train_loader = create_dataloader(
-        data_dir=data_root,
-        img_dir=d_cfg.get('train_img', 'images/train2017'),
-        label_dir=d_cfg.get('train_label', 'labels/train2017'),
-        input_size=d_cfg.get('input_size', 640),
-        batch_size=opts['batch'],
-        use_mosaic=not opts['no_mosaic'],
-        augment=True,
-        shuffle=True,
-        num_workers=opts['workers'],
-        drop_last=True,
-        class_id_format=d_cfg.get('class_id_format', 'yolo80'),
-        hsv_h=a_cfg.get('hsv_h', 0.015),
-        hsv_s=a_cfg.get('hsv_s', 0.7),
-        hsv_v=a_cfg.get('hsv_v', 0.4),
-        flip_lr=a_cfg.get('flip_lr', 0.5),
-    )
-
     val_loader = create_dataloader(
         data_dir=data_root,
         img_dir=d_cfg.get('val_img', 'images/val2017'),
@@ -188,8 +170,7 @@ def main():
         drop_last=False,
         class_id_format=d_cfg.get('class_id_format', 'yolo80'),
     )
-
-    print(f"Train: {len(train_loader.dataset)} samples | Val: {len(val_loader.dataset)} samples")
+    print(f"Val: {len(val_loader.dataset)} samples")
 
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
 
@@ -217,19 +198,8 @@ def main():
             use_tensorboard=t_cfg.get('tensorboard', True),
         )
 
-    # Two-stage training for dual-head models
-    two_stage = t_cfg.get('two_stage', {})
-    is_dual_head = model_name in ('dual_head', 'dual_neck', 'attn_dual', 'bifpn_dual')
-    if two_stage.get('enabled') and is_dual_head:
-        s1 = two_stage['stage1']
-        s2 = two_stage['stage2']
-
-        # ---- Stage 1: pose head only (person-only data) ----
-        model.train_det = False
-        model.freeze_head('det')
-
-        # Person-only dataloader for stage 1
-        train_loader_s1 = create_dataloader(
+    def _make_train_loader(person_only=False):
+        return create_dataloader(
             data_dir=data_root,
             img_dir=d_cfg.get('train_img', 'images/train2017'),
             label_dir=d_cfg.get('train_label', 'labels/train2017'),
@@ -245,8 +215,21 @@ def main():
             hsv_s=a_cfg.get('hsv_s', 0.7),
             hsv_v=a_cfg.get('hsv_v', 0.4),
             flip_lr=a_cfg.get('flip_lr', 0.5),
-            person_only=True,
+            person_only=person_only,
         )
+
+    # Two-stage training for dual-head models
+    two_stage = t_cfg.get('two_stage', {})
+    is_dual_head = model_name in ('dual_head', 'dual_neck', 'attn_dual', 'bifpn_dual')
+    if two_stage.get('enabled') and is_dual_head:
+        s1 = two_stage['stage1']
+        s2 = two_stage['stage2']
+
+        # ---- Stage 1: pose head only (person-only data) ----
+        model.train_det = False
+        model.freeze_head('det')
+
+        train_loader_s1 = _make_train_loader(person_only=True)
         print(f"Stage1 train (person-only): {len(train_loader_s1.dataset)} samples")
 
         # Quick debug: test one batch
@@ -277,11 +260,17 @@ def main():
             close_mosaic_epochs=close_mosaic,
         )
 
+        # Release stage1 loader to free memory before creating full loader
+        del train_loader_s1
+
         # ---- Stage 2: both heads (full data) ----
         model.train_det = True
         model.det_weight_warmup_epochs = s2.get('det_weight_warmup_epochs', 5)
-        model.det_weight_mult = 0.0  # start from 0
+        model.det_weight_mult = 0.0
         model.unfreeze_all()
+
+        train_loader = _make_train_loader(person_only=False)
+        print(f"Stage2 train (full): {len(train_loader.dataset)} samples")
 
         def _on_epoch_start(epoch):
             model.update_det_weight(epoch)
@@ -307,6 +296,9 @@ def main():
         print(f"\nTwo-stage training complete for {model_name}!")
     else:
         # Single-stage training (original flow)
+        train_loader = _make_train_loader()
+        print(f"Train: {len(train_loader.dataset)} samples")
+
         trainer = _make_trainer(opts['lr'])
         if resume:
             trainer.load(resume)
