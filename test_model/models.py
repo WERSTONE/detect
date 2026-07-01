@@ -341,20 +341,13 @@ class _DualHeadModel(_BaseModel):
             pose_gt_kpts, feat_sizes, self.strides, pose_gt_batch,
             num_det_classes=1)
 
-        # Loss. Use one shared assigned-positive normalizer for det/pose box,
-        # cls, and DFL terms so dual-head variants stay comparable with
-        # unified_head, whose loss sees all classes in one assigner.
-        def _count_pos(targets):
-            return sum(len(t['gt_boxes']) for t in targets if t is not None)
-
-        shared_pos_norm = max(_count_pos(det_targets) + _count_pos(pose_targets), 1)
-        pose_pos_norm = max(_count_pos(pose_targets), 1)
+        # Loss
         det_l = self.det_loss(
             det_out, det_targets, self.strides, feat_sizes,
-            head_type='det', norm_pos=shared_pos_norm)
+            head_type='det')
         pose_l = self.pose_loss(
             pose_out, pose_targets, self.strides, feat_sizes,
-            head_type='pose', norm_pos=shared_pos_norm, kpt_norm=pose_pos_norm)
+            head_type='pose')
 
         total = det_l['cls'] + det_l['ciou'] + det_l['dfl']
         if 'kpt' in pose_l:
