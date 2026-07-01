@@ -216,6 +216,11 @@ class _DualHeadModel(_BaseModel):
         self.num_det_classes = num_det_classes
         self.num_kpts = num_kpts
 
+        # Two-stage training controls
+        self.train_det = True
+        self.train_pose = True
+        self.det_weight_mult = 1.0
+
         self.det_loss = MultiTaskLoss(
             w_box=7.5, w_cls=0.5, w_dfl=1.5,
             w_pose=0.0, w_kobj=0.0, reg_max=reg_max,
@@ -224,6 +229,16 @@ class _DualHeadModel(_BaseModel):
             w_box=7.5, w_cls=0.5, w_dfl=1.5,
             w_pose=12.0, w_kobj=1.0, reg_max=reg_max,
             num_det_classes=1, unified_head=False)
+
+    def freeze_head(self, name):
+        """Freeze a head. name: 'det' or 'pose'."""
+        head = getattr(self, name + '_head')
+        for p in head.parameters():
+            p.requires_grad = False
+
+    def unfreeze_all(self):
+        for p in self.parameters():
+            p.requires_grad = True
 
     @torch.no_grad()
     def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6):
@@ -330,11 +345,14 @@ class _DualHeadModel(_BaseModel):
             pose_gt_kpts = torch.empty(0, 17, 3, device=device)
             pose_gt_batch = torch.empty(0, device=device, dtype=torch.long)
 
-        # Assigner
-        det_targets = self.assigner(
-            det_scores, det_boxes, det_gt_boxes, det_gt_classes,
-            None, feat_sizes, self.strides, det_gt_batch,
-            num_det_classes=self.num_det_classes)
+        # Assigner (skip det assigner if not training det)
+        if self.train_det:
+            det_targets = self.assigner(
+                det_scores, det_boxes, det_gt_boxes, det_gt_classes,
+                None, feat_sizes, self.strides, det_gt_batch,
+                num_det_classes=self.num_det_classes)
+        else:
+            det_targets = [None] * len(feat_sizes)
 
         pose_targets = self.assigner(
             pose_scores, pose_boxes, pose_gt_boxes, pose_gt_classes,
@@ -342,23 +360,34 @@ class _DualHeadModel(_BaseModel):
             num_det_classes=1)
 
         # Loss
-        det_l = self.det_loss(
-            det_out, det_targets, self.strides, feat_sizes,
-            head_type='det')
+        if self.train_det:
+            det_l = self.det_loss(
+                det_out, det_targets, self.strides, feat_sizes,
+                head_type='det')
+        else:
+            det_l = {'cls': torch.tensor(0.0, device=device),
+                     'ciou': torch.tensor(0.0, device=device),
+                     'dfl': torch.tensor(0.0, device=device)}
+
         pose_l = self.pose_loss(
             pose_out, pose_targets, self.strides, feat_sizes,
             head_type='pose')
 
-        total = det_l['cls'] + det_l['ciou'] + det_l['dfl']
+        # Apply det_weight_mult for staged training
+        det_cls = det_l['cls'] * self.det_weight_mult
+        det_ciou = det_l['ciou'] * self.det_weight_mult
+        det_dfl = det_l['dfl'] * self.det_weight_mult
+
+        total = det_cls + det_ciou + det_dfl
         if 'kpt' in pose_l:
             total = total + pose_l['kpt'] + pose_l.get('kobj', 0.0)
         total = total + pose_l['cls'] + pose_l['ciou'] + pose_l['dfl']
 
         loss_dict = {
             'total': total,
-            'det_cls': det_l['cls'].item(),
-            'det_ciou': det_l['ciou'].item(),
-            'det_dfl': det_l['dfl'].item(),
+            'det_cls': det_cls.item(),
+            'det_ciou': det_ciou.item(),
+            'det_dfl': det_dfl.item(),
             'pose_cls': pose_l['cls'].item(),
             'pose_ciou': pose_l['ciou'].item(),
             'pose_dfl': pose_l['dfl'].item(),

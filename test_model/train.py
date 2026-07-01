@@ -191,46 +191,102 @@ def main():
 
     print(f"Train: {len(train_loader.dataset)} samples | Val: {len(val_loader.dataset)} samples")
 
-    # Create trainer
-    save_path = Path(opts['save_dir']) / model_name
-    trainer = Trainer(
-        model=model,
-        device=device,
-        lr=opts['lr'],
-        optimizer=opts['optimizer'],
-        momentum=t_cfg.get('momentum', 0.937),
-        weight_decay=t_cfg.get('weight_decay', 5e-4),
-        nesterov=t_cfg.get('nesterov', True),
-        final_lr_ratio=t_cfg.get('lrf', 0.01),
-        cos_lr=t_cfg.get('cos_lr', True),
-        warmup_epochs=t_cfg.get('warmup_epochs', 3),
-        grad_clip=t_cfg.get('grad_clip', 10.0),
-        log_interval=t_cfg.get('log_interval', 20 if not opts['debug'] else 1),
-        save_interval=t_cfg.get('save_interval', 50),
-        val_interval=t_cfg.get('val_interval', 5),
-        save_dir=str(save_path),
-        use_amp=(not opts['no_amp']) and device == 'cuda',
-        ema_decay=t_cfg.get('ema_decay', 0.9999),
-        save_best_by=t_cfg.get('save_best_by', 'loss'),
-        use_tensorboard=t_cfg.get('tensorboard', True),
-    )
-
-    if resume:
-        trainer.load(resume)
-
-    # Train
-    epochs = 3 if opts['debug'] else opts['epochs']
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
 
-    trainer.fit(
-        epochs=epochs,
-        train_loader=train_loader,
-        val_loader=val_loader,
-        save_prefix=model_name,
-        close_mosaic_epochs=close_mosaic,
-    )
+    def _make_trainer(lr, save_dir_suffix=''):
+        save_path = Path(opts['save_dir']) / (model_name + save_dir_suffix)
+        return Trainer(
+            model=model,
+            device=device,
+            lr=lr,
+            optimizer=opts['optimizer'],
+            momentum=t_cfg.get('momentum', 0.937),
+            weight_decay=t_cfg.get('weight_decay', 5e-4),
+            nesterov=t_cfg.get('nesterov', True),
+            final_lr_ratio=t_cfg.get('lrf', 0.01),
+            cos_lr=t_cfg.get('cos_lr', True),
+            warmup_epochs=t_cfg.get('warmup_epochs', 3),
+            grad_clip=t_cfg.get('grad_clip', 10.0),
+            log_interval=t_cfg.get('log_interval', 20 if not opts['debug'] else 1),
+            save_interval=t_cfg.get('save_interval', 50),
+            val_interval=t_cfg.get('val_interval', 5),
+            save_dir=str(save_path),
+            use_amp=(not opts['no_amp']) and device == 'cuda',
+            ema_decay=t_cfg.get('ema_decay', 0.9999),
+            save_best_by=t_cfg.get('save_best_by', 'loss'),
+            use_tensorboard=t_cfg.get('tensorboard', True),
+        )
 
-    print(f"\nTraining complete for {model_name}!")
+    # Two-stage training for dual-head models
+    two_stage = t_cfg.get('two_stage', {})
+    is_dual_head = model_name in ('dual_head', 'dual_neck', 'attn_dual', 'bifpn_dual')
+    if two_stage.get('enabled') and is_dual_head:
+        s1 = two_stage['stage1']
+        s2 = two_stage['stage2']
+
+        # ---- Stage 1: pose head only ----
+        model.train_det = False
+        model.freeze_head('det')
+
+        s1_epochs = min(3, s1.get('epochs', 80)) if opts['debug'] else s1.get('epochs', 80)
+        s1_lr = s1.get('lr0', opts['lr'])
+        if s1.get('freeze_backbone', False):
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+
+        print(f"\n{'='*60}")
+        print(f"Stage 1: pose head only | Epochs: {s1_epochs} | LR: {s1_lr}")
+        print(f"{'='*60}")
+
+        trainer1 = _make_trainer(s1_lr)
+        trainer1.fit(
+            epochs=s1_epochs,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            save_prefix=model_name + '_stage1',
+            close_mosaic_epochs=close_mosaic,
+        )
+
+        # ---- Stage 2: both heads ----
+        model.train_det = True
+        model.det_weight_mult = s2.get('det_weight_mult', 0.5)
+        model.unfreeze_all()
+
+        s2_epochs = min(3, s2.get('epochs', 200)) if opts['debug'] else s2.get('epochs', 200)
+        s2_lr = s2.get('lr0', opts['lr'] * 0.4)
+
+        print(f"\n{'='*60}")
+        print(f"Stage 2: both heads | Epochs: {s2_epochs} | LR: {s2_lr}")
+        print(f"  det_weight_mult: {model.det_weight_mult}")
+        print(f"{'='*60}")
+
+        trainer2 = _make_trainer(s2_lr)
+        trainer2.fit(
+            epochs=s2_epochs,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            save_prefix=model_name,
+            close_mosaic_epochs=close_mosaic,
+        )
+
+        print(f"\nTwo-stage training complete for {model_name}!")
+    else:
+        # Single-stage training (original flow)
+        trainer = _make_trainer(opts['lr'])
+        if resume:
+            trainer.load(resume)
+
+        epochs = 3 if opts['debug'] else opts['epochs']
+
+        trainer.fit(
+            epochs=epochs,
+            train_loader=train_loader,
+            val_loader=val_loader,
+            save_prefix=model_name,
+            close_mosaic_epochs=close_mosaic,
+        )
+
+        print(f"\nTraining complete for {model_name}!")
 
 
 if __name__ == '__main__':

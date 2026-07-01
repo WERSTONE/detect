@@ -64,6 +64,21 @@ training:
   close_mosaic_epochs: 10  # disable mosaic for last N epochs
   no_mosaic: false         # completely disable mosaic
 
+  # Two-stage training (dual-head models only)
+  # Stage 1: train pose head only → Stage 2: train both heads
+  two_stage:
+    enabled: false
+
+    stage1:
+      epochs: 50                # stage 1 epochs
+      lr0: 0.005                # stage 1 learning rate
+      freeze_backbone: false    # freeze backbone in stage 1
+
+    stage2:
+      epochs: 150               # stage 2 epochs (count from 0)
+      lr0: 0.002                # stage 2 learning rate (usually lower)
+      det_weight_mult: 0.5      # down-weight det losses at stage 2 start
+
 # ---- Loss Weights ----
 loss:
   w_box: 7.5               # CIoU box loss
