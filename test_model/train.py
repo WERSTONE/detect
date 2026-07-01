@@ -224,9 +224,35 @@ def main():
         s1 = two_stage['stage1']
         s2 = two_stage['stage2']
 
-        # ---- Stage 1: pose head only ----
+        # ---- Stage 1: pose head only (person-only data) ----
         model.train_det = False
         model.freeze_head('det')
+
+        # Person-only dataloader for stage 1
+        train_loader_s1 = create_dataloader(
+            data_dir=data_root,
+            img_dir=d_cfg.get('train_img', 'images/train2017'),
+            label_dir=d_cfg.get('train_label', 'labels/train2017'),
+            input_size=d_cfg.get('input_size', 640),
+            batch_size=opts['batch'],
+            use_mosaic=not opts['no_mosaic'],
+            augment=True,
+            shuffle=True,
+            num_workers=opts['workers'],
+            drop_last=True,
+            class_id_format=d_cfg.get('class_id_format', 'yolo80'),
+            person_only=True,
+        )
+        print(f"Stage1 train (person-only): {len(train_loader_s1.dataset)} samples")
+
+        # Quick debug: test one batch
+        model.train()
+        dbg_batch = next(iter(train_loader_s1))
+        dbg_images = dbg_batch['image'].to(device, non_blocking=True)
+        dbg_gt = [{'boxes': dbg_batch['boxes'][i], 'classes': dbg_batch['classes'][i],
+                    'kpts': dbg_batch['kpts'][i]} for i in range(len(dbg_images))]
+        dbg_losses = model.compute_loss(dbg_images, dbg_gt)
+        print(f"  [DEBUG] test batch loss: " + " ".join(f"{k}={v:.4f}" for k, v in sorted(dbg_losses.items())))
 
         s1_epochs = min(3, s1.get('epochs', 80)) if opts['debug'] else s1.get('epochs', 80)
         s1_lr = s1.get('lr0', opts['lr'])
@@ -241,13 +267,13 @@ def main():
         trainer1 = _make_trainer(s1_lr)
         trainer1.fit(
             epochs=s1_epochs,
-            train_loader=train_loader,
+            train_loader=train_loader_s1,
             val_loader=val_loader,
             save_prefix=model_name + '_stage1',
             close_mosaic_epochs=close_mosaic,
         )
 
-        # ---- Stage 2: both heads ----
+        # ---- Stage 2: both heads (full data) ----
         model.train_det = True
         model.det_weight_warmup_epochs = s2.get('det_weight_warmup_epochs', 5)
         model.det_weight_mult = 0.0  # start from 0

@@ -91,7 +91,7 @@ class COCOMultiTaskDataset(Dataset):
                  input_size=640, use_mosaic=True, augment=True,
                  class_id_format='yolo80',
                  hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-                 flip_lr=0.5):
+                 flip_lr=0.5, person_only=False):
         self.data_dir = Path(data_dir)
         self.img_dir = self.data_dir / img_dir
         self.label_dir = self.data_dir / label_dir if label_dir else None
@@ -108,6 +108,21 @@ class COCOMultiTaskDataset(Dataset):
         self.samples = []
         if self.label_dir and self.label_dir.exists():
             for lb in self.label_dir.glob('*.txt'):
+                # person_only filter: check raw class 0 in label file
+                if person_only:
+                    has_person = False
+                    try:
+                        with open(lb, 'r') as f:
+                            for line in f:
+                                parts = line.strip().split()
+                                if parts and int(float(parts[0])) == 0:
+                                    has_person = True
+                                    break
+                    except Exception:
+                        pass
+                    if not has_person:
+                        continue
+
                 img_name = lb.stem + '.jpg'
                 img_path = self.img_dir / img_name
                 if not img_path.exists():
@@ -483,7 +498,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       distributed=False, rank=0, world_size=1,
                       drop_last=True, class_id_format='yolo80',
                       hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-                      flip_lr=0.5):
+                      flip_lr=0.5, person_only=False):
     """Create DataLoader for COCO dataset."""
     dataset = COCOMultiTaskDataset(
         data_dir=data_dir,
@@ -497,6 +512,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
         hsv_s=hsv_s,
         hsv_v=hsv_v,
         flip_lr=flip_lr,
+        person_only=person_only,
     )
 
     sampler = None
