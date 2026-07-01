@@ -241,6 +241,10 @@ def main():
             num_workers=opts['workers'],
             drop_last=True,
             class_id_format=d_cfg.get('class_id_format', 'yolo80'),
+            hsv_h=a_cfg.get('hsv_h', 0.015),
+            hsv_s=a_cfg.get('hsv_s', 0.7),
+            hsv_v=a_cfg.get('hsv_v', 0.4),
+            flip_lr=a_cfg.get('flip_lr', 0.5),
             person_only=True,
         )
         print(f"Stage1 train (person-only): {len(train_loader_s1.dataset)} samples")
