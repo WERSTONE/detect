@@ -381,10 +381,11 @@ class _DualHeadModel(_BaseModel):
             pose_out, pose_targets, self.strides, feat_sizes,
             head_type='pose')
 
-        # Apply det_weight_mult for staged training
-        det_cls = det_l['cls'] * self.det_weight_mult
-        det_ciou = det_l['ciou'] * self.det_weight_mult
-        det_dfl = det_l['dfl'] * self.det_weight_mult
+        # Apply det_weight_mult during training only (val uses full weight)
+        mult = self.det_weight_mult if self.training else 1.0
+        det_cls = det_l['cls'] * mult
+        det_ciou = det_l['ciou'] * mult
+        det_dfl = det_l['dfl'] * mult
 
         total = det_cls + det_ciou + det_dfl
         if 'kpt' in pose_l:
