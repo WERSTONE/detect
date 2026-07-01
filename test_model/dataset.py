@@ -106,8 +106,12 @@ class COCOMultiTaskDataset(Dataset):
 
         # Collect image-label pairs
         self.samples = []
+        n_labels = 0
+        n_no_person = 0
+        n_no_image = 0
         if self.label_dir and self.label_dir.exists():
             for lb in self.label_dir.glob('*.txt'):
+                n_labels += 1
                 # person_only filter: check raw class 0 in label file
                 if person_only:
                     has_person = False
@@ -121,6 +125,7 @@ class COCOMultiTaskDataset(Dataset):
                     except Exception:
                         pass
                     if not has_person:
+                        n_no_person += 1
                         continue
 
                 img_name = lb.stem + '.jpg'
@@ -129,6 +134,13 @@ class COCOMultiTaskDataset(Dataset):
                     img_path = self.img_dir / (lb.stem + '.png')
                 if img_path.exists():
                     self.samples.append((str(img_path), str(lb)))
+                else:
+                    n_no_image += 1
+
+            if person_only:
+                print(f"  Dataset({img_dir}): {n_labels} labels, "
+                      f"{n_no_person} filtered (no person), "
+                      f"{n_no_image} no image, {len(self.samples)} kept", flush=True)
         else:
             # Only images (no labels) — for prediction
             for ext in ('*.jpg', '*.png', '*.jpeg'):
