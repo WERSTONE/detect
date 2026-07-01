@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import yaml
+from torch.utils.data import DataLoader, Subset
 
 try:
     from tqdm import tqdm
@@ -338,13 +339,15 @@ def main():
     p.add_argument('--class-id-format', type=str, default=None,
                    choices=['yolo80', 'coco', 'auto'],
                    help='Label class id format')
+    p.add_argument('--max-samples', type=int, default=0,
+                   help='Optional sample limit for quick evaluation smoke tests')
     p.add_argument('--score-thresh', type=float, default=None, help='Prediction score threshold')
     p.add_argument('--iou-thresh', type=float, default=None, help='NMS IoU threshold')
     p.add_argument('--output', type=str, default=None, help='JSON output path')
     args = p.parse_args()
 
     from test_model.models import create_model
-    from test_model.dataset import create_dataloader
+    from test_model.dataset import create_dataloader, collate_fn
 
     cfg = {}
     if args.config:
@@ -406,6 +409,15 @@ def main():
         num_workers=workers,
         class_id_format=class_id_format,
     )
+    if args.max_samples and 0 < args.max_samples < len(loader.dataset):
+        loader = DataLoader(
+            Subset(loader.dataset, range(args.max_samples)),
+            batch_size=batch,
+            shuffle=False,
+            num_workers=workers,
+            collate_fn=collate_fn,
+            pin_memory=True,
+        )
     print(f"Eval samples: {len(loader.dataset)} | input_size={input_size} | "
           f"class_id_format={class_id_format}")
 
