@@ -20,7 +20,7 @@ from urllib.request import urlretrieve
 import numpy as np
 
 CLASS_MAP = {
-    0: 0,    # person
+    1: 0,    # person (COCO category_id=1)
     2: 1,    # bicycle
     3: 2,    # car
     4: 3,    # motorcycle
