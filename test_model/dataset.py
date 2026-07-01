@@ -119,9 +119,12 @@ class COCOMultiTaskDataset(Dataset):
                         with open(lb, 'r') as f:
                             for line in f:
                                 parts = line.strip().split()
-                                if parts and int(float(parts[0])) == 0:
-                                    has_person = True
-                                    break
+                                if parts:
+                                    raw_cls = int(float(parts[0]))
+                                    cls_20 = self._map_class_id(raw_cls, len(parts) > 5)
+                                    if cls_20 is not None and cls_20 == 0:
+                                        has_person = True
+                                        break
                     except Exception:
                         pass
                     if not has_person:
