@@ -127,8 +127,8 @@ Debug:       {cfg.get('debug', False)}"""]
         s1 = ts.get('stage1', {})
         s2 = ts.get('stage2', {})
         lines.append(f"""Two-Stage:   enabled
-  Stage1:    epochs={s1.get('epochs', 80)} lr={s1.get('lr0', 0.005)} freeze_backbone={s1.get('freeze_backbone', False)}
-  Stage2:    epochs={s2.get('epochs', 200)} lr={s2.get('lr0', 0.002)} det_weight_mult={s2.get('det_weight_mult', 0.5)}""")
+  Stage1:    epochs={s1.get('epochs', 50)} lr={s1.get('lr0', 0.005)} freeze_backbone={s1.get('freeze_backbone', False)}
+  Stage2:    epochs={s2.get('epochs', 150)} lr={s2.get('lr0', 0.002)} det_weight_warmup={s2.get('det_weight_warmup_epochs', 5)}""")
     lines.append(f"{'='*60}")
     print('\n'.join(lines))
 

@@ -300,7 +300,8 @@ class Trainer:
         print(f"  Loaded: {path} (epoch {self.current_epoch})")
 
     def fit(self, epochs, train_loader, val_loader=None,
-            save_prefix='model', close_mosaic_epochs=10):
+            save_prefix='model', close_mosaic_epochs=10,
+            on_epoch_start=None):
         """Main training loop.
 
         Args:
@@ -309,6 +310,7 @@ class Trainer:
             val_loader: Validation DataLoader
             save_prefix: Prefix for checkpoint filenames
             close_mosaic_epochs: Disable mosaic for last N epochs
+            on_epoch_start: Optional callback(epoch) called at start of each epoch
         """
         print(f"\n{'='*60}")
         print(f"Training: {save_prefix} | Epochs: {epochs} | "
@@ -320,6 +322,8 @@ class Trainer:
 
         for epoch in range(self.current_epoch, epochs):
             self.current_epoch = epoch
+            if on_epoch_start:
+                on_epoch_start(epoch)
             t0 = time.time()
 
             close_mosaic = (close_mosaic_epochs > 0 and

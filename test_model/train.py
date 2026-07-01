@@ -249,15 +249,19 @@ def main():
 
         # ---- Stage 2: both heads ----
         model.train_det = True
-        model.det_weight_mult = s2.get('det_weight_mult', 0.5)
+        model.det_weight_warmup_epochs = s2.get('det_weight_warmup_epochs', 5)
+        model.det_weight_mult = 0.0  # start from 0
         model.unfreeze_all()
+
+        def _on_epoch_start(epoch):
+            model.update_det_weight(epoch)
 
         s2_epochs = min(3, s2.get('epochs', 200)) if opts['debug'] else s2.get('epochs', 200)
         s2_lr = s2.get('lr0', opts['lr'] * 0.4)
 
         print(f"\n{'='*60}")
         print(f"Stage 2: both heads | Epochs: {s2_epochs} | LR: {s2_lr}")
-        print(f"  det_weight_mult: {model.det_weight_mult}")
+        print(f"  det_weight warmup over {model.det_weight_warmup_epochs} epochs (0→1)")
         print(f"{'='*60}")
 
         trainer2 = _make_trainer(s2_lr)
@@ -267,6 +271,7 @@ def main():
             val_loader=val_loader,
             save_prefix=model_name,
             close_mosaic_epochs=close_mosaic,
+            on_epoch_start=_on_epoch_start,
         )
 
         print(f"\nTwo-stage training complete for {model_name}!")

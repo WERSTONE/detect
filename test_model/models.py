@@ -220,6 +220,7 @@ class _DualHeadModel(_BaseModel):
         self.train_det = True
         self.train_pose = True
         self.det_weight_mult = 1.0
+        self.det_weight_warmup_epochs = 0
 
         self.det_loss = MultiTaskLoss(
             w_box=7.5, w_cls=0.5, w_dfl=1.5,
@@ -239,6 +240,13 @@ class _DualHeadModel(_BaseModel):
     def unfreeze_all(self):
         for p in self.parameters():
             p.requires_grad = True
+
+    def update_det_weight(self, epoch):
+        """Linear warmup: det_weight_mult 0→1 over det_weight_warmup_epochs."""
+        if self.det_weight_warmup_epochs <= 0:
+            self.det_weight_mult = 1.0
+        else:
+            self.det_weight_mult = min(1.0, epoch / self.det_weight_warmup_epochs)
 
     @torch.no_grad()
     def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6):
