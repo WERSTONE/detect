@@ -117,6 +117,7 @@ def main():
     if device == 'cuda':
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
+        torch.set_num_threads(1)  # Limit main-process CPU threads
         gpu_id = cfg.get('gpu_id', 0)
         if torch.cuda.device_count() > 1:
             torch.cuda.set_device(gpu_id % torch.cuda.device_count())
