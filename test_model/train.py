@@ -260,7 +260,9 @@ def main():
             close_mosaic_epochs=close_mosaic,
         )
 
-        # Release stage1 loader to free memory before creating full loader
+        # Release stage1 loader workers before creating full loader
+        if hasattr(train_loader_s1, '_iterator') and train_loader_s1._iterator is not None:
+            train_loader_s1._iterator._shutdown_workers()
         del train_loader_s1
 
         # ---- Stage 2: both heads (full data) ----
