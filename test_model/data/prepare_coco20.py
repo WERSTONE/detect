@@ -26,12 +26,12 @@ CLASS_MAP = {
     4: 3,    # motorcycle
     6: 4,    # bus
     8: 5,    # truck
-    17: 6,   # dog
-    15: 7,   # cat
-    14: 8,   # horse
+    18: 6,   # dog
+    17: 7,   # cat
+    19: 8,   # horse
     16: 9,   # bird
     21: 10,  # cow
-    19: 11,  # sheep
+    20: 11,  # sheep
     62: 12,  # chair
     67: 13,  # dining table
     73: 14,  # laptop
@@ -138,6 +138,8 @@ def filter_coco_to_yolo(data_dir):
         # ---- Write YOLO labels ----
         label_dir = data_dir / 'labels' / split
         label_dir.mkdir(parents=True, exist_ok=True)
+        for old_label in label_dir.glob('*.txt'):
+            old_label.unlink()
 
         converted = 0
         skipped_no_image = 0
