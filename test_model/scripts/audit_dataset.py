@@ -25,7 +25,7 @@ def parse_args():
     p.add_argument('--img-dir', type=str, default='train2017')
     p.add_argument('--label-dir', type=str, default='labels/train2017')
     p.add_argument('--input-size', type=int, default=640)
-    p.add_argument('--class-id-format', type=str, default='yolo80',
+    p.add_argument('--class-id-format', type=str, default='coco20',
                    choices=['yolo80', 'coco', 'coco20', 'internal', 'internal20', 'auto'])
     p.add_argument('--max-samples', type=int, default=0,
                    help='0 means audit all samples')

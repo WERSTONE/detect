@@ -89,7 +89,7 @@ class COCOMultiTaskDataset(Dataset):
 
     def __init__(self, data_dir, img_dir, label_dir=None,
                  input_size=640, use_mosaic=True, augment=True,
-                 class_id_format='yolo80',
+                 class_id_format='coco20',
                  hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
                  flip_lr=0.5, mosaic_prob=0.5, person_only=False):
         self.data_dir = Path(data_dir)
@@ -515,7 +515,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       use_mosaic=True, augment=True,
                       shuffle=True, num_workers=4,
                       distributed=False, rank=0, world_size=1,
-                      drop_last=True, class_id_format='yolo80',
+                      drop_last=True, class_id_format='coco20',
                       hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
                       flip_lr=0.5, mosaic_prob=0.5, person_only=False):
     """Create DataLoader for COCO dataset."""

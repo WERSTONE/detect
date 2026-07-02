@@ -158,6 +158,8 @@ def main():
 
     # Create val dataloader (shared)
     data_root = Path(opts['data_root'])
+    class_id_format = d_cfg.get('class_id_format', 'coco20')
+    print(f"Label format: {class_id_format} (prepared internal ids 0..19)")
     val_loader = create_dataloader(
         data_dir=data_root,
         img_dir=d_cfg.get('val_img', 'images/val2017'),
@@ -169,7 +171,7 @@ def main():
         shuffle=False,
         num_workers=opts['workers'],
         drop_last=False,
-        class_id_format=d_cfg.get('class_id_format', 'yolo80'),
+        class_id_format=class_id_format,
     )
     print(f"Val: {len(val_loader.dataset)} samples")
 
@@ -211,7 +213,7 @@ def main():
             shuffle=True,
             num_workers=opts['workers'],
             drop_last=True,
-            class_id_format=d_cfg.get('class_id_format', 'yolo80'),
+            class_id_format=class_id_format,
             hsv_h=a_cfg.get('hsv_h', 0.015),
             hsv_s=a_cfg.get('hsv_s', 0.7),
             hsv_v=a_cfg.get('hsv_v', 0.4),

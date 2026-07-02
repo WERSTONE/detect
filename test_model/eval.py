@@ -388,7 +388,7 @@ def main():
     batch = args.batch or e_cfg.get('batch_size', 16)
     workers = args.workers if args.workers is not None else cfg.get('training', {}).get('workers', 4)
     input_size = args.input_size or d_cfg.get('input_size', 640)
-    class_id_format = args.class_id_format or d_cfg.get('class_id_format', 'yolo80')
+    class_id_format = args.class_id_format or d_cfg.get('class_id_format', 'coco20')
     score_thresh = args.score_thresh if args.score_thresh is not None else e_cfg.get('score_thresh', 0.01)
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else e_cfg.get('iou_thresh', 0.6)
 
