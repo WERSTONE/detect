@@ -215,6 +215,7 @@ def main():
             hsv_s=a_cfg.get('hsv_s', 0.7),
             hsv_v=a_cfg.get('hsv_v', 0.4),
             flip_lr=a_cfg.get('flip_lr', 0.5),
+            mosaic_prob=a_cfg.get('mosaic_prob', 0.5),
             person_only=person_only,
         )
 

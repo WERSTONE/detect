@@ -95,6 +95,7 @@ augmentation:
   flip_lr: 0.5             # horizontal flip probability
   scale: 0.5               # scale
   translate: 0.1           # translation
+  mosaic_prob: 0.5         # mosaic probability (0=never, 1=always)
 
 # ---- Evaluation ----
 eval:

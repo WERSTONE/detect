@@ -91,12 +91,13 @@ class COCOMultiTaskDataset(Dataset):
                  input_size=640, use_mosaic=True, augment=True,
                  class_id_format='yolo80',
                  hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-                 flip_lr=0.5, person_only=False):
+                 flip_lr=0.5, mosaic_prob=0.5, person_only=False):
         self.data_dir = Path(data_dir)
         self.img_dir = self.data_dir / img_dir
         self.label_dir = self.data_dir / label_dir if label_dir else None
         self.input_size = input_size
         self.use_mosaic = use_mosaic and augment
+        self.mosaic_prob = mosaic_prob
         self.augment = augment
         self.class_id_format = class_id_format
         self.hsv_h = hsv_h
@@ -161,7 +162,7 @@ class COCOMultiTaskDataset(Dataset):
         return len(self.samples)
 
     def __getitem__(self, idx):
-        if self.use_mosaic and random.random() < 0.5:
+        if self.use_mosaic and random.random() < self.mosaic_prob:
             return self._load_mosaic(idx)
         return self._load_single(idx)
 
@@ -513,7 +514,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       distributed=False, rank=0, world_size=1,
                       drop_last=True, class_id_format='yolo80',
                       hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-                      flip_lr=0.5, person_only=False):
+                      flip_lr=0.5, mosaic_prob=0.5, person_only=False):
     """Create DataLoader for COCO dataset."""
     dataset = COCOMultiTaskDataset(
         data_dir=data_dir,
@@ -527,6 +528,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
         hsv_s=hsv_s,
         hsv_v=hsv_v,
         flip_lr=flip_lr,
+        mosaic_prob=mosaic_prob,
         person_only=person_only,
     )
 
