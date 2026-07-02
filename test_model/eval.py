@@ -114,7 +114,7 @@ def compute_ap_by_class(predictions, ground_truths, iou_thresh=0.5):
         ap = 0.0
         for t in np.linspace(0, 1, 101):
             ap += (np.max(precisions[recalls >= t]) if np.any(recalls >= t) else 0) / 101.0
-        aps[cls_id] = float(ap)
+        aps[cls_id] = float(np.clip(ap, 0.0, 1.0))
 
     return aps
 
@@ -167,20 +167,27 @@ def compute_pose_ap(predictions, ground_truths):
     all_dets = []
     gt_person_counts = []
 
+    for gt in ground_truths:
+        person_mask = gt['classes'] == 0
+        if 'kpts' in gt and len(gt['kpts']) == len(gt['classes']):
+            visible_mask = (gt['kpts'][:, :, 2] > 0).any(axis=1)
+            person_mask = person_mask & visible_mask
+        else:
+            person_mask = np.zeros_like(person_mask, dtype=bool)
+        gt_person_counts.append(int(person_mask.sum()))
+
     for img_idx, pred in enumerate(predictions):
         if 'person_boxes' not in pred:
             continue
         p_boxes = pred['person_boxes']
         p_scores = pred['person_scores']
         p_kpts = pred['person_kpts']
+        if len(p_kpts) != len(p_boxes):
+            p_kpts = np.zeros((len(p_boxes), 17, 3), dtype=np.float32)
 
         for i in range(len(p_boxes)):
             all_dets.append((img_idx, float(p_scores[i]),
                             p_boxes[i].tolist(), p_kpts[i]))
-
-        gt = ground_truths[img_idx]
-        person_mask = gt['classes'] == 0
-        gt_person_counts.append(int(person_mask.sum()))
 
     all_dets.sort(key=lambda x: x[1], reverse=True)
     total_gt = sum(gt_person_counts)
@@ -195,6 +202,11 @@ def compute_pose_ap(predictions, ground_truths):
     for det_idx, (img_idx, score, det_box, det_kpts) in enumerate(all_dets):
         gt = ground_truths[img_idx]
         person_mask = gt['classes'] == 0
+        if 'kpts' in gt and len(gt['kpts']) == len(gt['classes']):
+            visible_mask = (gt['kpts'][:, :, 2] > 0).any(axis=1)
+            person_mask = person_mask & visible_mask
+        else:
+            person_mask = np.zeros_like(person_mask, dtype=bool)
         if not person_mask.any():
             fp[det_idx] = 1
             continue
@@ -230,7 +242,19 @@ def compute_pose_ap(predictions, ground_truths):
     ap = 0.0
     for t in np.linspace(0, 1, 101):
         ap += (np.max(precisions[recalls >= t]) if np.any(recalls >= t) else 0) / 101.0
-    return float(ap)
+    return float(np.clip(ap, 0.0, 1.0))
+
+
+def _to_numpy(value, dtype, shape):
+    """Convert torch/numpy/list predictions to a numpy array with a stable shape."""
+    if value is None:
+        return np.zeros(shape, dtype=dtype)
+    if isinstance(value, torch.Tensor):
+        value = value.detach().cpu().numpy()
+    arr = np.asarray(value, dtype=dtype)
+    if arr.size == 0:
+        return np.zeros(shape, dtype=dtype)
+    return arr
 
 
 def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6):
@@ -251,14 +275,25 @@ def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6
 
             for i in range(len(images)):
                 pred = predictions[i]
+                boxes_t = pred['boxes']
+                scores_t = pred['scores']
+                classes_t = pred['classes']
+                person_mask_t = classes_t == 0
+                person_boxes = pred.get('person_boxes', boxes_t[person_mask_t])
+                person_scores = pred.get('person_scores', scores_t[person_mask_t])
+                person_kpts = pred.get('person_kpts', pred.get('kpts'))
+                person_boxes_np = _to_numpy(person_boxes, np.float32, (0, 4))
+                person_scores_np = _to_numpy(person_scores, np.float32, (0,))
+                person_kpts_np = _to_numpy(person_kpts, np.float32, (0, 17, 3))
+                if len(person_kpts_np) != len(person_boxes_np):
+                    person_kpts_np = np.zeros((len(person_boxes_np), 17, 3), dtype=np.float32)
                 all_preds.append({
-                    'boxes': pred['boxes'].cpu().numpy().astype(np.float32),
-                    'scores': pred['scores'].cpu().numpy().astype(np.float32),
-                    'classes': pred['classes'].cpu().numpy().astype(np.int32),
-                    'person_boxes': pred.get('person_boxes', pred['boxes'][pred['classes'] == 0]).cpu().numpy().astype(np.float32),
-                    'person_scores': pred.get('person_scores', pred['scores'][pred['classes'] == 0]).cpu().numpy().astype(np.float32),
-                    'person_kpts': pred.get('person_kpts',
-                        pred.get('kpts', np.zeros((0, 17, 3), dtype=np.float32))).cpu().numpy().astype(np.float32),
+                    'boxes': _to_numpy(boxes_t, np.float32, (0, 4)),
+                    'scores': _to_numpy(scores_t, np.float32, (0,)),
+                    'classes': _to_numpy(classes_t, np.int32, (0,)),
+                    'person_boxes': person_boxes_np,
+                    'person_scores': person_scores_np,
+                    'person_kpts': person_kpts_np,
                 })
 
                 all_gts.append({
