@@ -28,7 +28,7 @@ data:
 training:
   epochs: 200
   batch_size: 32            # 24GB GPU: start with 24; reduce to 16/12 if OOM
-  workers: 20
+  workers: 16
 
   # Optimizer (SGD matches YOLOv8 official recipe)
   optimizer: sgd           # sgd | adamw
