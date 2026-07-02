@@ -74,27 +74,33 @@ class TaskAlignedAssigner:
         if num_gts == 0:
             return [None] * num_levels
 
-        level_ranges = self._build_level_ranges(strides, num_levels)
+        batch_indices = (
+            batch_indices.to(device=device, dtype=torch.long)
+            if batch_indices is not None else
+            torch.zeros(num_gts, device=device, dtype=torch.long)
+        )
 
-        # Initialize per-level targets
-        targets = [{
-            'grid_xy': [], 'gt_boxes': [], 'gt_classes': [],
-            'gt_kpts': [], 'batch_idx': [], 'align_score': [],
-        } for _ in range(num_levels)]
-
-        # Concatenate all levels
         offsets = []
-        level_W = []
-        total_N = 0
+        level_ids = []
+        level_w = []
+        total_n = 0
         for lvl, (H, W) in enumerate(feat_sizes):
-            offsets.append(total_N)
-            level_W.append(W)
-            total_N += H * W
+            offsets.append(total_n)
+            n_lvl = H * W
+            total_n += n_lvl
+            level_ids.append(torch.full((n_lvl,), lvl, device=device, dtype=torch.long))
+            level_w.append(W)
 
-        all_scores = torch.cat([s.view(s.shape[0], -1, s.shape[-1]) for s in pred_scores], dim=1)
-        all_boxes = torch.cat([b.view(b.shape[0], -1, 4) for b in pred_boxes], dim=1)
+        offsets_t = torch.tensor(offsets, device=device, dtype=torch.long)
+        level_w_t = torch.tensor(level_w, device=device, dtype=torch.long)
+        level_ids = torch.cat(level_ids, dim=0)
 
-        # Build all grid center coordinates
+        all_scores = torch.cat(
+            [s.reshape(s.shape[0], -1, s.shape[-1]) for s in pred_scores], dim=1)
+        all_boxes = torch.cat(
+            [b.reshape(b.shape[0], -1, 4) for b in pred_boxes], dim=1)
+        B = all_scores.shape[0]
+
         all_centers = []
         for lvl, (H, W) in enumerate(feat_sizes):
             stride = strides[lvl]
@@ -106,133 +112,113 @@ class TaskAlignedAssigner:
             all_centers.append(torch.stack([cx.flatten(), cy.flatten()], dim=1))
         all_centers = torch.cat(all_centers, dim=0)
 
-        for gt_i in range(num_gts):
-            gt_box = gt_boxes[gt_i]
-            gt_cls_i = gt_classes[gt_i].item()
-            gt_batch = batch_indices[gt_i].item() if batch_indices is not None else 0
+        if self.center_radius >= 0:
+            gt_centers = (gt_boxes[:, :2] + gt_boxes[:, 2:]) * 0.5
+            max_dist = self.center_radius * strides[0]
+            center_mask = (all_centers.unsqueeze(0) - gt_centers.unsqueeze(1)).norm(dim=2) <= max_dist
+        else:
+            center_x = all_centers[:, 0].unsqueeze(0)
+            center_y = all_centers[:, 1].unsqueeze(0)
+            center_mask = (
+                (center_x >= gt_boxes[:, 0:1]) &
+                (center_x <= gt_boxes[:, 2:3]) &
+                (center_y >= gt_boxes[:, 1:2]) &
+                (center_y <= gt_boxes[:, 3:4])
+            )
 
-            # Center constraint
-            if self.center_radius >= 0:
-                gt_cx = (gt_box[0] + gt_box[2]) / 2
-                gt_cy = (gt_box[1] + gt_box[3]) / 2
-                max_dist = self.center_radius * strides[0]
-                dist = (all_centers - torch.tensor([gt_cx, gt_cy], device=device)).norm(dim=1)
-                center_mask = dist <= max_dist
+        level_ranges = self._build_level_ranges(strides, num_levels)
+        wh = (gt_boxes[:, 2:] - gt_boxes[:, :2]).clamp(min=0)
+        max_side = wh.max(dim=1).values
+        valid_levels = torch.zeros(num_gts, num_levels, device=device, dtype=torch.bool)
+        for lvl, (lo, hi) in enumerate(level_ranges):
+            if lvl == num_levels - 1:
+                valid_levels[:, lvl] = max_side >= lo
             else:
-                center_mask = (
-                    (all_centers[:, 0] >= gt_box[0]) &
-                    (all_centers[:, 0] <= gt_box[2]) &
-                    (all_centers[:, 1] >= gt_box[1]) &
-                    (all_centers[:, 1] <= gt_box[3])
-                )
+                valid_levels[:, lvl] = (max_side >= lo) & (max_side < hi)
 
-            # Level filtering by box size
-            gt_w, gt_h = (gt_box[2] - gt_box[0]).item(), (gt_box[3] - gt_box[1]).item()
-            max_side = max(gt_w, gt_h)
+        base_levels = valid_levels.clone()
+        valid_levels[:, 1:] |= base_levels[:, :-1]
+        valid_levels[:, :-1] |= base_levels[:, 1:]
+        no_level = ~valid_levels.any(dim=1)
+        fallback = torch.where(
+            max_side >= level_ranges[-1][0],
+            torch.full_like(batch_indices, num_levels - 1),
+            torch.zeros_like(batch_indices),
+        )
+        valid_levels[no_level, fallback[no_level]] = True
 
-            valid_levels = set()
-            for lvl, (lo, hi) in enumerate(level_ranges):
-                if lvl == num_levels - 1:
-                    if max_side >= lo:
-                        valid_levels.add(lvl)
-                elif lo <= max_side < hi:
-                    valid_levels.add(lvl)
-            adjacent = set()
-            for lvl in valid_levels:
-                if lvl > 0:
-                    adjacent.add(lvl - 1)
-                if lvl < num_levels - 1:
-                    adjacent.add(lvl + 1)
-            valid_levels |= adjacent
-            if not valid_levels:
-                valid_levels.add(num_levels - 1 if max_side >= level_ranges[-1][0] else 0)
+        valid_mask = center_mask & valid_levels[:, level_ids]
+        valid_count = valid_mask.sum(dim=1)
+        valid_mask = torch.where((valid_count == 0).unsqueeze(1), center_mask, valid_mask)
+        valid_count = valid_mask.sum(dim=1)
+        active = valid_count > 0
+        if active.nonzero(as_tuple=True)[0].numel() == 0:
+            return [None] * num_levels
 
-            level_mask = torch.zeros(total_N, dtype=torch.bool, device=device)
-            for lvl in valid_levels:
-                start = offsets[lvl]
-                end = start + feat_sizes[lvl][0] * feat_sizes[lvl][1]
-                level_mask[start:end] = True
+        score_idx = gt_classes.clamp(0, all_scores.shape[-1] - 1)
+        if all_scores.shape[-1] == 1:
+            score_idx = torch.zeros_like(score_idx)
+        gt_scores = all_scores[batch_indices].gather(
+            2, score_idx.view(num_gts, 1, 1).expand(-1, total_n, 1)).squeeze(-1)
 
-            valid_mask = center_mask & level_mask
-            valid_count = valid_mask.sum().item()
-            if valid_count == 0:
-                valid_mask = center_mask
-                valid_count = valid_mask.sum().item()
-            if valid_count == 0:
-                continue
+        gt_pred_boxes = all_boxes[batch_indices]
+        lt = torch.max(gt_pred_boxes[..., :2], gt_boxes[:, None, :2])
+        rb = torch.min(gt_pred_boxes[..., 2:], gt_boxes[:, None, 2:])
+        inter_wh = (rb - lt).clamp(min=0)
+        inter = inter_wh[..., 0] * inter_wh[..., 1]
+        pred_area = (
+            (gt_pred_boxes[..., 2] - gt_pred_boxes[..., 0]).clamp(min=1e-7) *
+            (gt_pred_boxes[..., 3] - gt_pred_boxes[..., 1]).clamp(min=1e-7)
+        )
+        gt_area = (
+            (gt_boxes[:, 2] - gt_boxes[:, 0]).clamp(min=1e-7) *
+            (gt_boxes[:, 3] - gt_boxes[:, 1]).clamp(min=1e-7)
+        ).unsqueeze(1)
+        ious = inter / (pred_area + gt_area - inter + 1e-16)
 
-            # Alignment score
-            valid_indices = valid_mask.nonzero(as_tuple=True)[0]
+        align = gt_scores.pow(self.alpha) * ious.pow(self.beta)
+        align = align.masked_fill(~valid_mask, -1.0)
+        topk = min(self.topk, total_n)
+        topk_score, topk_idx = align.topk(topk, dim=1)
+        keep = active.unsqueeze(1) & (topk_score >= 0)
+        if keep.nonzero(as_tuple=True)[0].numel() == 0:
+            return [None] * num_levels
 
-            # Map class index to head's class index space
-            # For dual-head: person(0) -> PoseHead cls_idx=0, det classes(1..19) -> DetectHead cls_idx=0..18
-            # For unified-head: class 0..19 direct
-            if all_scores.shape[-1] == 1:
-                # Pose head: only person class
-                score_idx = 0
-            elif all_scores.shape[-1] <= num_det_classes:
-                # Detect head or unified head
-                score_idx = gt_cls_i
-            else:
-                score_idx = gt_cls_i
+        gt_sel = torch.arange(num_gts, device=device).view(-1, 1).expand(-1, topk)[keep]
+        global_idx = topk_idx[keep]
+        align_sel = topk_score[keep]
+        level_sel = level_ids[global_idx]
+        local_idx = global_idx - offsets_t[level_sel]
+        gx = local_idx % level_w_t[level_sel]
+        gy = local_idx // level_w_t[level_sel]
+        batch_sel = batch_indices[gt_sel]
+        boxes_sel = gt_boxes[gt_sel]
+        classes_sel = gt_classes[gt_sel]
 
-            score_idx = min(score_idx, all_scores.shape[-1] - 1)
-            cls_valid = all_scores[gt_batch, valid_indices, score_idx]
-            ious_valid = _box_iou(all_boxes[gt_batch, valid_indices], gt_box.unsqueeze(0)).squeeze(-1)
-            align_valid = cls_valid.pow(self.alpha) * ious_valid.pow(self.beta)
-
-            topk = min(self.topk, valid_count)
-            _, topk_local = align_valid.topk(topk)
-
-            gt_kpt_val = None
-            if gt_cls_i == 0 and gt_kpts is not None and gt_i < len(gt_kpts):
-                gt_kpt_val = gt_kpts[gt_i]
-
-            for k in range(topk):
-                global_idx = valid_indices[topk_local[k]].item()
-
-                for lvl in range(num_levels - 1, -1, -1):
-                    if global_idx >= offsets[lvl]:
-                        break
-
-                W_l = level_W[lvl]
-                local_idx = global_idx - offsets[lvl]
-                gx = local_idx % W_l
-                gy = local_idx // W_l
-
-                t = targets[lvl]
-                t['grid_xy'].append(torch.tensor([gx, gy], device=device))
-                t['gt_boxes'].append(gt_box)
-                t['gt_classes'].append(gt_cls_i)
-                t['batch_idx'].append(gt_batch)
-                t['align_score'].append(align_valid[topk_local[k]])
-                t['gt_kpts'].append(gt_kpt_val)
-
-        # Resolve conflicts: keep the assignment with highest alignment per grid cell
         merged = []
         for lvl in range(num_levels):
-            t = targets[lvl]
-            if len(t['grid_xy']) == 0:
+            lvl_pos = (level_sel == lvl).nonzero(as_tuple=True)[0]
+            if lvl_pos.numel() == 0:
                 merged.append(None)
                 continue
 
-            best_by_cell = {}
-            for i, (grid, batch_idx, align_score) in enumerate(
-                    zip(t['grid_xy'], t['batch_idx'], t['align_score'])):
-                key = (int(batch_idx), int(grid[0]), int(grid[1]))
-                prev = best_by_cell.get(key)
-                if prev is None or align_score > t['align_score'][prev]:
-                    best_by_cell[key] = i
-            keep = sorted(best_by_cell.values())
-            for key in t:
-                t[key] = [t[key][i] for i in keep]
+            H, W = feat_sizes[lvl]
+            lvl_local = local_idx[lvl_pos]
+            cell_key = batch_sel[lvl_pos] * (H * W) + lvl_local
+            best_score = torch.full((B * H * W,), -1.0, device=device, dtype=align_sel.dtype)
+            best_score.scatter_reduce_(0, cell_key, align_sel[lvl_pos], reduce='amax', include_self=True)
+            keep_pos = lvl_pos[align_sel[lvl_pos] == best_score[cell_key]]
+
+            grid_xy = torch.stack([gx[keep_pos], gy[keep_pos]], dim=1)
+            cls_keep = classes_sel[keep_pos]
+            person_pos = (cls_keep == 0).nonzero(as_tuple=True)[0]
 
             merged.append({
-                'grid_xy': torch.stack(t['grid_xy'], dim=0),
-                'gt_boxes': torch.stack(t['gt_boxes'], dim=0),
-                'gt_classes': torch.tensor(t['gt_classes'], device=device, dtype=torch.long),
-                'gt_kpts': (torch.stack([x for x in t['gt_kpts'] if x is not None])
-                            if any(x is not None for x in t['gt_kpts']) else None),
-                'batch_idx': torch.tensor(t['batch_idx'], device=device, dtype=torch.long),
+                'grid_xy': grid_xy,
+                'gt_boxes': boxes_sel[keep_pos],
+                'gt_classes': cls_keep.long(),
+                'gt_kpts': (gt_kpts[gt_sel[keep_pos][person_pos]]
+                            if gt_kpts is not None and person_pos.numel() > 0 else None),
+                'batch_idx': batch_sel[keep_pos].long(),
             })
         return merged
