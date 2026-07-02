@@ -197,16 +197,21 @@ class MultiTaskLoss(nn.Module):
             iou, _, _ = _iou_xyxy(pred_xyxy, gt_boxes)
 
             # Classification targets
-            for i in range(N_pos):
-                c = gt_classes[i].item()
-                if head_type == 'det':
-                    # Dual-head detection classes are already shifted to 0..18.
-                    if 0 <= c < cls_tgt_all.shape[-1]:
-                        cls_tgt_all[batch_idx[i], gy[i] * W + gx[i], c] = 1.0
-                elif head_type == 'pose' and c == 0:
-                    cls_tgt_all[batch_idx[i], gy[i] * W + gx[i], 0] = 1.0
-                elif self.unified_head:
-                    cls_tgt_all[batch_idx[i], gy[i] * W + gx[i], c] = 1.0
+            cls_tgt_flat = cls_tgt_all.view(-1, cls_tgt_all.shape[-1])
+            flat_idx = batch_idx * N_lvl + gy * W + gx
+            if head_type == 'det':
+                # Dual-head detection classes are already shifted to 0..18.
+                valid_cls = (gt_classes >= 0) & (gt_classes < cls_tgt_all.shape[-1])
+                if valid_cls.any():
+                    cls_tgt_flat[flat_idx[valid_cls], gt_classes[valid_cls]] = 1.0
+            elif head_type == 'pose':
+                person_pos = gt_classes == 0
+                if person_pos.any():
+                    cls_tgt_flat[flat_idx[person_pos], 0] = 1.0
+            elif self.unified_head:
+                valid_cls = (gt_classes >= 0) & (gt_classes < cls_tgt_all.shape[-1])
+                if valid_cls.any():
+                    cls_tgt_flat[flat_idx[valid_cls], gt_classes[valid_cls]] = 1.0
 
             loss_cls += _cls_loss(cls_p_all.reshape(-1, cls_p_all.shape[-1]),
                                   cls_tgt_all.reshape(-1, cls_tgt_all.shape[-1]))
@@ -232,9 +237,9 @@ class MultiTaskLoss(nn.Module):
             # Keypoint loss (only for person class)
             person_mask = gt_classes == 0
             if person_mask.any() and kpt_p is not None:
-                n_person = person_mask.sum().item()
-                total_person_pos += n_person
                 p_idx = person_mask.nonzero(as_tuple=True)[0].to(device)
+                n_person = p_idx.numel()
+                total_person_pos += n_person
                 p_boxes = gt_boxes[p_idx]
                 p_locs = torch.stack([locs_x[p_idx], locs_y[p_idx]], dim=1)
 

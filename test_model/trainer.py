@@ -11,7 +11,6 @@ Key features:
 
 import math
 import time
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -47,7 +46,7 @@ class Trainer:
                  log_interval=20, save_interval=20, val_interval=5,
                  save_dir='checkpoints', use_amp=True,
                  ema_decay=0.9999, save_best_by='loss',
-                 use_tensorboard=False):
+                 use_tensorboard=False, check_finite_loss=False):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.grad_clip = grad_clip
@@ -84,6 +83,7 @@ class Trainer:
         self.global_step = 0
         self.save_best_by = save_best_by
         self.best_metric = float('inf') if save_best_by == 'loss' else -float('inf')
+        self.check_finite_loss = check_finite_loss
 
         # EMA
         self.ema_decay = ema_decay
@@ -152,8 +152,8 @@ class Trainer:
             if close_mosaic is not None:
                 loader.dataset.use_mosaic = not close_mosaic
 
-        metrics = defaultdict(float)
-        running = defaultdict(float)
+        metrics = {}
+        running = {}
         n_batches = len(loader)
         step = 0
         seen_step = 0
@@ -184,7 +184,7 @@ class Trainer:
             total_loss = losses['total']
 
             # Check for NaN
-            if torch.isnan(total_loss) or torch.isinf(total_loss):
+            if self.check_finite_loss and not torch.isfinite(total_loss.detach()).item():
                 skipped += 1
                 self.optimizer.zero_grad(set_to_none=True)
                 print(f"  WARNING: NaN/Inf loss at batch {seen_step}/{n_batches}, skipping batch")
@@ -212,35 +212,34 @@ class Trainer:
 
             for k, v in losses.items():
                 if isinstance(v, torch.Tensor):
-                    running[k] += v.item()
-                    metrics[k] += v.item()
+                    value = v.detach()
+                    running[k] = running.get(k, torch.zeros_like(value)) + value
+                    metrics[k] = metrics.get(k, torch.zeros_like(value)) + value
 
             if step % self.log_interval == 0:
                 pct = step / n_batches * 100
-                parts = [f"{k}={running[k] / self.log_interval:.4f}" for k in sorted(running)]
+                parts = [f"{k}={(running[k] / self.log_interval).item():.4f}" for k in sorted(running)]
                 parts.append(f"lr={lr:.2e}")
                 print(f"  [{step}/{n_batches} {pct:.0f}%] " + " ".join(parts))
                 if self.writer:
                     for k in running:
-                        self.writer.add_scalar(f'train/{k}', running[k] / self.log_interval, self.global_step)
+                        self.writer.add_scalar(f'train/{k}', (running[k] / self.log_interval).item(), self.global_step)
                     self.writer.add_scalar('train/lr', lr, self.global_step)
                 running.clear()
 
-        if skipped:
-            metrics['skipped'] = float(skipped)
         if step == 0:
             return metrics
-        for k in metrics:
-            if k != 'skipped':
-                metrics[k] /= step
-        return metrics
+        out = {k: (v / step).item() for k, v in metrics.items()}
+        if skipped:
+            out['skipped'] = float(skipped)
+        return out
 
     @torch.no_grad()
     def validate(self, loader):
         """Validation loop."""
         self.model.eval()
         self._swap_ema(to_ema=True)
-        metrics = defaultdict(float)
+        metrics = {}
 
         for batch in loader:
             images = batch['image'].to(self.device, non_blocking=True)
@@ -260,13 +259,13 @@ class Trainer:
 
             for k, v in losses.items():
                 if isinstance(v, torch.Tensor):
-                    metrics['val_' + k] += v.item()
+                    key = 'val_' + k
+                    value = v.detach()
+                    metrics[key] = metrics.get(key, torch.zeros_like(value)) + value
 
         self._swap_ema(to_ema=True)
         n = max(len(loader), 1)
-        for k in metrics:
-            metrics[k] /= n
-        return metrics
+        return {k: (v / n).item() for k, v in metrics.items()}
 
     def save(self, path, metrics=None):
         self._swap_ema(to_ema=True)

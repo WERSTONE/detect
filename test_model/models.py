@@ -93,6 +93,7 @@ class _BaseModel(nn.Module):
     def _forward_backbone_neck(self, x):
         raise NotImplementedError
 
+    @torch.no_grad()
     def _get_decoded_preds(self, head_outs, feat_sizes):
         """Decode head outputs for assigner consumption.
 
@@ -294,13 +295,14 @@ class _DualHeadModel(_BaseModel):
         det_scores, det_boxes = self._get_decoded_preds(det_out, feat_sizes)
 
         pose_scores, pose_boxes = [], []
-        for lvl in range(len(feat_sizes)):
-            # Pose head has only 1 class
-            cls_p = pose_out['cls'][lvl].permute(0, 2, 3, 1).reshape(B, -1, 1)
-            pose_scores.append(cls_p.sigmoid())
-            H, W = feat_sizes[lvl]
-            grid = _make_grid(W, H, device) * self.strides[lvl]
-            pose_boxes.append(_dfl_decode(pose_out['reg'][lvl], self.reg_max, self.strides[lvl], grid))
+        with torch.no_grad():
+            for lvl in range(len(feat_sizes)):
+                # Pose head has only 1 class
+                cls_p = pose_out['cls'][lvl].permute(0, 2, 3, 1).reshape(B, -1, 1)
+                pose_scores.append(cls_p.sigmoid())
+                H, W = feat_sizes[lvl]
+                grid = _make_grid(W, H, device) * self.strides[lvl]
+                pose_boxes.append(_dfl_decode(pose_out['reg'][lvl], self.reg_max, self.strides[lvl], grid))
 
         # Separate GTs by head
         det_boxes_list = []
@@ -313,40 +315,50 @@ class _DualHeadModel(_BaseModel):
 
         for b in range(B):
             gt = gt_dict_list[b]
-            boxes = gt['boxes'].to(device)
-            classes = gt['classes'].to(device)
-            kpts = gt.get('kpts', torch.zeros(0, 17, 3)).to(device)
+            boxes = gt['boxes']
+            classes = gt['classes']
+            kpts = gt.get('kpts', torch.zeros(0, 17, 3))
+            if len(boxes) == 0:
+                continue
 
-            for i in range(len(boxes)):
-                cls = classes[i].item()
-                if cls == 0:  # person
-                    pose_boxes_list.append(boxes[i])
-                    pose_cls_list.append(0)
-                    if i < len(kpts):
-                        pose_kpts_list.append(kpts[i])
-                    else:
-                        pose_kpts_list.append(torch.zeros(17, 3, device=device))
-                    pose_batch_list.append(b)
-                else:  # detection classes
-                    det_boxes_list.append(boxes[i])
-                    det_cls_list.append(cls - 1)  # shift 1..19 -> 0..18
-                    det_batch_list.append(b)
+            person_mask = classes == 0
+            det_mask = ~person_mask
+
+            if det_mask.any():
+                det_gt_boxes_batch = boxes[det_mask]
+                det_boxes_list.append(det_gt_boxes_batch.to(device, non_blocking=True))
+                det_cls_list.append((classes[det_mask] - 1).to(device, non_blocking=True))
+                det_batch_list.append(torch.full(
+                    (len(det_gt_boxes_batch),), b, device=device, dtype=torch.long))
+
+            if person_mask.any():
+                pose_gt_boxes_batch = boxes[person_mask]
+                pose_boxes_list.append(pose_gt_boxes_batch.to(device, non_blocking=True))
+                pose_cls_list.append(torch.zeros(
+                    len(pose_gt_boxes_batch), device=device, dtype=torch.long))
+                if len(kpts) == len(boxes):
+                    pose_kpts = kpts[person_mask]
+                else:
+                    pose_kpts = torch.zeros(len(pose_gt_boxes_batch), 17, 3, dtype=boxes.dtype)
+                pose_kpts_list.append(pose_kpts.to(device, non_blocking=True))
+                pose_batch_list.append(torch.full(
+                    (len(pose_gt_boxes_batch),), b, device=device, dtype=torch.long))
 
         # Build GT tensors
         if det_boxes_list:
-            det_gt_boxes = torch.stack(det_boxes_list)
-            det_gt_classes = torch.tensor(det_cls_list, device=device, dtype=torch.long)
-            det_gt_batch = torch.tensor(det_batch_list, device=device, dtype=torch.long)
+            det_gt_boxes = torch.cat(det_boxes_list, dim=0)
+            det_gt_classes = torch.cat(det_cls_list, dim=0).long()
+            det_gt_batch = torch.cat(det_batch_list, dim=0)
         else:
             det_gt_boxes = torch.empty(0, 4, device=device)
             det_gt_classes = torch.empty(0, device=device, dtype=torch.long)
             det_gt_batch = torch.empty(0, device=device, dtype=torch.long)
 
         if pose_boxes_list:
-            pose_gt_boxes = torch.stack(pose_boxes_list)
-            pose_gt_classes = torch.zeros(len(pose_boxes_list), device=device, dtype=torch.long)
-            pose_gt_kpts = torch.stack(pose_kpts_list)
-            pose_gt_batch = torch.tensor(pose_batch_list, device=device, dtype=torch.long)
+            pose_gt_boxes = torch.cat(pose_boxes_list, dim=0)
+            pose_gt_classes = torch.cat(pose_cls_list, dim=0)
+            pose_gt_kpts = torch.cat(pose_kpts_list, dim=0)
+            pose_gt_batch = torch.cat(pose_batch_list, dim=0)
         else:
             pose_gt_boxes = torch.empty(0, 4, device=device)
             pose_gt_classes = torch.empty(0, device=device, dtype=torch.long)
@@ -394,17 +406,17 @@ class _DualHeadModel(_BaseModel):
 
         loss_dict = {
             'total': total,
-            'det_cls': det_cls.item(),
-            'det_ciou': det_ciou.item(),
-            'det_dfl': det_dfl.item(),
-            'pose_cls': pose_l['cls'].item(),
-            'pose_ciou': pose_l['ciou'].item(),
-            'pose_dfl': pose_l['dfl'].item(),
+            'det_cls': det_cls.detach(),
+            'det_ciou': det_ciou.detach(),
+            'det_dfl': det_dfl.detach(),
+            'pose_cls': pose_l['cls'].detach(),
+            'pose_ciou': pose_l['ciou'].detach(),
+            'pose_dfl': pose_l['dfl'].detach(),
         }
         if 'kpt' in pose_l:
-            loss_dict['pose_kpt'] = pose_l['kpt'].item()
+            loss_dict['pose_kpt'] = pose_l['kpt'].detach()
         if 'kobj' in pose_l:
-            loss_dict['pose_kobj'] = pose_l['kobj'].item()
+            loss_dict['pose_kobj'] = pose_l['kobj'].detach()
 
         return loss_dict
 
@@ -477,24 +489,27 @@ class ModelB_UnifiedHead(_BaseModel):
         all_boxes, all_classes, all_kpts, all_batch = [], [], [], []
         for b in range(B):
             gt = gt_dict_list[b]
-            boxes = gt['boxes'].to(device)
-            classes = gt['classes'].to(device)
-            kpts = gt.get('kpts', torch.zeros(0, 17, 3)).to(device)
+            boxes = gt['boxes']
+            classes = gt['classes']
+            kpts = gt.get('kpts', torch.zeros(0, 17, 3))
+            if len(boxes) == 0:
+                continue
 
-            for i in range(len(boxes)):
-                all_boxes.append(boxes[i])
-                all_classes.append(classes[i].item())
-                if classes[i] == 0 and i < len(kpts):
-                    all_kpts.append(kpts[i])
-                else:
-                    all_kpts.append(torch.zeros(17, 3, device=device))
-                all_batch.append(b)
+            kpts_full = torch.zeros(len(boxes), 17, 3, dtype=boxes.dtype)
+            person_mask = classes == 0
+            if len(kpts) == len(boxes) and person_mask.any():
+                kpts_full[person_mask] = kpts[person_mask]
+
+            all_boxes.append(boxes.to(device, non_blocking=True))
+            all_classes.append(classes.to(device, non_blocking=True))
+            all_kpts.append(kpts_full.to(device, non_blocking=True))
+            all_batch.append(torch.full((len(boxes),), b, device=device, dtype=torch.long))
 
         if all_boxes:
-            gt_boxes = torch.stack(all_boxes)
-            gt_classes = torch.tensor(all_classes, device=device, dtype=torch.long)
-            gt_kpts = torch.stack(all_kpts)
-            gt_batch = torch.tensor(all_batch, device=device, dtype=torch.long)
+            gt_boxes = torch.cat(all_boxes, dim=0)
+            gt_classes = torch.cat(all_classes, dim=0).long()
+            gt_kpts = torch.cat(all_kpts, dim=0)
+            gt_batch = torch.cat(all_batch, dim=0)
         else:
             gt_boxes = torch.empty(0, 4, device=device)
             gt_classes = torch.empty(0, device=device, dtype=torch.long)
@@ -513,7 +528,7 @@ class ModelB_UnifiedHead(_BaseModel):
             total = total + losses['kpt'] + losses.get('kobj', 0.0)
 
         result = {'total': total}
-        result.update({k: v.item() if isinstance(v, torch.Tensor) else v for k, v in losses.items()})
+        result.update({k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in losses.items()})
         return result
 
 
