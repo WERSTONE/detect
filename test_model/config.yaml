@@ -22,7 +22,7 @@ data:
   val_img: val2017
   val_label: labels/val2017
   input_size: 640
-  class_id_format: yolo80   # yolo80 for standard YOLO COCO labels; coco for raw COCO category_id labels
+  class_id_format: coco20   # coco20 for remapped 0..19 labels; yolo80/coco for source ids
 
 # ---- Training ----
 training:

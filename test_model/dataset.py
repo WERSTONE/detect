@@ -370,9 +370,12 @@ class COCOMultiTaskDataset(Dataset):
         label format:
           - yolo80: standard YOLO COCO ids, person=0, car=2, ...
           - coco: COCO category ids, person=1, car=3, ...
+          - coco20/internal: already remapped ids 0..19 used by this model.
           - auto: prefer yolo80, except keypoint person annotations may be 0 or 1.
         """
         fmt = str(self.class_id_format).lower()
+        if fmt in ('coco20', 'internal', 'internal20'):
+            return cls if 0 <= cls < len(COCO20_CLASSES) else None
         if fmt == 'coco':
             return COCO_CATEGORY_ID_TO_20.get(cls)
         if fmt == 'auto':

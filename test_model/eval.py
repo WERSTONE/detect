@@ -337,7 +337,7 @@ def main():
     p.add_argument('--label-dir', type=str, default=None, help='Validation label directory under data root')
     p.add_argument('--input-size', type=int, default=None, help='Evaluation input size')
     p.add_argument('--class-id-format', type=str, default=None,
-                   choices=['yolo80', 'coco', 'auto'],
+                   choices=['yolo80', 'coco', 'coco20', 'internal', 'internal20', 'auto'],
                    help='Label class id format')
     p.add_argument('--max-samples', type=int, default=0,
                    help='Optional sample limit for quick evaluation smoke tests')
