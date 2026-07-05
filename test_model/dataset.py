@@ -202,6 +202,7 @@ class COCOMultiTaskDataset(Dataset):
             'kpts': kpts,
             'scale': scale,
             'pad': (pad_l, pad_t),
+            'img_path': img_path,
         }
 
     def _load_mosaic(self, idx):
@@ -315,6 +316,7 @@ class COCOMultiTaskDataset(Dataset):
             'kpts': kpts_t,
             'scale': 1.0,
             'pad': (0, 0),
+            'img_path': '',
         }
 
     def _parse_yolo_label(self, label_path, img_w, img_h):
@@ -507,6 +509,9 @@ def collate_fn(batch):
         'boxes': [x['boxes'] for x in batch],
         'classes': [x['classes'] for x in batch],
         'kpts': [x['kpts'] for x in batch],
+        'scale': [x.get('scale', 1.0) for x in batch],
+        'pad': [x.get('pad', (0, 0)) for x in batch],
+        'img_path': [x.get('img_path', '') for x in batch],
     }
 
 

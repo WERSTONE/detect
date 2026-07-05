@@ -21,6 +21,11 @@ from test_model.heads import DetectHead, PoseHead, UnifiedHead
 from test_model.assigner import TaskAlignedAssigner
 from test_model.loss import MultiTaskLoss
 
+try:
+    from torchvision.ops import batched_nms
+except Exception:  # pragma: no cover - fallback for minimal environments
+    batched_nms = None
+
 
 # ── DFL decode helpers ──
 
@@ -72,6 +77,35 @@ def _nms(boxes, scores, iou_thresh=0.6):
     return torch.tensor(keep, device=boxes.device, dtype=torch.long)
 
 
+def _batched_nms(boxes, scores, classes, iou_thresh=0.6, max_det=300):
+    """Class-aware NMS with a small fallback if torchvision is unavailable."""
+    if boxes.numel() == 0:
+        return torch.empty(0, dtype=torch.long, device=boxes.device)
+
+    if batched_nms is not None:
+        try:
+            keep = batched_nms(boxes, scores, classes, iou_thresh)
+        except RuntimeError:
+            keep = None
+    else:
+        keep = None
+
+    if keep is None:
+        keep_parts = []
+        for cls_id in classes.unique():
+            cls_idx = (classes == cls_id).nonzero(as_tuple=True)[0]
+            cls_keep = _nms(boxes[cls_idx], scores[cls_idx], iou_thresh)
+            if cls_keep.numel() > 0:
+                keep_parts.append(cls_idx[cls_keep])
+        keep = torch.cat(keep_parts) if keep_parts else torch.empty(0, dtype=torch.long, device=boxes.device)
+        if keep.numel() > 1:
+            keep = keep[scores[keep].argsort(descending=True)]
+
+    if max_det and keep.numel() > max_det:
+        keep = keep[:max_det]
+    return keep
+
+
 # ═══════════════════════════════════════════════════════════════
 # Base model with shared training logic
 # ═══════════════════════════════════════════════════════════════
@@ -118,7 +152,7 @@ class _BaseModel(nn.Module):
         return pred_scores, pred_boxes
 
     @torch.no_grad()
-    def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6):
+    def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6, max_det=300):
         """Run detection on normalized images [B, 3, 640, 640].
 
         Returns: List[dict] per image with 'boxes'[K,4], 'scores'[K], 'classes'[K],
@@ -133,10 +167,11 @@ class _BaseModel(nn.Module):
         reg_list = head_outs['reg']
 
         return self._decode_predictions(cls_list, reg_list, head_outs.get('kpt'),
-                                        score_thresh, iou_thresh)
+                                        score_thresh, iou_thresh, max_det=max_det)
 
     def _decode_predictions(self, cls_list, reg_list, kpt_list,
-                            score_thresh=0.01, iou_thresh=0.6, cls_offset=0):
+                            score_thresh=0.01, iou_thresh=0.6, cls_offset=0,
+                            max_det=300, max_nms=30000):
         """Decode raw outputs -> final predictions.
 
         Args:
@@ -149,7 +184,7 @@ class _BaseModel(nn.Module):
         results = []
         for b in range(B):
             all_boxes, all_scores, all_cls = [], [], []
-            kpt_outs = []
+            all_kpts = []
 
             for lvl, stride in enumerate(self.strides):
                 _, _, H, W = cls_list[lvl].shape
@@ -160,39 +195,49 @@ class _BaseModel(nn.Module):
                 reg_l = reg_list[lvl][b:b+1]
                 boxes_l = _dfl_decode(reg_l, self.reg_max, stride, grid)[0]
 
-                # Per-class threshold + NMS
-                for c in range(num_cls):
-                    sc = scores_l[:, c]
-                    keep_mask = sc > score_thresh
-                    if keep_mask.any():
-                        c_boxes = boxes_l[keep_mask]
-                        c_scores = sc[keep_mask]
-                        nms_k = _nms(c_boxes, c_scores, iou_thresh)
-                        if nms_k.numel() > 0:
-                            all_boxes.append(c_boxes[nms_k])
-                            all_scores.append(c_scores[nms_k])
-                            all_cls.append(torch.full((len(nms_k),), c + cls_offset, device=device, dtype=torch.long))
+                score_mask = scores_l > score_thresh
+                if not score_mask.any():
+                    continue
 
-                            if kpt_list is not None and c == 0:
-                                keep_indices = keep_mask.nonzero(as_tuple=True)[0]
-                                final_indices = keep_indices[nms_k]
-                                kpt_l = kpt_list[lvl][b:b+1].permute(0, 2, 3, 1).reshape(H * W, 17, 3)
-                                kpt_selected = kpt_l[final_indices]
-                                grid_center = grid.view(H * W, 1, 2) + 0.5 * stride
-                                kpt_xy = kpt_selected[..., :2] * stride + grid_center[final_indices]
-                                kpt_vis = kpt_selected[..., 2:3].sigmoid()
-                                kpt_outs.append(torch.cat([kpt_xy, kpt_vis], dim=-1))
+                anchor_idx, cls_idx = score_mask.nonzero(as_tuple=True)
+                selected_scores = scores_l[anchor_idx, cls_idx]
+                if max_nms and selected_scores.numel() > max_nms:
+                    topk = selected_scores.argsort(descending=True)[:max_nms]
+                    anchor_idx = anchor_idx[topk]
+                    cls_idx = cls_idx[topk]
+                    selected_scores = selected_scores[topk]
+
+                selected_boxes = boxes_l[anchor_idx]
+                selected_classes = cls_idx + cls_offset
+                all_boxes.append(selected_boxes)
+                all_scores.append(selected_scores)
+                all_cls.append(selected_classes.long())
+
+                if kpt_list is not None:
+                    kpts_aligned = torch.zeros((len(selected_boxes), 17, 3), device=device)
+                    person_mask = (cls_idx == 0) & (cls_offset == 0)
+                    if person_mask.any():
+                        kpt_l = kpt_list[lvl][b:b+1].permute(0, 2, 3, 1).reshape(H * W, 17, 3)
+                        person_anchor_idx = anchor_idx[person_mask]
+                        kpt_selected = kpt_l[person_anchor_idx]
+                        grid_center = grid.view(H * W, 1, 2) + 0.5 * stride
+                        kpt_xy = kpt_selected[..., :2] * stride + grid_center[person_anchor_idx]
+                        kpt_vis = kpt_selected[..., 2:3].sigmoid()
+                        kpts_aligned[person_mask] = torch.cat([kpt_xy, kpt_vis], dim=-1)
+                    all_kpts.append(kpts_aligned)
 
             if all_boxes:
+                boxes = torch.cat(all_boxes)
+                scores = torch.cat(all_scores)
+                classes = torch.cat(all_cls)
+                kpts = torch.cat(all_kpts) if all_kpts else torch.zeros((len(boxes), 17, 3), device=device)
+                keep = _batched_nms(boxes, scores, classes, iou_thresh=iou_thresh, max_det=max_det)
                 result = {
-                    'boxes': torch.cat(all_boxes),
-                    'scores': torch.cat(all_scores),
-                    'classes': torch.cat(all_cls),
+                    'boxes': boxes[keep],
+                    'scores': scores[keep],
+                    'classes': classes[keep],
+                    'kpts': kpts[keep],
                 }
-                if kpt_outs:
-                    result['kpts'] = torch.cat(kpt_outs)
-                else:
-                    result['kpts'] = torch.zeros(0, 17, 3, device=device)
             else:
                 result = {
                     'boxes': torch.zeros(0, 4, device=device),
@@ -250,7 +295,7 @@ class _DualHeadModel(_BaseModel):
             self.det_weight_mult = min(1.0, epoch / self.det_weight_warmup_epochs)
 
     @torch.no_grad()
-    def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6):
+    def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6, max_det=300):
         """Merge det and pose head predictions."""
         self.eval()
         device = next(self.parameters()).device
@@ -262,23 +307,34 @@ class _DualHeadModel(_BaseModel):
         # Decode detection head (classes 1..19 → shifted to 1..19)
         det_results = self._decode_predictions(
             det_out['cls'], det_out['reg'], None, score_thresh, iou_thresh,
-            cls_offset=1)  # det classes are 0..18 internally, output as 1..19
+            cls_offset=1, max_det=max_det)  # det classes are 0..18 internally, output as 1..19
 
         # Decode pose head (class 0 = person)
         pose_results = self._decode_predictions(
             pose_out['cls'], pose_out['reg'], pose_out.get('kpt'),
-            score_thresh, iou_thresh, cls_offset=0)
+            score_thresh, iou_thresh, cls_offset=0, max_det=max_det)
 
         # Merge
         merged = []
         for b in range(B):
             d = det_results[b]
             p = pose_results[b]
+            boxes = torch.cat([p['boxes'], d['boxes']]) if p['boxes'].numel() + d['boxes'].numel() > 0 else torch.zeros(0, 4, device=device)
+            scores = torch.cat([p['scores'], d['scores']]) if p['scores'].numel() + d['scores'].numel() > 0 else torch.zeros(0, device=device)
+            classes = torch.cat([p['classes'], d['classes']]) if p['classes'].numel() + d['classes'].numel() > 0 else torch.zeros(0, dtype=torch.long, device=device)
+            det_kpts = torch.zeros((len(d['boxes']), 17, 3), device=device)
+            kpts = torch.cat([p.get('kpts', torch.zeros(0, 17, 3, device=device)), det_kpts]) if len(boxes) else torch.zeros(0, 17, 3, device=device)
+            if max_det and len(scores) > max_det:
+                keep = scores.argsort(descending=True)[:max_det]
+                boxes = boxes[keep]
+                scores = scores[keep]
+                classes = classes[keep]
+                kpts = kpts[keep]
             merged.append({
-                'boxes': torch.cat([p['boxes'], d['boxes']]) if p['boxes'].numel() + d['boxes'].numel() > 0 else torch.zeros(0, 4, device=device),
-                'scores': torch.cat([p['scores'], d['scores']]) if p['scores'].numel() + d['scores'].numel() > 0 else torch.zeros(0, device=device),
-                'classes': torch.cat([p['classes'], d['classes']]) if p['classes'].numel() + d['classes'].numel() > 0 else torch.zeros(0, dtype=torch.long, device=device),
-                'kpts': p.get('kpts', torch.zeros(0, 17, 3, device=device)),
+                'boxes': boxes,
+                'scores': scores,
+                'classes': classes,
+                'kpts': kpts,
             })
         return merged
 

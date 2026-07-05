@@ -12,7 +12,6 @@ Usage:
 
 import argparse
 import json
-from collections import defaultdict
 from pathlib import Path
 
 import numpy as np
@@ -39,84 +38,100 @@ def compute_iou(box1, box2):
     return inter / (area1 + area2 - inter + 1e-16)
 
 
-def compute_ap_by_class(predictions, ground_truths, iou_thresh=0.5):
-    """Compute AP for each class using 101-point interpolation.
+def _interp_ap(tp, fp, total_gt):
+    """COCO-style 101-point interpolated AP."""
+    if total_gt <= 0:
+        return -1.0
+    if len(tp) == 0:
+        return 0.0
 
-    Args:
-        predictions: List[dict] with 'boxes'[K,4], 'scores'[K], 'classes'[K]
-        ground_truths: List[dict] with 'boxes'[M,4], 'classes'[M]
+    tp_cum = np.cumsum(tp)
+    fp_cum = np.cumsum(fp)
+    recalls = tp_cum / total_gt
+    precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1)
 
-    Returns:
-        dict mapping class_id -> AP value
-    """
-    num_classes = 20
-    aps = {}
+    ap = 0.0
+    for t in np.linspace(0, 1, 101):
+        ap += (np.max(precisions[recalls >= t]) if np.any(recalls >= t) else 0) / 101.0
+    return float(np.clip(ap, 0.0, 1.0))
+
+
+def compute_ap_by_class_multi(predictions, ground_truths, iou_thresholds=None, num_classes=20):
+    """Compute per-class AP for several IoU thresholds in one pass."""
+    if iou_thresholds is None:
+        iou_thresholds = np.arange(0.5, 1.0, 0.05)
+    iou_thresholds = np.asarray(iou_thresholds, dtype=np.float32)
+    num_thr = len(iou_thresholds)
+
+    aps = {cls_id: np.full(num_thr, -1.0, dtype=np.float32) for cls_id in range(num_classes)}
+
+    gt_by_class = {}
+    for cls_id in range(num_classes):
+        cls_gt_boxes = []
+        total_gt = 0
+        for gt in ground_truths:
+            classes = np.asarray(gt['classes'], dtype=np.int32)
+            boxes = np.asarray(gt['boxes'], dtype=np.float32).reshape(-1, 4)
+            mask = classes == cls_id
+            boxes_cls = boxes[mask]
+            cls_gt_boxes.append(boxes_cls)
+            total_gt += len(boxes_cls)
+        gt_by_class[cls_id] = (cls_gt_boxes, total_gt)
 
     for cls_id in range(num_classes):
-        # Collect all predictions for this class
         all_dets = []
         for img_idx, pred in enumerate(predictions):
-            mask = pred['classes'] == cls_id
+            classes = np.asarray(pred['classes'], dtype=np.int32)
+            boxes = np.asarray(pred['boxes'], dtype=np.float32).reshape(-1, 4)
+            scores = np.asarray(pred['scores'], dtype=np.float32)
+            mask = classes == cls_id
             if not mask.any():
                 continue
-            boxes = pred['boxes'][mask]
-            scores = pred['scores'][mask]
-            for i in range(len(boxes)):
-                all_dets.append((img_idx, float(scores[i]), boxes[i].tolist()))
+            for score, box in zip(scores[mask], boxes[mask]):
+                all_dets.append((img_idx, float(score), box))
 
         all_dets.sort(key=lambda x: x[1], reverse=True)
-
-        # Count GTs for this class
-        gt_counts = []
-        gt_matched = []
-        for gt in ground_truths:
-            mask = gt['classes'] == cls_id
-            gt_counts.append(int(mask.sum()))
-            gt_matched.append(np.zeros(int(mask.sum()), dtype=bool))
-        total_gt = sum(gt_counts)
-
+        gt_boxes_by_img, total_gt = gt_by_class[cls_id]
         if total_gt == 0:
-            aps[cls_id] = -1  # undefined
             continue
 
-        tp = np.zeros(len(all_dets))
-        fp = np.zeros(len(all_dets))
+        tp = np.zeros((num_thr, len(all_dets)), dtype=np.float32)
+        fp = np.zeros((num_thr, len(all_dets)), dtype=np.float32)
+        gt_matched = [[np.zeros(len(boxes), dtype=bool) for boxes in gt_boxes_by_img]
+                      for _ in range(num_thr)]
 
-        for det_idx, (img_idx, score, det_box) in enumerate(all_dets):
-            gt_boxes_all = ground_truths[img_idx]['boxes']
-            gt_cls_all = ground_truths[img_idx]['classes']
-            mask = gt_cls_all == cls_id
-
-            if not mask.any():
-                fp[det_idx] = 1
+        for det_idx, (img_idx, _score, det_box) in enumerate(all_dets):
+            gt_boxes_cls = gt_boxes_by_img[img_idx]
+            if len(gt_boxes_cls) == 0:
+                fp[:, det_idx] = 1
                 continue
 
-            gt_boxes_cls = gt_boxes_all[mask]
-            ious = compute_iou(np.array(det_box), gt_boxes_cls)
+            ious = compute_iou(np.asarray(det_box, dtype=np.float32), gt_boxes_cls)
+            order = ious.argsort()[::-1]
+            for ti, iou_thresh in enumerate(iou_thresholds):
+                best_local = -1
+                for li in order:
+                    if ious[li] >= iou_thresh and not gt_matched[ti][img_idx][li]:
+                        best_local = int(li)
+                        break
+                if best_local >= 0:
+                    tp[ti, det_idx] = 1
+                    gt_matched[ti][img_idx][best_local] = True
+                else:
+                    fp[ti, det_idx] = 1
 
-            best_iou, best_local = 0.0, -1
-            for li in range(len(gt_boxes_cls)):
-                if not gt_matched[img_idx][li] and ious[li] > best_iou:
-                    best_iou = float(ious[li])
-                    best_local = li
-
-            if best_iou >= iou_thresh:
-                tp[det_idx] = 1
-                gt_matched[img_idx][best_local] = True
-            else:
-                fp[det_idx] = 1
-
-        tp_cum = np.cumsum(tp)
-        fp_cum = np.cumsum(fp)
-        recalls = tp_cum / total_gt
-        precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1)
-
-        ap = 0.0
-        for t in np.linspace(0, 1, 101):
-            ap += (np.max(precisions[recalls >= t]) if np.any(recalls >= t) else 0) / 101.0
-        aps[cls_id] = float(np.clip(ap, 0.0, 1.0))
+        aps[cls_id] = np.asarray([
+            _interp_ap(tp[ti], fp[ti], total_gt) for ti in range(num_thr)
+        ], dtype=np.float32)
 
     return aps
+
+
+def compute_ap_by_class(predictions, ground_truths, iou_thresh=0.5):
+    """Compute AP for each class using 101-point interpolation."""
+    multi = compute_ap_by_class_multi(
+        predictions, ground_truths, iou_thresholds=np.array([iou_thresh], dtype=np.float32))
+    return {cls_id: float(values[0]) for cls_id, values in multi.items()}
 
 
 def compute_pose_oks(pred_kpts, gt_kpts, gt_boxes):
@@ -135,37 +150,39 @@ def compute_pose_oks(pred_kpts, gt_kpts, gt_boxes):
         0.072, 0.062, 0.062, 0.107, 0.107, 0.087, 0.087, 0.089, 0.089,
     ])
 
+    pred_kpts = np.asarray(pred_kpts, dtype=np.float32).reshape(-1, 17, 3)
+    gt_kpts = np.asarray(gt_kpts, dtype=np.float32).reshape(-1, 17, 3)
+    gt_boxes = np.asarray(gt_boxes, dtype=np.float32).reshape(-1, 4)
+
     K, M = len(pred_kpts), len(gt_kpts)
-    oks = np.zeros((K, M))
+    if K == 0 or M == 0:
+        return np.zeros((K, M), dtype=np.float32)
 
-    for k in range(K):
-        for m in range(M):
-            gt_box = gt_boxes[m]
-            area = (gt_box[2] - gt_box[0]) * (gt_box[3] - gt_box[1])
-            scale = np.sqrt(max(area, 1.0))
-
-            d2 = np.sum((pred_kpts[k, :, :2] - gt_kpts[m, :, :2]) ** 2, axis=1)
-            k2 = (sigmas ** 2) * (2 * scale) ** 2
-            visible = gt_kpts[m, :, 2] > 0
-
-            if visible.sum() == 0:
-                oks[k, m] = 0.0
-            else:
-                oks[k, m] = float(np.mean(np.exp(-d2[visible] / (2 * k2[visible]))))
-
-    return oks
+    area = np.maximum((gt_boxes[:, 2] - gt_boxes[:, 0]) * (gt_boxes[:, 3] - gt_boxes[:, 1]), 1.0)
+    scale = np.sqrt(area)
+    k2 = (sigmas.reshape(1, 1, 17) ** 2) * (2 * scale.reshape(1, M, 1)) ** 2
+    d2 = ((pred_kpts[:, None, :, :2] - gt_kpts[None, :, :, :2]) ** 2).sum(axis=-1)
+    visible = gt_kpts[None, :, :, 2] > 0
+    oks_raw = np.exp(-d2 / (2 * k2 + 1e-16)) * visible
+    visible_count = visible.sum(axis=-1)
+    return np.divide(
+        oks_raw.sum(axis=-1),
+        np.maximum(visible_count, 1),
+        out=np.zeros((K, M), dtype=np.float32),
+        where=visible_count > 0,
+    ).astype(np.float32)
 
 
-def compute_pose_ap(predictions, ground_truths):
-    """Compute pose AP@0.5 using OKS.
+def compute_pose_ap_multi(predictions, ground_truths, oks_thresholds=None):
+    """Compute pose AP over one or more OKS thresholds."""
+    if oks_thresholds is None:
+        oks_thresholds = np.arange(0.5, 1.0, 0.05)
+    oks_thresholds = np.asarray(oks_thresholds, dtype=np.float32)
+    num_thr = len(oks_thresholds)
 
-    Args:
-        predictions: List[dict] with person_boxes, person_scores, person_kpts
-        ground_truths: List[dict] with boxes, classes, kpts
-    """
-    oks_thresh = 0.5
     all_dets = []
-    gt_person_counts = []
+    gt_person_by_img = []
+    total_gt = 0
 
     for gt in ground_truths:
         person_mask = gt['classes'] == 0
@@ -174,7 +191,10 @@ def compute_pose_ap(predictions, ground_truths):
             person_mask = person_mask & visible_mask
         else:
             person_mask = np.zeros_like(person_mask, dtype=bool)
-        gt_person_counts.append(int(person_mask.sum()))
+        gt_boxes_person = gt['boxes'][person_mask].astype(np.float32).reshape(-1, 4)
+        gt_kpts_person = gt['kpts'][person_mask].astype(np.float32).reshape(-1, 17, 3)
+        gt_person_by_img.append((gt_boxes_person, gt_kpts_person))
+        total_gt += len(gt_boxes_person)
 
     for img_idx, pred in enumerate(predictions):
         if 'person_boxes' not in pred:
@@ -190,59 +210,47 @@ def compute_pose_ap(predictions, ground_truths):
                             p_boxes[i].tolist(), p_kpts[i]))
 
     all_dets.sort(key=lambda x: x[1], reverse=True)
-    total_gt = sum(gt_person_counts)
 
     if total_gt == 0:
         return None
 
-    tp = np.zeros(len(all_dets))
-    fp = np.zeros(len(all_dets))
-    gt_matched = [np.zeros(c, dtype=bool) for c in gt_person_counts]
+    tp = np.zeros((num_thr, len(all_dets)), dtype=np.float32)
+    fp = np.zeros((num_thr, len(all_dets)), dtype=np.float32)
+    gt_matched = [[np.zeros(len(gt_person_by_img[i][0]), dtype=bool)
+                   for i in range(len(gt_person_by_img))] for _ in range(num_thr)]
 
     for det_idx, (img_idx, score, det_box, det_kpts) in enumerate(all_dets):
-        gt = ground_truths[img_idx]
-        person_mask = gt['classes'] == 0
-        if 'kpts' in gt and len(gt['kpts']) == len(gt['classes']):
-            visible_mask = (gt['kpts'][:, :, 2] > 0).any(axis=1)
-            person_mask = person_mask & visible_mask
-        else:
-            person_mask = np.zeros_like(person_mask, dtype=bool)
-        if not person_mask.any():
-            fp[det_idx] = 1
+        gt_boxes_person, gt_kpts_person = gt_person_by_img[img_idx]
+        if len(gt_boxes_person) == 0:
+            fp[:, det_idx] = 1
             continue
 
-        gt_boxes_person = gt['boxes'][person_mask]
-        gt_kpts_person = gt['kpts'][person_mask]
-
-        # Compute OKS
         oks = compute_pose_oks(
             det_kpts.reshape(1, 17, 3),
             gt_kpts_person.reshape(-1, 17, 3),
             gt_boxes_person.reshape(-1, 4),
         )[0]
+        order = oks.argsort()[::-1]
+        for ti, oks_thresh in enumerate(oks_thresholds):
+            best_local = -1
+            for li in order:
+                if oks[li] >= oks_thresh and not gt_matched[ti][img_idx][li]:
+                    best_local = int(li)
+                    break
+            if best_local >= 0:
+                tp[ti, det_idx] = 1
+                gt_matched[ti][img_idx][best_local] = True
+            else:
+                fp[ti, det_idx] = 1
 
-        # Find best unmatched GT
-        best_oks, best_local = 0.0, -1
-        for li in range(len(gt_boxes_person)):
-            if not gt_matched[img_idx][li] and oks[li] > best_oks:
-                best_oks = float(oks[li])
-                best_local = li
+    return np.asarray([_interp_ap(tp[ti], fp[ti], total_gt) for ti in range(num_thr)], dtype=np.float32)
 
-        if best_oks >= oks_thresh:
-            tp[det_idx] = 1
-            gt_matched[img_idx][best_local] = True
-        else:
-            fp[det_idx] = 1
 
-    tp_cum = np.cumsum(tp)
-    fp_cum = np.cumsum(fp)
-    recalls = tp_cum / total_gt
-    precisions = tp_cum / np.maximum(tp_cum + fp_cum, 1)
-
-    ap = 0.0
-    for t in np.linspace(0, 1, 101):
-        ap += (np.max(precisions[recalls >= t]) if np.any(recalls >= t) else 0) / 101.0
-    return float(np.clip(ap, 0.0, 1.0))
+def compute_pose_ap(predictions, ground_truths):
+    """Compute pose AP@0.5 using OKS."""
+    aps = compute_pose_ap_multi(
+        predictions, ground_truths, oks_thresholds=np.array([0.5], dtype=np.float32))
+    return None if aps is None else float(aps[0])
 
 
 def _to_numpy(value, dtype, shape):
@@ -257,7 +265,7 @@ def _to_numpy(value, dtype, shape):
     return arr
 
 
-def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6):
+def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6, max_det=300):
     """Run inference and collect predictions + ground truths."""
     model.eval()
     model.to(device)
@@ -265,13 +273,16 @@ def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6
     all_preds = []
     all_gts = []
 
-    with torch.no_grad():
+    with torch.inference_mode():
         for batch in tqdm(dataloader, desc='Evaluating'):
             images = batch['image'].to(device)
 
-            # Forward pass
-            predictions = model.predict_val(
-                images, score_thresh=score_thresh, iou_thresh=iou_thresh)
+            try:
+                predictions = model.predict_val(
+                    images, score_thresh=score_thresh, iou_thresh=iou_thresh, max_det=max_det)
+            except TypeError:
+                predictions = model.predict_val(
+                    images, score_thresh=score_thresh, iou_thresh=iou_thresh)
 
             for i in range(len(images)):
                 pred = predictions[i]
@@ -281,7 +292,13 @@ def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6
                 person_mask_t = classes_t == 0
                 person_boxes = pred.get('person_boxes', boxes_t[person_mask_t])
                 person_scores = pred.get('person_scores', scores_t[person_mask_t])
-                person_kpts = pred.get('person_kpts', pred.get('kpts'))
+                person_kpts = pred.get('person_kpts')
+                if person_kpts is None:
+                    kpts_t = pred.get('kpts')
+                    if kpts_t is not None and len(kpts_t) == len(boxes_t):
+                        person_kpts = kpts_t[person_mask_t]
+                    else:
+                        person_kpts = kpts_t
                 person_boxes_np = _to_numpy(person_boxes, np.float32, (0, 4))
                 person_scores_np = _to_numpy(person_scores, np.float32, (0,))
                 person_kpts_np = _to_numpy(person_kpts, np.float32, (0, 17, 3))
@@ -305,6 +322,113 @@ def evaluate(model, dataloader, device='cuda', score_thresh=0.01, iou_thresh=0.6
     return all_preds, all_gts
 
 
+def _scale_boxes_to_letterbox(boxes, scale, pad):
+    boxes = np.asarray(boxes, dtype=np.float32).reshape(-1, 4).copy()
+    if len(boxes) == 0:
+        return boxes
+    pad_l, pad_t = pad
+    boxes[:, [0, 2]] = boxes[:, [0, 2]] * float(scale) + float(pad_l)
+    boxes[:, [1, 3]] = boxes[:, [1, 3]] * float(scale) + float(pad_t)
+    return boxes
+
+
+def _scale_kpts_to_letterbox(kpts, scale, pad):
+    kpts = np.asarray(kpts, dtype=np.float32).reshape(-1, 17, 3).copy()
+    if len(kpts) == 0:
+        return kpts
+    pad_l, pad_t = pad
+    kpts[..., 0] = kpts[..., 0] * float(scale) + float(pad_l)
+    kpts[..., 1] = kpts[..., 1] * float(scale) + float(pad_t)
+    return kpts
+
+
+def evaluate_ultralytics(yolo_model, dataloader, device='cuda', score_thresh=0.01,
+                         iou_thresh=0.6, max_det=300, provider='ultralytics_detect',
+                         input_size=640):
+    """Evaluate an official Ultralytics model on the same labels/metrics."""
+    from test_model.dataset import YOLO80_ID_TO_20
+
+    all_preds = []
+    all_gts = []
+
+    for batch in tqdm(dataloader, desc=f'Evaluating {provider}'):
+        paths = batch.get('img_path', [])
+        if not paths:
+            raise RuntimeError("Dataloader batch does not include img_path; update dataset.collate_fn first")
+
+        results = yolo_model.predict(
+            source=paths,
+            imgsz=input_size,
+            conf=score_thresh,
+            iou=iou_thresh,
+            max_det=max_det,
+            device=device,
+            verbose=False,
+        )
+
+        for i, result in enumerate(results):
+            scale = batch['scale'][i]
+            pad = batch['pad'][i]
+            pred_boxes = np.zeros((0, 4), dtype=np.float32)
+            pred_scores = np.zeros((0,), dtype=np.float32)
+            pred_classes = np.zeros((0,), dtype=np.int32)
+            person_boxes = np.zeros((0, 4), dtype=np.float32)
+            person_scores = np.zeros((0,), dtype=np.float32)
+            person_kpts = np.zeros((0, 17, 3), dtype=np.float32)
+
+            if result.boxes is not None and len(result.boxes) > 0:
+                raw_boxes = result.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+                raw_scores = result.boxes.conf.detach().cpu().numpy().astype(np.float32)
+                raw_classes = result.boxes.cls.detach().cpu().numpy().astype(np.int32)
+
+                boxes_lb = _scale_boxes_to_letterbox(raw_boxes, scale, pad)
+
+                if provider == 'ultralytics_pose':
+                    keep = raw_classes == 0
+                    pred_boxes = boxes_lb[keep]
+                    pred_scores = raw_scores[keep]
+                    pred_classes = np.zeros(len(pred_boxes), dtype=np.int32)
+                    person_boxes = pred_boxes
+                    person_scores = pred_scores
+
+                    if result.keypoints is not None and len(result.keypoints) > 0:
+                        raw_xy = result.keypoints.xy.detach().cpu().numpy().astype(np.float32)[keep]
+                        if getattr(result.keypoints, 'conf', None) is not None:
+                            raw_conf = result.keypoints.conf.detach().cpu().numpy().astype(np.float32)[keep]
+                        else:
+                            raw_conf = np.ones(raw_xy.shape[:2], dtype=np.float32)
+                        person_kpts = np.concatenate([raw_xy, raw_conf[..., None]], axis=-1)
+                        person_kpts = _scale_kpts_to_letterbox(person_kpts, scale, pad)
+                    else:
+                        person_kpts = np.zeros((len(person_boxes), 17, 3), dtype=np.float32)
+                else:
+                    mapped = np.array([YOLO80_ID_TO_20.get(int(c), -1) for c in raw_classes], dtype=np.int32)
+                    keep = mapped >= 0
+                    pred_boxes = boxes_lb[keep]
+                    pred_scores = raw_scores[keep]
+                    pred_classes = mapped[keep]
+                    person_mask = pred_classes == 0
+                    person_boxes = pred_boxes[person_mask]
+                    person_scores = pred_scores[person_mask]
+                    person_kpts = np.zeros((len(person_boxes), 17, 3), dtype=np.float32)
+
+            all_preds.append({
+                'boxes': pred_boxes,
+                'scores': pred_scores,
+                'classes': pred_classes,
+                'person_boxes': person_boxes,
+                'person_scores': person_scores,
+                'person_kpts': person_kpts,
+            })
+            all_gts.append({
+                'boxes': batch['boxes'][i].cpu().numpy().astype(np.float32),
+                'classes': batch['classes'][i].cpu().numpy().astype(np.int32),
+                'kpts': batch['kpts'][i].cpu().numpy().astype(np.float32),
+            })
+
+    return all_preds, all_gts
+
+
 def compute_all_metrics(all_preds, all_gts):
     """Compute comprehensive metrics.
 
@@ -317,43 +441,59 @@ def compute_all_metrics(all_preds, all_gts):
     - Per-class AP@0.5
     """
     results = {}
+    iou_thresholds = np.arange(0.5, 1.0, 0.05, dtype=np.float32)
+    det_aps = compute_ap_by_class_multi(all_preds, all_gts, iou_thresholds=iou_thresholds)
+    ap50 = {cls_id: float(values[0]) for cls_id, values in det_aps.items()}
 
     # Detection AP@0.5
-    ap50 = compute_ap_by_class(all_preds, all_gts, iou_thresh=0.5)
     valid_ap50 = [v for v in ap50.values() if v >= 0]
     results['mAP@0.5'] = float(np.mean(valid_ap50)) if valid_ap50 else 0.0
+    results['mAP50'] = results['mAP@0.5']
+    results['metrics/mAP50(B)'] = results['mAP@0.5']
 
     # Detection AP@0.5 (excluding person = class 0)
     ap50_no_person = [v for c, v in ap50.items() if c != 0 and v >= 0]
     results['mAP@0.5_no_person'] = float(np.mean(ap50_no_person)) if ap50_no_person else 0.0
+    results['mAP50_no_person'] = results['mAP@0.5_no_person']
 
     # Person box AP@0.5
     results['AP_person_box@0.5'] = float(ap50.get(0, 0.0)) if ap50.get(0, -1) >= 0 else 0.0
 
     # Detection AP@0.5:0.95 (average over IoU thresholds)
-    aps_5095 = []
-    for iou_t in np.arange(0.5, 1.0, 0.05):
-        ap_t = compute_ap_by_class(all_preds, all_gts, iou_thresh=float(iou_t))
-        valid = [v for v in ap_t.values() if v >= 0]
-        if valid:
-            aps_5095.append(np.mean(valid))
-    results['mAP@0.5:0.95'] = float(np.mean(aps_5095)) if aps_5095 else 0.0
+    class_ap5095 = {}
+    for cls_id, values in det_aps.items():
+        valid = values[values >= 0]
+        class_ap5095[cls_id] = float(np.mean(valid)) if len(valid) else -1.0
+    valid_ap5095 = [v for v in class_ap5095.values() if v >= 0]
+    results['mAP@0.5:0.95'] = float(np.mean(valid_ap5095)) if valid_ap5095 else 0.0
+    results['mAP50-95'] = results['mAP@0.5:0.95']
+    results['metrics/mAP50-95(B)'] = results['mAP@0.5:0.95']
 
     # Detection AP@0.5:0.95 (no person)
-    aps_5095_np = []
-    for iou_t in np.arange(0.5, 1.0, 0.05):
-        ap_t = compute_ap_by_class(all_preds, all_gts, iou_thresh=float(iou_t))
-        valid_np = [v for c, v in ap_t.items() if c != 0 and v >= 0]
-        if valid_np:
-            aps_5095_np.append(np.mean(valid_np))
-    results['mAP@0.5:0.95_no_person'] = float(np.mean(aps_5095_np)) if aps_5095_np else 0.0
+    valid_ap5095_np = [v for c, v in class_ap5095.items() if c != 0 and v >= 0]
+    results['mAP@0.5:0.95_no_person'] = float(np.mean(valid_ap5095_np)) if valid_ap5095_np else 0.0
+    results['mAP50-95_no_person'] = results['mAP@0.5:0.95_no_person']
+    results['AP_person_box@0.5:0.95'] = (
+        float(class_ap5095.get(0, 0.0)) if class_ap5095.get(0, -1) >= 0 else 0.0
+    )
 
-    # Pose AP@0.5 (OKS-based)
-    pose_ap = compute_pose_ap(all_preds, all_gts)
-    results['AP_pose@0.5'] = pose_ap if pose_ap is not None else 0.0
+    # Pose AP (OKS-based)
+    pose_aps = compute_pose_ap_multi(all_preds, all_gts, oks_thresholds=iou_thresholds)
+    if pose_aps is None:
+        results['AP_pose@0.5'] = 0.0
+        results['AP_pose@0.5:0.95'] = 0.0
+    else:
+        results['AP_pose@0.5'] = float(pose_aps[0])
+        valid_pose = pose_aps[pose_aps >= 0]
+        results['AP_pose@0.5:0.95'] = float(np.mean(valid_pose)) if len(valid_pose) else 0.0
+    results['mAPpose50'] = results['AP_pose@0.5']
+    results['mAPpose50-95'] = results['AP_pose@0.5:0.95']
+    results['metrics/mAP50(P)'] = results['AP_pose@0.5']
+    results['metrics/mAP50-95(P)'] = results['AP_pose@0.5:0.95']
 
     # Per-class AP@0.5
     results['per_class_AP@0.5'] = {int(k): float(v) for k, v in ap50.items()}
+    results['per_class_AP@0.5:0.95'] = {int(k): float(v) for k, v in class_ap5095.items()}
 
     return results
 
@@ -361,8 +501,13 @@ def compute_all_metrics(all_preds, all_gts):
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--config', type=str, default=None, help='Training config path')
-    p.add_argument('--weights', type=str, required=True, help='Model checkpoint path')
-    p.add_argument('--model', type=str, required=True,
+    p.add_argument('--provider', type=str, default='test_model',
+                   choices=['test_model', 'ultralytics_detect', 'ultralytics_pose'],
+                   help='Evaluation model provider')
+    p.add_argument('--weights', type=str, default=None, help='test_model checkpoint path')
+    p.add_argument('--ultralytics-weights', type=str, default=None,
+                   help='Ultralytics model weights, e.g. yolov8m.pt or yolov8m-pose.pt')
+    p.add_argument('--model', type=str, default=None,
                    choices=['dual_head', 'unified_head', 'dual_neck', 'attn_dual', 'bifpn_dual'])
     p.add_argument('--data', type=str, required=True, help='Dataset directory')
     p.add_argument('--device', type=str, default='cuda')
@@ -378,10 +523,10 @@ def main():
                    help='Optional sample limit for quick evaluation smoke tests')
     p.add_argument('--score-thresh', type=float, default=None, help='Prediction score threshold')
     p.add_argument('--iou-thresh', type=float, default=None, help='NMS IoU threshold')
+    p.add_argument('--max-det', type=int, default=None, help='Max detections per image after NMS')
     p.add_argument('--output', type=str, default=None, help='JSON output path')
     args = p.parse_args()
 
-    from test_model.models import create_model
     from test_model.dataset import create_dataloader, collate_fn
 
     cfg = {}
@@ -394,20 +539,34 @@ def main():
     d_cfg = cfg.get('data', {})
     e_cfg = cfg.get('eval', {})
 
-    # Load model
-    model_kwargs = {
-        'num_kpts': cfg.get('num_kpts', 17),
-        'reg_max': cfg.get('reg_max', 16),
-    }
-    if args.model == 'unified_head':
-        model_kwargs['num_classes'] = cfg.get('num_classes', 20)
+    model = None
+    yolo_model = None
+    if args.provider == 'test_model':
+        if not args.model:
+            p.error("--model is required when --provider test_model")
+        if not args.weights:
+            p.error("--weights is required when --provider test_model")
+        from test_model.models import create_model
+
+        model_kwargs = {
+            'num_kpts': cfg.get('num_kpts', 17),
+            'reg_max': cfg.get('reg_max', 16),
+        }
+        if args.model == 'unified_head':
+            model_kwargs['num_classes'] = cfg.get('num_classes', 20)
+        else:
+            model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 19)
+        model = create_model(args.model, **model_kwargs)
+        ckpt = torch.load(args.weights, map_location='cpu', weights_only=False)
+        model.load_state_dict(ckpt['model_state_dict'])
+        print(f"Loaded checkpoint: {args.weights}")
+        print(f"Model params: {model.num_params / 1e6:.2f}M")
     else:
-        model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 19)
-    model = create_model(args.model, **model_kwargs)
-    ckpt = torch.load(args.weights, map_location='cpu', weights_only=False)
-    model.load_state_dict(ckpt['model_state_dict'])
-    print(f"Loaded checkpoint: {args.weights}")
-    print(f"Model params: {model.num_params / 1e6:.2f}M")
+        if not args.ultralytics_weights:
+            p.error("--ultralytics-weights is required for ultralytics providers")
+        from ultralytics import YOLO
+        yolo_model = YOLO(args.ultralytics_weights)
+        print(f"Loaded Ultralytics weights: {args.ultralytics_weights}")
 
     # Create dataloader
     data_root = Path(args.data)
@@ -426,6 +585,7 @@ def main():
     class_id_format = args.class_id_format or d_cfg.get('class_id_format', 'coco20')
     score_thresh = args.score_thresh if args.score_thresh is not None else e_cfg.get('score_thresh', 0.01)
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else e_cfg.get('iou_thresh', 0.6)
+    max_det = args.max_det if args.max_det is not None else e_cfg.get('max_det', 300)
 
     device = args.device
     if device == 'cuda' and not torch.cuda.is_available():
@@ -454,11 +614,17 @@ def main():
             pin_memory=True,
         )
     print(f"Eval samples: {len(loader.dataset)} | input_size={input_size} | "
-          f"class_id_format={class_id_format}")
+          f"class_id_format={class_id_format} | provider={args.provider} | max_det={max_det}")
 
     # Evaluate
-    all_preds, all_gts = evaluate(
-        model, loader, device, score_thresh=score_thresh, iou_thresh=iou_thresh)
+    if args.provider == 'test_model':
+        all_preds, all_gts = evaluate(
+            model, loader, device, score_thresh=score_thresh, iou_thresh=iou_thresh,
+            max_det=max_det)
+    else:
+        all_preds, all_gts = evaluate_ultralytics(
+            yolo_model, loader, device, score_thresh=score_thresh, iou_thresh=iou_thresh,
+            max_det=max_det, provider=args.provider, input_size=input_size)
     metrics = compute_all_metrics(all_preds, all_gts)
 
     # Report
@@ -466,7 +632,7 @@ def main():
     print("EVALUATION RESULTS")
     print("=" * 60)
     for k, v in metrics.items():
-        if k == 'per_class_AP@0.5':
+        if isinstance(v, dict):
             continue
         print(f"  {k}: {v:.4f}")
     print()

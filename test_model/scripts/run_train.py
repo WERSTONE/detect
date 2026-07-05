@@ -209,6 +209,7 @@ def main():
                 '--class-id-format', cfg.get('data', {}).get('class_id_format', 'coco20'),
                 '--score-thresh', str(eval_cfg.get('score_thresh', 0.01)),
                 '--iou-thresh', str(eval_cfg.get('iou_thresh', 0.6)),
+                '--max-det', str(eval_cfg.get('max_det', 300)),
                 '--output', str(metrics_path),
             ]
 

@@ -105,6 +105,7 @@ eval:
     - best
   score_thresh: 0.01       # NMS score threshold
   iou_thresh: 0.6          # NMS IoU threshold
+  max_det: 300             # max detections per image, aligned with YOLO/COCO eval
   batch_size: 16
 
 # ---- Device ----
