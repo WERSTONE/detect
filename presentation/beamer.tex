@@ -140,9 +140,8 @@
 
 % ============================================================
 \begin{frame}{M-D：ECA注意力 + 双头 (Attention Dual)}
-  \vspace{0.3cm}
   \centering
-  \begin{tikzpicture}[node distance=0.8cm and 1.2cm]
+  \begin{tikzpicture}[node distance=0.7cm and 1.0cm, scale=0.95, transform shape]
     \node[aio]    (in)   {输入\\{\tiny 640×640}};
     \node[abase,right=of in]  (bk)   {Backbone\\{\tiny CSPDarknet}};
     \node[aattn,right=of bk]  (eca)  {ECA\\{\tiny Attention}};

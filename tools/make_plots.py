@@ -43,6 +43,9 @@ def make_train_loss():
         tag = "epoch/train_total"
         if tag in data:
             s, v = data[tag]["steps"], data[tag]["values"]
+            # Shift two-stage data: stage1 was overwritten, stage2 starts at epoch 50
+            if "2-stage" in label:
+                s = [x + 50 for x in s]
             ax.plot(s, v, color=color, lw=1.5, label=label, alpha=0.85)
     ax.set_xlabel("Epoch"); ax.set_ylabel("Total Loss")
     ax.set_title("Training Total Loss")
@@ -60,6 +63,8 @@ def make_val_loss():
         tag = "epoch/val_total"
         if tag in data:
             s, v = data[tag]["steps"], data[tag]["values"]
+            if "2-stage" in label:
+                s = [x + 50 for x in s]
             ax.plot(s, v, "o-", color=color, ms=3, lw=1.2, label=label, alpha=0.85)
     ax.set_xlabel("Epoch"); ax.set_ylabel("Val Total Loss")
     ax.set_title("Validation Total Loss")
