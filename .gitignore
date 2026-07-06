@@ -30,7 +30,6 @@ Thumbs.db
 
 # Runtime outputs
 logs/
-checkpoints/
 runs/
 outputs/
 *.log
