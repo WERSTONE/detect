@@ -255,7 +255,7 @@ def main():
         print(f"Stage 1: pose head only | Epochs: {s1_epochs} | LR: {s1_lr}")
         print(f"{'='*60}")
 
-        trainer1 = _make_trainer(s1_lr)
+        trainer1 = _make_trainer(s1_lr, save_dir_suffix='_stage1')
         trainer1.fit(
             epochs=s1_epochs,
             train_loader=train_loader_s1,

@@ -1,0 +1,296 @@
+% Multi-Head YOLOv8m Model Verification Beamer
+% Compile: xelatex beamer.tex
+\documentclass[aspectratio=169, 10pt]{ctexbeamer}
+
+\usetheme{Madrid}
+\usecolortheme{whale}
+\setbeamertemplate{navigation symbols}{}
+
+\usepackage{tikz}
+\usetikzlibrary{shapes.geometric, arrows, positioning, fit, calc}
+\usepackage{pgfplots}\pgfplotsset{compat=1.18}
+\usepackage{booktabs,graphicx,colortbl}
+
+\title{多任务YOLOv8m模型验证}
+\subtitle{五种候选架构对比与性能分析}
+\author{AI4PumpRoom}
+\date{\today}
+
+\tikzset{
+  ablock/.style={rectangle,draw,rounded corners=2pt,minimum width=1.6cm,minimum height=0.6cm,
+                 align=center,font=\small\bfseries},
+  aio/.style={ablock,fill=gray!10},
+  abase/.style={ablock,fill=green!12},
+  aneck/.style={ablock,fill=blue!12},
+  ahead/.style={ablock,fill=orange!12},
+  aattn/.style={ablock,fill=red!12},
+  abifpn/.style={ablock,fill=teal!12},
+  aunif/.style={ablock,fill=purple!12},
+}
+
+\begin{document}
+
+% ============================================================
+\begin{frame}
+  \titlepage
+  \vfill\centering
+  {\small 基于YOLOv8m的多任务检测与人体姿态估计联合模型}
+\end{frame}
+
+% ============================================================
+\begin{frame}{研究动机与候选模型}
+  \textbf{目标：}单一模型同时完成\alert{20类目标检测}与\alert{17点人体姿态估计}
+
+  \vspace{0.2cm}
+  \textbf{五种候选架构（均基于YOLOv8m, $\sim$25M参数）}
+
+  \vspace{0.15cm}
+  \small
+  \begin{tabular}{cll}
+    \toprule
+    编号 & 模型 & 关键特征 \\
+    \midrule
+    M-A & Standard Dual-Head & FPN+PAN共享颈 + 独立检测头/姿态头 \\
+    M-B & Unified Head       & FPN+PAN + 统一20类检测+姿态头 \\
+    M-C & Dual-Neck          & 独立检测颈 + 独立姿态颈 + 双头 \\
+    M-D & ECA-Dual           & Backbone加ECA注意力 + 标准双头 \\
+    M-E & BiFPN-Dual         & BiFPN双向特征金字塔 + 标准双头 \\
+    \bottomrule
+  \end{tabular}
+
+  \vspace{0.2cm}
+  \textbf{评估：}检测mAP@50 / mAP@50:95 + 姿态AP@50 / AP@50:95 + vs YOLOv8官方基线
+\end{frame}
+
+% ============================================================
+\begin{frame}{M-A：标准双头 (Standard Dual-Head)}
+  \vspace{0.3cm}
+  \centering
+  \begin{tikzpicture}[node distance=0.8cm and 1.2cm]
+    \node[aio]    (in)   {输入\\{\tiny 640×640}};
+    \node[abase,right=of in]  (bk)   {Backbone\\{\tiny CSPDarknet}};
+    \node[aneck,right=of bk]  (neck) {FPN+PAN\\{\tiny Neck}};
+    \node[ahead,above right=0.3cm and 1.0cm of neck] (dh) {DetectHead\\{\tiny 19类}};
+    \node[ahead,below right=0.3cm and 1.0cm of neck] (ph) {PoseHead\\{\tiny 1类+17KPT}};
+    \node[aio,right=of dh]    (do)   {检测输出};
+    \node[aio,right=of ph]    (po)   {姿态输出};
+    \draw[->,>=stealth] (in) -- (bk);
+    \draw[->,>=stealth] (bk) -- (neck);
+    \draw[->,>=stealth] (neck.east) -- ++(0.5,0) |- (dh);
+    \draw[->,>=stealth] (neck.east) -- ++(0.5,0) |- (ph);
+    \draw[->,>=stealth] (dh) -- (do);
+    \draw[->,>=stealth] (ph) -- (po);
+  \end{tikzpicture}
+
+  \vspace{0.3cm}
+  \small
+  \textbf{设计思路：}共享Backbone+Neck后分叉两个独立Head，各自优化 \\
+  \textbf{参数：}25.34M \quad|\quad \textbf{变体：}单阶段训练(40epoch) / 两阶段训练(先pose后联合)
+\end{frame}
+
+% ============================================================
+\begin{frame}{M-B：统一头部 (Unified Head)}
+  \vspace{0.5cm}
+  \centering
+  \begin{tikzpicture}[node distance=0.8cm and 1.5cm]
+    \node[aio]    (in)   {输入\\{\tiny 640×640}};
+    \node[abase,right=of in]  (bk)   {Backbone\\{\tiny CSPDarknet}};
+    \node[aneck,right=of bk]  (neck) {FPN+PAN\\{\tiny Neck}};
+    \node[aunif,right=of neck] (uh)  {UnifiedHead\\{\tiny 20类+17KPT}};
+    \node[aio,right=of uh]    (out)  {统一输出\\{\tiny det + pose}};
+    \draw[->,>=stealth] (in) -- (bk);
+    \draw[->,>=stealth] (bk) -- (neck);
+    \draw[->,>=stealth] (neck) -- (uh);
+    \draw[->,>=stealth] (uh) -- (out);
+  \end{tikzpicture}
+
+  \vspace{0.5cm}
+  \small
+  \textbf{设计思路：}单一Head同时处理检测+姿态，最大化参数共享 \\
+  \textbf{参数：}最少，结构最简单 \quad|\quad 收敛最快但检测精度有损
+\end{frame}
+
+% ============================================================
+\begin{frame}{M-C：双颈部 (Dual-Neck)}
+  \vspace{0.3cm}
+  \centering
+  \begin{tikzpicture}[node distance=0.8cm and 1.2cm]
+    \node[aio]    (in)  {输入\\{\tiny 640×640}};
+    \node[abase,right=of in] (bk)  {Backbone\\{\tiny CSPDarknet}};
+    \node[aneck,above right=0.3cm and 1.0cm of bk] (dn) {DetNeck\\{\tiny FPN+PAN}};
+    \node[aneck,below right=0.3cm and 1.0cm of bk] (pn) {PoseNeck\\{\tiny FPN+PAN}};
+    \node[ahead,right=of dn] (dh) {DetectHead\\{\tiny 19类}};
+    \node[ahead,right=of pn] (ph) {PoseHead\\{\tiny 1类+17KPT}};
+    \node[aio,right=of dh]   (do) {检测输出};
+    \node[aio,right=of ph]   (po) {姿态输出};
+    \draw[->,>=stealth] (in) -- (bk);
+    \draw[->,>=stealth] (bk.east) -- ++(0.3,0) |- (dn);
+    \draw[->,>=stealth] (bk.east) -- ++(0.3,0) |- (pn);
+    \draw[->,>=stealth] (dn) -- (dh);
+    \draw[->,>=stealth] (pn) -- (ph);
+    \draw[->,>=stealth] (dh) -- (do);
+    \draw[->,>=stealth] (ph) -- (po);
+  \end{tikzpicture}
+
+  \vspace{0.3cm}
+  \small
+  \textbf{设计思路：}完全解耦，检测/姿态各有独立Neck，任务间零特征干扰 \\
+  \textbf{参数：}最多（两套Neck）\quad|\quad 参数量换任务隔离
+\end{frame}
+
+% ============================================================
+\begin{frame}{M-D：ECA注意力 + 双头 (Attention Dual)}
+  \vspace{0.3cm}
+  \centering
+  \begin{tikzpicture}[node distance=0.8cm and 1.2cm]
+    \node[aio]    (in)   {输入\\{\tiny 640×640}};
+    \node[abase,right=of in]  (bk)   {Backbone\\{\tiny CSPDarknet}};
+    \node[aattn,right=of bk]  (eca)  {ECA\\{\tiny Attention}};
+    \node[aneck,right=of eca] (neck) {FPN+PAN\\{\tiny Neck}};
+    \node[ahead,above right=0.3cm and 1.0cm of neck] (dh) {DetectHead\\{\tiny 19类}};
+    \node[ahead,below right=0.3cm and 1.0cm of neck] (ph) {PoseHead\\{\tiny 1类+17KPT}};
+    \node[aio,right=of dh]    (do)   {检测输出};
+    \node[aio,right=of ph]    (po)   {姿态输出};
+    \draw[->,>=stealth] (in) -- (bk);
+    \draw[->,>=stealth] (bk) -- (eca);
+    \draw[->,>=stealth] (eca) -- (neck);
+    \draw[->,>=stealth] (neck.east) -- ++(0.5,0) |- (dh);
+    \draw[->,>=stealth] (neck.east) -- ++(0.5,0) |- (ph);
+    \draw[->,>=stealth] (dh) -- (do);
+    \draw[->,>=stealth] (ph) -- (po);
+  \end{tikzpicture}
+
+  \vspace{0.3cm}
+  \small
+  \textbf{设计思路：}Backbone输出后插入ECA通道注意力，增强特征表达 \\
+  \textbf{参数：}几乎不增加 \quad|\quad 检测性能与M-A相当
+\end{frame}
+
+% ============================================================
+\begin{frame}{M-E：BiFPN + 双头 (BiFPN Dual)}
+  \vspace{0.3cm}
+  \centering
+  \begin{tikzpicture}[node distance=0.8cm and 1.2cm]
+    \node[aio]    (in)    {输入\\{\tiny 640×640}};
+    \node[abase,right=of in]   (bk)    {Backbone\\{\tiny CSPDarknet}};
+    \node[abifpn,right=of bk]  (bifpn) {BiFPN\\{\tiny Neck}};
+    \node[ahead,above right=0.3cm and 1.0cm of bifpn] (dh) {DetectHead\\{\tiny 19类}};
+    \node[ahead,below right=0.3cm and 1.0cm of bifpn] (ph) {PoseHead\\{\tiny 1类+17KPT}};
+    \node[aio,right=of dh]     (do)    {检测输出};
+    \node[aio,right=of ph]     (po)    {姿态输出};
+    \draw[->,>=stealth] (in) -- (bk);
+    \draw[->,>=stealth] (bk) -- (bifpn);
+    \draw[->,>=stealth] (bifpn.east) -- ++(0.5,0) |- (dh);
+    \draw[->,>=stealth] (bifpn.east) -- ++(0.5,0) |- (ph);
+    \draw[->,>=stealth] (dh) -- (do);
+    \draw[->,>=stealth] (ph) -- (po);
+    \draw[->,>=stealth,dashed,teal!60] (bifpn.north) to[out=30,in=150] (bifpn.east);
+    \draw[<-,>=stealth,dashed,teal!60] (bifpn.south) to[out=-30,in=-150] (bifpn.east);
+  \end{tikzpicture}
+
+  \vspace{0.3cm}
+  \small
+  \textbf{设计思路：}BiFPN替代FPN+PAN，可学习跨尺度特征融合权重 \\
+  \textbf{姿态最优：}AP50=67.8，BiFPN对姿态任务增益最大
+\end{frame}
+
+% ============================================================
+\begin{frame}{训练过程 --- Loss曲线}
+  \centering
+  \includegraphics[width=0.49\textwidth]{../checkpoints/plots/train_total_loss.pdf}
+  \hfill
+  \includegraphics[width=0.49\textwidth]{../checkpoints/plots/val_total_loss.pdf}
+
+  \vspace{0.15cm}
+  \small
+  \begin{itemize}\setlength{\itemsep}{2pt}
+    \item M-B (Unified Head) 收敛最快，final loss最低
+    \item 各模型验证loss均高于训练loss，存在一定过拟合
+    \item M-A两阶段训练的epoch已由TB自动连续编号
+    \item {\small[*] 两阶段Loss仅含Stage2数据（Stage1日志被覆盖，已于代码中修复）}
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\begin{frame}{检测性能对比}
+  \centering
+  \includegraphics[width=0.78\textwidth]{../checkpoints/plots/comparison_det.pdf}
+
+  \vspace{0.1cm}
+  \small
+  \begin{itemize}\setlength{\itemsep}{2pt}
+    \item M-A（单阶段）和M-D（ECA）检测最优，mAP50 $\approx$ 57.8
+    \item 各模型 Person AP50 均稳定在 78--79
+    \item YOLOv8m-detect 单任务基线 68.7 --- 多任务有明显精度折损
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\begin{frame}{姿态估计性能对比}
+  \centering
+  \includegraphics[width=0.78\textwidth]{../checkpoints/plots/comparison_pose.pdf}
+
+  \vspace{0.1cm}
+  \small
+  \begin{itemize}\setlength{\itemsep}{2pt}
+    \item M-E (BiFPN) 姿态最优：AP50=67.8, AP50-95=45.9
+    \item M-B (Unified) 次之：AP50=66.1 --- 统一头有利于姿态学习
+    \item YOLOv8m-pose 单任务基线 89.6 --- 姿态是多任务的最大挑战
+  \end{itemize}
+\end{frame}
+
+% ============================================================
+\begin{frame}{综合性能对比表}
+  \centering
+  \scriptsize
+  \begin{tabular}{lcccccr}
+    \toprule
+    \rowcolor{blue!10}
+    \textbf{模型} & \textbf{Det} & \textbf{Det} & \textbf{No-Pers} & \textbf{Pose} & \textbf{Pose} & \textbf{训练} \\
+    \rowcolor{blue!10}
+    & \textbf{mAP50} & \textbf{mAP50-95} & \textbf{mAP50} & \textbf{AP50} & \textbf{AP50-95} & \textbf{Epoch} \\
+    \midrule
+    M-A (单阶段) & \textbf{57.8} & \textbf{38.2} & 56.7 & 62.6 & 40.4 & 40 \\
+    M-A (两阶段) & 56.6 & 37.4 & 55.5 & 59.7 & 37.4 & 30$\rightarrow$10 \\
+    M-B Unified   & 52.6 & 34.0 & 51.2 & 66.1 & 45.8 & 20 \\
+    M-C DualNeck  & 54.1 & 34.6 & 52.9 & 61.8 & 38.5 & 20 \\
+    M-D ECA       & 57.6 & 38.1 & 56.4 & 63.4 & 42.4 & 20 \\
+    M-E BiFPN     & 54.7 & 35.5 & 53.4 & \textbf{67.8} & \textbf{45.9} & 20 \\
+    \midrule
+    YOLOv8n-detect & 54.9 & 38.3 & 53.9 & --- & --- & 官方 \\
+    YOLOv8s-detect & 62.9 & 45.8 & 62.1 & --- & --- & 官方 \\
+    YOLOv8m-detect & \underline{68.7} & \underline{51.4} & 68.1 & --- & --- & 官方 \\
+    YOLOv8n-pose   & 3.0 & 2.2 & --- & 83.7 & 62.1 & 官方 \\
+    YOLOv8s-pose   & 3.1 & 2.3 & --- & 87.4 & 70.3 & 官方 \\
+    YOLOv8m-pose   & 3.1 & 2.4 & --- & \underline{89.6} & \underline{74.6} & 官方 \\
+    \bottomrule
+  \end{tabular}
+  \vspace{0.15cm}
+
+  \small 检测最优：M-A/M-D $\approx$57.8 \quad|\quad 姿态最优：M-E 67.8 \quad|\quad 收敛最快：M-B
+\end{frame}
+
+% ============================================================
+\begin{frame}{结论与展望}
+  \textbf{核心发现}
+  \begin{enumerate}\setlength{\itemsep}{3pt}
+    \item \alert{检测：} M-A (Dual-Head) 和 M-D (ECA) 最优，mAP50 $\approx$ 57.8
+    \item \alert{姿态：} M-E (BiFPN) 最优，AP50=67.8
+    \item \alert{收敛：} M-B (Unified Head) 最快，结构最简单但检测精度有损（52.6）
+    \item \alert{两阶段训练：} M-A两阶段方案未超越单阶段，需更多epoch
+    \item \alert{多任务折损：} 联合模型检测/姿态均低于YOLOv8m单任务基线（68.7/89.6）
+  \end{enumerate}
+
+  \vspace{0.2cm}
+  \textbf{后续方向}
+  \begin{itemize}\setlength{\itemsep}{2pt}
+    \item 增加训练epoch至200+充分收敛后重新对比
+    \item 动态任务权重 \& 联合蒸馏
+    \item 推理速度对比（FPS / 参数量 / FLOPs）
+  \end{itemize}
+
+  \vspace{0.3cm}
+  \centering \Large \textbf{谢谢！}
+\end{frame}
+
+\end{document}
