@@ -8,7 +8,7 @@
 #   1. Installs uv package manager
 #   2. Creates a dedicated conda env or uses uv venv
 #   3. Installs project dependencies (PyTorch, OpenCV, etc.)
-#   4. Downloads and prepares COCO 2017 20-class dataset
+#   4. Downloads and prepares COCO 2017 80-class dataset
 #
 # Customize via env vars:
 #   DATA_DIR=/root/autodl-tmp/coco2017     # fast SSD for data
@@ -60,17 +60,28 @@ for i in range(torch.cuda.device_count()):
 
 # ---- Step 3: Download & prepare COCO ----
 echo ""
-echo "[3/4] Preparing COCO 2017 20-class dataset..."
+echo "[3/4] Preparing COCO 2017 80-class dataset..."
 uv run python test_model/data/prepare_coco20.py \
     --data-dir "$DATA_DIR" \
-    --download
+    --download \
+    --full80
 
 # ---- Step 4: Verify dataset ----
 echo ""
 echo "[4/4] Verifying dataset..."
 uv run python test_model/data/prepare_coco20.py \
     --data-dir "$DATA_DIR" \
-    --verify-only
+    --verify-only \
+    --full80
+
+echo ""
+echo "[4.1/4] Auditing label mapping..."
+uv run python test_model/scripts/audit_dataset.py \
+    --data "$DATA_DIR" \
+    --img-dir train2017 \
+    --label-dir labels/train2017 \
+    --class-id-format yolo80 \
+    --max-samples 256
 
 mkdir -p "$SAVE_DIR"
 

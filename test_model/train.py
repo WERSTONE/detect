@@ -131,9 +131,9 @@ def main():
         'reg_max': cfg.get('reg_max', 16),
     }
     if model_name == 'unified_head':
-        model_kwargs['num_classes'] = cfg.get('num_classes', 20)
+        model_kwargs['num_classes'] = cfg.get('num_classes', 80)
     else:
-        model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 19)
+        model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 80)
 
     model = create_model(model_name, **model_kwargs)
     print(f"Parameters: {model.num_params / 1e6:.2f}M")
@@ -144,11 +144,13 @@ def main():
         model.det_loss.w_cls = l_cfg.get('w_cls', 0.5)
         model.det_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
     if hasattr(model, 'pose_loss'):
-        model.pose_loss.w_box = l_cfg.get('w_box', 7.5)
-        model.pose_loss.w_cls = l_cfg.get('w_cls', 0.5)
-        model.pose_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
+        model.pose_loss.w_box = 0.0
+        model.pose_loss.w_cls = 0.0
+        model.pose_loss.w_dfl = 0.0
         model.pose_loss.w_pose = l_cfg.get('w_pose', 12.0)
         model.pose_loss.w_kobj = l_cfg.get('w_kobj', 1.0)
+    if hasattr(model, 'disable_pose_proposal_training'):
+        model.disable_pose_proposal_training()
     if hasattr(model, 'loss_fn'):
         model.loss_fn.w_box = l_cfg.get('w_box', 7.5)
         model.loss_fn.w_cls = l_cfg.get('w_cls', 0.5)
@@ -158,8 +160,8 @@ def main():
 
     # Create val dataloader (shared)
     data_root = Path(opts['data_root'])
-    class_id_format = d_cfg.get('class_id_format', 'coco20')
-    print(f"Label format: {class_id_format} (prepared internal ids 0..19)")
+    class_id_format = d_cfg.get('class_id_format', 'yolo80')
+    print(f"Label format: {class_id_format} (internal COCO ids 0..79)")
     val_loader = create_dataloader(
         data_dir=data_root,
         img_dir=d_cfg.get('val_img', 'images/val2017'),
@@ -199,6 +201,10 @@ def main():
             ema_decay=t_cfg.get('ema_decay', 0.9999),
             save_best_by=t_cfg.get('save_best_by', 'loss'),
             use_tensorboard=t_cfg.get('tensorboard', True),
+            early_stop_enabled=t_cfg.get('early_stop', {}).get('enabled', False),
+            early_stop_patience=t_cfg.get('early_stop', {}).get('patience', 0),
+            early_stop_min_delta=t_cfg.get('early_stop', {}).get('min_delta', 0.0),
+            early_stop_start_epoch=t_cfg.get('early_stop', {}).get('start_epoch', 0),
         )
 
     def _make_train_loader(person_only=False):
@@ -221,6 +227,96 @@ def main():
             mosaic_prob=a_cfg.get('mosaic_prob', 0.5),
             person_only=person_only,
         )
+
+    dynamic_cfg = t_cfg.get('dynamic_weights', {})
+    task_loss_history = []
+
+    def _apply_dynamic_weights(epoch):
+        if hasattr(model, 'disable_pose_proposal_training'):
+            model.disable_pose_proposal_training()
+        if hasattr(model, 'train_det') and not model.train_det:
+            if hasattr(model, 'set_task_weights'):
+                model.set_task_weights(1.0, 1.0)
+            return
+        if not dynamic_cfg.get('enabled', False):
+            if hasattr(model, 'set_task_weights'):
+                model.set_task_weights(1.0, 1.0)
+            return
+        method = str(dynamic_cfg.get('method', 'dwa')).lower()
+        if method != 'dwa':
+            raise ValueError(f"Unsupported dynamic weight method: {method}")
+
+        num_tasks = 2.0
+        temperature = float(dynamic_cfg.get('temperature', 2.0))
+        eps = float(dynamic_cfg.get('eps', 1e-8))
+
+        if epoch < 2 or len(task_loss_history) < 2:
+            det_weight = 1.0
+            pose_weight = 1.0
+        else:
+            prev2 = task_loss_history[-2]
+            prev1 = task_loss_history[-1]
+            det_ratio = prev1['det_total'] / max(prev2['det_total'], eps)
+            pose_ratio = prev1['pose_total'] / max(prev2['pose_total'], eps)
+            det_score = torch.exp(torch.tensor(det_ratio / temperature, dtype=torch.float32)).item()
+            pose_score = torch.exp(torch.tensor(pose_ratio / temperature, dtype=torch.float32)).item()
+            norm = max(det_score + pose_score, eps)
+            det_weight = num_tasks * det_score / norm
+            pose_weight = num_tasks * pose_score / norm
+
+        det_weight = float(min(max(det_weight, dynamic_cfg.get('det_min', 0.2)), dynamic_cfg.get('det_max', 5.0)))
+        pose_weight = float(min(max(pose_weight, dynamic_cfg.get('pose_min', 0.2)), dynamic_cfg.get('pose_max', 5.0)))
+        if hasattr(model, 'set_task_weights'):
+            model.set_task_weights(det_weight, pose_weight)
+
+    def _record_task_losses(epoch, train_metrics, _val_metrics=None):
+        det_total = float(train_metrics.get('det_total', 0.0))
+        pose_total = float(train_metrics.get('pose_total', 0.0))
+        task_loss_history.append({
+            'epoch': int(epoch),
+            'det_total': max(det_total, 1e-8),
+            'pose_total': max(pose_total, 1e-8),
+        })
+
+    def _compose_epoch_callbacks(*callbacks):
+        callbacks = [cb for cb in callbacks if cb]
+        if not callbacks:
+            return None
+
+        def _callback(epoch):
+            for cb in callbacks:
+                cb(epoch)
+        return _callback
+
+    def _run_preflight(train_loader, val_loader_to_check=None, tag='train'):
+        print(f"\n[Preflight] Checking one {tag} batch...")
+        model.train()
+        batch = next(iter(train_loader))
+        images = batch['image'].to(device, non_blocking=True)
+        gt_list = [{
+            'boxes': batch['boxes'][i],
+            'classes': batch['classes'][i],
+            'kpts': batch['kpts'][i],
+        } for i in range(len(images))]
+        losses = model.compute_loss(images, gt_list)
+        print("  loss ok: " + " ".join(
+            f"{k}={v:.4f}" for k, v in sorted(losses.items()) if isinstance(v, torch.Tensor)))
+
+        if val_loader_to_check is not None:
+            print(f"[Preflight] Checking one {tag} val decode batch...")
+            model.eval()
+            val_batch = next(iter(val_loader_to_check))
+            val_images = val_batch['image'].to(device, non_blocking=True)
+            predictions = model.predict_val(
+                val_images,
+                score_thresh=cfg.get('eval', {}).get('score_thresh', 0.01),
+                iou_thresh=cfg.get('eval', {}).get('iou_thresh', 0.6),
+                max_det=cfg.get('eval', {}).get('max_det', 300),
+            )
+            if len(predictions) != len(val_images):
+                raise RuntimeError(
+                    f"predict_val returned {len(predictions)} predictions for {len(val_images)} images")
+            print(f"  decode ok: batch={len(val_images)} preds={len(predictions)}")
 
     # Two-stage training for dual-head models
     two_stage = t_cfg.get('two_stage', {})
@@ -254,6 +350,7 @@ def main():
         print(f"\n{'='*60}")
         print(f"Stage 1: pose head only | Epochs: {s1_epochs} | LR: {s1_lr}")
         print(f"{'='*60}")
+        _run_preflight(train_loader_s1, val_loader, tag='stage1')
 
         trainer1 = _make_trainer(s1_lr, save_dir_suffix='_stage1')
         trainer1.fit(
@@ -262,6 +359,8 @@ def main():
             val_loader=val_loader,
             save_prefix=model_name + '_stage1',
             close_mosaic_epochs=close_mosaic,
+            on_epoch_start=_apply_dynamic_weights,
+            on_epoch_end=_record_task_losses,
         )
 
         # Release stage1 loader workers before creating full loader
@@ -270,6 +369,7 @@ def main():
         del train_loader_s1
 
         # ---- Stage 2: both heads (full data) ----
+        task_loss_history.clear()
         model.train_det = True
         model.det_weight_warmup_epochs = s2.get('det_weight_warmup_epochs', 5)
         model.det_weight_mult = 0.0
@@ -289,6 +389,7 @@ def main():
         print(f"  det_weight warmup over {model.det_weight_warmup_epochs} epochs (0→1)")
         print(f"{'='*60}")
 
+        _run_preflight(train_loader, val_loader, tag='stage2')
         trainer2 = _make_trainer(s2_lr)
         trainer2.fit(
             epochs=s2_epochs,
@@ -296,7 +397,8 @@ def main():
             val_loader=val_loader,
             save_prefix=model_name,
             close_mosaic_epochs=close_mosaic,
-            on_epoch_start=_on_epoch_start,
+            on_epoch_start=_compose_epoch_callbacks(_on_epoch_start, _apply_dynamic_weights),
+            on_epoch_end=_record_task_losses,
         )
 
         print(f"\nTwo-stage training complete for {model_name}!")
@@ -304,6 +406,7 @@ def main():
         # Single-stage training (original flow)
         train_loader = _make_train_loader()
         print(f"Train: {len(train_loader.dataset)} samples")
+        _run_preflight(train_loader, val_loader, tag='single-stage')
 
         trainer = _make_trainer(opts['lr'])
         if resume:
@@ -317,6 +420,8 @@ def main():
             val_loader=val_loader,
             save_prefix=model_name,
             close_mosaic_epochs=close_mosaic,
+            on_epoch_start=_apply_dynamic_weights,
+            on_epoch_end=_record_task_losses,
         )
 
         print(f"\nTraining complete for {model_name}!")

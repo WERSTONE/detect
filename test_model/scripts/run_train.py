@@ -113,7 +113,7 @@ Training Config
 {'='*60}
 Model:       {cfg['model']}
 Data:        {cfg['data']['root']}
-Label format:{cfg.get('data', {}).get('class_id_format', 'coco20')}
+Label format:{cfg.get('data', {}).get('class_id_format', 'yolo80')}
 Epochs:      {t.get('epochs', 300)} | Batch: {t.get('batch_size', 16)}
 Optimizer:   {t.get('optimizer', 'sgd')} | LR: {t.get('lr0', 0.01)} → {t.get('lr0', 0.01) * t.get('lrf', 0.01):.0e}
 Warmup:      {t.get('warmup_epochs', 3)} epochs | Cosine LR: {t.get('cos_lr', True)}
@@ -206,7 +206,7 @@ def main():
                 '--img-dir', cfg.get('data', {}).get('val_img', 'images/val2017'),
                 '--label-dir', cfg.get('data', {}).get('val_label', 'labels/val2017'),
                 '--input-size', str(cfg.get('data', {}).get('input_size', 640)),
-                '--class-id-format', cfg.get('data', {}).get('class_id_format', 'coco20'),
+                '--class-id-format', cfg.get('data', {}).get('class_id_format', 'yolo80'),
                 '--score-thresh', str(eval_cfg.get('score_thresh', 0.01)),
                 '--iou-thresh', str(eval_cfg.get('iou_thresh', 0.6)),
                 '--max-det', str(eval_cfg.get('max_det', 300)),

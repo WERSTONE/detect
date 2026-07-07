@@ -3,8 +3,8 @@
 
 Checks the class-id mapping used by COCOMultiTaskDataset and reports the split
 that dual-head models will see:
-  - person boxes + keypoints -> pose head
-  - non-person boxes -> detection head
+  - all COCO boxes/classes -> detection head
+  - person keypoints -> pose head
 """
 
 import argparse
@@ -16,7 +16,7 @@ from pathlib import Path
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from test_model.dataset import COCOMultiTaskDataset, COCO20_CLASSES
+from test_model.dataset import COCOMultiTaskDataset, COCO80_CLASSES
 
 
 def parse_args():
@@ -25,8 +25,10 @@ def parse_args():
     p.add_argument('--img-dir', type=str, default='train2017')
     p.add_argument('--label-dir', type=str, default='labels/train2017')
     p.add_argument('--input-size', type=int, default=640)
-    p.add_argument('--class-id-format', type=str, default='coco20',
-                   choices=['yolo80', 'coco', 'coco20', 'internal', 'internal20', 'auto'])
+    p.add_argument('--class-id-format', type=str, default='yolo80',
+                   choices=['yolo80', 'internal80', 'coco', 'coco80',
+                            'coco20', 'internal', 'internal20',
+                            'coco_category20', 'coco20_category', 'auto'])
     p.add_argument('--max-samples', type=int, default=0,
                    help='0 means audit all samples')
     p.add_argument('--output', type=str, default=None)
@@ -53,7 +55,7 @@ def main():
     images_with_labels = 0
     person_boxes = 0
     person_with_visible_kpts = 0
-    non_person_boxes = 0
+    det_boxes = 0
 
     limit = len(dataset) if args.max_samples <= 0 else min(args.max_samples, len(dataset))
     for idx in range(limit):
@@ -83,8 +85,7 @@ def main():
                 person_boxes += 1
                 if i < len(kpts) and (kpts[i, :, 2] > 0).any().item():
                     person_with_visible_kpts += 1
-            else:
-                non_person_boxes += 1
+            det_boxes += 1
 
     result = {
         'dataset_root': str(Path(args.data).resolve()),
@@ -96,15 +97,17 @@ def main():
         'raw_label_lines': raw_lines,
         'ignored_label_lines': ignored_lines,
         'dual_head_split': {
-            'pose_head_person_boxes': person_boxes,
+            'det_head_all_boxes': det_boxes,
+            'det_head_person_boxes': person_boxes,
             'pose_head_person_boxes_with_visible_keypoints': person_with_visible_kpts,
-            'det_head_non_person_boxes': non_person_boxes,
         },
         'mapped_class_counts': {
-            COCO20_CLASSES[k]: int(v) for k, v in sorted(mapped_class_counts.items())
+            COCO80_CLASSES[k]: int(v) for k, v in sorted(mapped_class_counts.items())
+            if 0 <= k < len(COCO80_CLASSES)
         },
         'sanitized_class_counts': {
-            COCO20_CLASSES[k]: int(v) for k, v in sorted(sanitized_class_counts.items())
+            COCO80_CLASSES[k]: int(v) for k, v in sorted(sanitized_class_counts.items())
+            if 0 <= k < len(COCO80_CLASSES)
         },
         'raw_class_counts': {str(k): int(v) for k, v in sorted(raw_class_counts.items())},
     }

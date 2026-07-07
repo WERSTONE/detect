@@ -46,7 +46,9 @@ class Trainer:
                  log_interval=20, save_interval=20, val_interval=5,
                  save_dir='checkpoints', use_amp=True,
                  ema_decay=0.9999, save_best_by='loss',
-                 use_tensorboard=False, check_finite_loss=False):
+                 use_tensorboard=False, check_finite_loss=False,
+                 early_stop_enabled=False, early_stop_patience=0,
+                 early_stop_min_delta=0.0, early_stop_start_epoch=0):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.grad_clip = grad_clip
@@ -84,6 +86,11 @@ class Trainer:
         self.save_best_by = save_best_by
         self.best_metric = float('inf') if save_best_by == 'loss' else -float('inf')
         self.check_finite_loss = check_finite_loss
+        self.early_stop_enabled = early_stop_enabled and early_stop_patience > 0
+        self.early_stop_patience = int(early_stop_patience)
+        self.early_stop_min_delta = float(early_stop_min_delta)
+        self.early_stop_start_epoch = int(early_stop_start_epoch)
+        self.early_stop_bad_epochs = 0
 
         # EMA
         self.ema_decay = ema_decay
@@ -135,6 +142,11 @@ class Trainer:
     def _set_lr(self, lr):
         for pg in self.optimizer.param_groups:
             pg['lr'] = lr
+
+    def _is_improved(self, current):
+        if self.save_best_by == 'loss':
+            return current < self.best_metric - self.early_stop_min_delta
+        return current > self.best_metric + self.early_stop_min_delta
 
     def train_epoch(self, loader, max_epochs, epoch, close_mosaic=None):
         """Train one epoch.
@@ -300,7 +312,7 @@ class Trainer:
 
     def fit(self, epochs, train_loader, val_loader=None,
             save_prefix='model', close_mosaic_epochs=10,
-            on_epoch_start=None):
+            on_epoch_start=None, on_epoch_end=None):
         """Main training loop.
 
         Args:
@@ -310,6 +322,7 @@ class Trainer:
             save_prefix: Prefix for checkpoint filenames
             close_mosaic_epochs: Disable mosaic for last N epochs
             on_epoch_start: Optional callback(epoch) called at start of each epoch
+            on_epoch_end: Optional callback(epoch, train_metrics, val_metrics) called at end of each epoch
         """
         print(f"\n{'='*60}")
         print(f"Training: {save_prefix} | Epochs: {epochs} | "
@@ -341,10 +354,16 @@ class Trainer:
                 log += " | " + " ".join(f"{k}={v:.4f}" for k, v in sorted(val_m.items()))
 
                 current = val_m.get('val_total', float('inf'))
-                if self.save_best_by == 'loss' and current < self.best_metric:
+                improved = self._is_improved(current)
+                if improved:
                     self.best_metric = current
+                    self.early_stop_bad_epochs = 0
                     self.save(self.save_dir / f"{save_prefix}_best.pt", val_m)
                     log += " [BEST]"
+                elif (self.early_stop_enabled and
+                      epoch + 1 >= self.early_stop_start_epoch):
+                    self.early_stop_bad_epochs += 1
+                    log += f" [NO_IMPROVE {self.early_stop_bad_epochs}/{self.early_stop_patience}]"
 
             print(log)
 
@@ -357,6 +376,15 @@ class Trainer:
 
             if (epoch + 1) % self.save_interval == 0:
                 self.save(self.save_dir / f"{save_prefix}_epoch{epoch + 1}.pt")
+
+            if on_epoch_end:
+                on_epoch_end(epoch, train_m, val_m if do_val else None)
+
+            if (do_val and self.early_stop_enabled and
+                    self.early_stop_bad_epochs >= self.early_stop_patience):
+                print(f"Early stopping at epoch {epoch + 1}: "
+                      f"best {self.save_best_by}={self.best_metric:.4f}")
+                break
 
         # Save last checkpoint
         self.save(self.save_dir / f"{save_prefix}_last.pt")

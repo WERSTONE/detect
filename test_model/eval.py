@@ -7,7 +7,7 @@ Computes:
 - Outputs comparison-ready JSON
 
 Usage:
-    python -m test_model.eval --model dual_head --weights checkpoints/dual_head/dual_head_best.pt --data data/coco20
+    python -m test_model.eval --model dual_head --weights checkpoints/dual_head/dual_head_best.pt --data /data/coco2017
 """
 
 import argparse
@@ -56,7 +56,7 @@ def _interp_ap(tp, fp, total_gt):
     return float(np.clip(ap, 0.0, 1.0))
 
 
-def compute_ap_by_class_multi(predictions, ground_truths, iou_thresholds=None, num_classes=20):
+def compute_ap_by_class_multi(predictions, ground_truths, iou_thresholds=None, num_classes=80):
     """Compute per-class AP for several IoU thresholds in one pass."""
     if iou_thresholds is None:
         iou_thresholds = np.arange(0.5, 1.0, 0.05)
@@ -127,10 +127,11 @@ def compute_ap_by_class_multi(predictions, ground_truths, iou_thresholds=None, n
     return aps
 
 
-def compute_ap_by_class(predictions, ground_truths, iou_thresh=0.5):
+def compute_ap_by_class(predictions, ground_truths, iou_thresh=0.5, num_classes=80):
     """Compute AP for each class using 101-point interpolation."""
     multi = compute_ap_by_class_multi(
-        predictions, ground_truths, iou_thresholds=np.array([iou_thresh], dtype=np.float32))
+        predictions, ground_truths, iou_thresholds=np.array([iou_thresh], dtype=np.float32),
+        num_classes=num_classes)
     return {cls_id: float(values[0]) for cls_id, values in multi.items()}
 
 
@@ -344,7 +345,7 @@ def _scale_kpts_to_letterbox(kpts, scale, pad):
 
 def evaluate_ultralytics(yolo_model, dataloader, device='cuda', score_thresh=0.01,
                          iou_thresh=0.6, max_det=300, provider='ultralytics_detect',
-                         input_size=640):
+                         input_size=640, num_classes=80):
     """Evaluate an official Ultralytics model on the same labels/metrics."""
     from test_model.dataset import YOLO80_ID_TO_20
 
@@ -403,6 +404,8 @@ def evaluate_ultralytics(yolo_model, dataloader, device='cuda', score_thresh=0.0
                         person_kpts = np.zeros((len(person_boxes), 17, 3), dtype=np.float32)
                 else:
                     mapped = np.array([YOLO80_ID_TO_20.get(int(c), -1) for c in raw_classes], dtype=np.int32)
+                    if num_classes == 80:
+                        mapped = raw_classes
                     keep = mapped >= 0
                     pred_boxes = boxes_lb[keep]
                     pred_scores = raw_scores[keep]
@@ -429,7 +432,7 @@ def evaluate_ultralytics(yolo_model, dataloader, device='cuda', score_thresh=0.0
     return all_preds, all_gts
 
 
-def compute_all_metrics(all_preds, all_gts):
+def compute_all_metrics(all_preds, all_gts, num_classes=80):
     """Compute comprehensive metrics.
 
     Returns dict with:
@@ -442,7 +445,8 @@ def compute_all_metrics(all_preds, all_gts):
     """
     results = {}
     iou_thresholds = np.arange(0.5, 1.0, 0.05, dtype=np.float32)
-    det_aps = compute_ap_by_class_multi(all_preds, all_gts, iou_thresholds=iou_thresholds)
+    det_aps = compute_ap_by_class_multi(
+        all_preds, all_gts, iou_thresholds=iou_thresholds, num_classes=num_classes)
     ap50 = {cls_id: float(values[0]) for cls_id, values in det_aps.items()}
 
     # Detection AP@0.5
@@ -517,7 +521,9 @@ def main():
     p.add_argument('--label-dir', type=str, default=None, help='Validation label directory under data root')
     p.add_argument('--input-size', type=int, default=None, help='Evaluation input size')
     p.add_argument('--class-id-format', type=str, default=None,
-                   choices=['yolo80', 'coco', 'coco20', 'internal', 'internal20', 'auto'],
+                   choices=['yolo80', 'internal80', 'coco', 'coco80',
+                            'coco20', 'internal', 'internal20',
+                            'coco_category20', 'coco20_category', 'auto'],
                    help='Label class id format')
     p.add_argument('--max-samples', type=int, default=0,
                    help='Optional sample limit for quick evaluation smoke tests')
@@ -553,9 +559,9 @@ def main():
             'reg_max': cfg.get('reg_max', 16),
         }
         if args.model == 'unified_head':
-            model_kwargs['num_classes'] = cfg.get('num_classes', 20)
+            model_kwargs['num_classes'] = cfg.get('num_classes', 80)
         else:
-            model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 19)
+            model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 80)
         model = create_model(args.model, **model_kwargs)
         ckpt = torch.load(args.weights, map_location='cpu', weights_only=False)
         model.load_state_dict(ckpt['model_state_dict'])
@@ -582,10 +588,11 @@ def main():
     batch = args.batch or e_cfg.get('batch_size', 16)
     workers = args.workers if args.workers is not None else cfg.get('training', {}).get('workers', 4)
     input_size = args.input_size or d_cfg.get('input_size', 640)
-    class_id_format = args.class_id_format or d_cfg.get('class_id_format', 'coco20')
+    class_id_format = args.class_id_format or d_cfg.get('class_id_format', 'yolo80')
     score_thresh = args.score_thresh if args.score_thresh is not None else e_cfg.get('score_thresh', 0.01)
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else e_cfg.get('iou_thresh', 0.6)
     max_det = args.max_det if args.max_det is not None else e_cfg.get('max_det', 300)
+    num_classes = cfg.get('num_classes', 80)
 
     device = args.device
     if device == 'cuda' and not torch.cuda.is_available():
@@ -624,8 +631,9 @@ def main():
     else:
         all_preds, all_gts = evaluate_ultralytics(
             yolo_model, loader, device, score_thresh=score_thresh, iou_thresh=iou_thresh,
-            max_det=max_det, provider=args.provider, input_size=input_size)
-    metrics = compute_all_metrics(all_preds, all_gts)
+            max_det=max_det, provider=args.provider, input_size=input_size,
+            num_classes=num_classes)
+    metrics = compute_all_metrics(all_preds, all_gts, num_classes=num_classes)
 
     # Report
     print("\n" + "=" * 60)

@@ -1,9 +1,9 @@
 """Detection and pose heads (decoupled, YOLOv8-style).
 
 Head types:
-    DetectHead: cls(19) + reg(4*reg_max)  — non-person detection
-    PoseHead:   cls(1)  + reg(4*reg_max) + kpt(17*3) — person + keypoints
-    UnifiedHead: cls(20) + reg(4*reg_max) + kpt(17*3) — all-in-one
+    DetectHead: cls(80) + reg(4*reg_max) - full COCO detection
+    PoseHead:   kpt(17*3) branch used for person keypoints
+    UnifiedHead: cls(80) + reg(4*reg_max) + kpt(17*3) - all-in-one
 """
 
 import math
@@ -27,14 +27,14 @@ def _make_tower(in_ch, mid_ch, depth):
 
 
 class DetectHead(nn.Module):
-    """Detection head for non-person classes (19 classes).
+    """Detection head for COCO classes.
 
     Output per grid cell:
-        cls: [B, 19, H, W]  — classification logits
-        reg: [B, 4*reg_max, H, W] — DFL distribution
+        cls: [B, num_classes, H, W] classification logits
+        reg: [B, 4*reg_max, H, W] DFL distribution
     """
 
-    def __init__(self, in_ch, num_classes=19, reg_max=16, tower_depth=2):
+    def __init__(self, in_ch, num_classes=80, reg_max=16, tower_depth=2):
         super().__init__()
         self.num_classes = num_classes
         self.reg_max = reg_max
@@ -71,7 +71,7 @@ class DetectHead(nn.Module):
 
 
 class PoseHead(nn.Module):
-    """Pose head for person detection + 17 keypoints.
+    """Pose head with keypoint prediction for person detections.
 
     Output per grid cell:
         cls: [B, 1, H, W]   — person classification logit
@@ -126,15 +126,15 @@ class PoseHead(nn.Module):
 
 
 class UnifiedHead(nn.Module):
-    """Unified head: all 20 classes + person keypoints from one head.
+    """Unified head: all COCO classes + person keypoints from one head.
 
     Output per grid cell:
-        cls: [B, 20, H, W]  — 20-class logits (incl. person at index 0)
+        cls: [B, num_classes, H, W] logits (incl. person at index 0)
         reg: [B, 4*reg_max, H, W] — DFL distribution
         kpt: [B, 51, H, W]  — only valid for person class
     """
 
-    def __init__(self, in_ch, num_classes=20, num_kpts=17, reg_max=16, tower_depth=2):
+    def __init__(self, in_ch, num_classes=80, num_kpts=17, reg_max=16, tower_depth=2):
         super().__init__()
         self.num_classes = num_classes
         self.num_kpts = num_kpts

@@ -50,7 +50,7 @@ class TaskAlignedAssigner:
     @torch.no_grad()
     def __call__(self, pred_scores, pred_boxes, gt_boxes, gt_classes,
                  gt_kpts, feat_sizes, strides, batch_indices,
-                 num_det_classes=19):
+                 num_det_classes=80):
         """Assign targets.
 
         Args:

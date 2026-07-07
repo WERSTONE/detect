@@ -18,7 +18,24 @@ import torch
 from torch.utils.data import Dataset, DataLoader, DistributedSampler
 
 
-# COCO 20-class mapping.
+# COCO class mappings. Full 80-class COCO is now the default; the previous
+# 20-class subset remains for old experiments and tests.
+COCO80_CLASSES = [
+    'person', 'bicycle', 'car', 'motorcycle', 'airplane', 'bus', 'train',
+    'truck', 'boat', 'traffic light', 'fire hydrant', 'stop sign',
+    'parking meter', 'bench', 'bird', 'cat', 'dog', 'horse', 'sheep', 'cow',
+    'elephant', 'bear', 'zebra', 'giraffe', 'backpack', 'umbrella',
+    'handbag', 'tie', 'suitcase', 'frisbee', 'skis', 'snowboard',
+    'sports ball', 'kite', 'baseball bat', 'baseball glove', 'skateboard',
+    'surfboard', 'tennis racket', 'bottle', 'wine glass', 'cup', 'fork',
+    'knife', 'spoon', 'bowl', 'banana', 'apple', 'sandwich', 'orange',
+    'broccoli', 'carrot', 'hot dog', 'pizza', 'donut', 'cake', 'chair',
+    'couch', 'potted plant', 'bed', 'dining table', 'toilet', 'tv',
+    'laptop', 'mouse', 'remote', 'keyboard', 'cell phone', 'microwave',
+    'oven', 'toaster', 'sink', 'refrigerator', 'book', 'clock', 'vase',
+    'scissors', 'teddy bear', 'hair drier', 'toothbrush',
+]
+
 COCO20_CLASSES = [
     'person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck',
     'dog', 'cat', 'horse', 'bird', 'cow', 'sheep',
@@ -72,6 +89,19 @@ COCO_CATEGORY_ID_TO_20 = {
     77: 19,  # cell phone
 }
 
+COCO_CATEGORY_ID_TO_80 = {
+    1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
+    11: 10, 13: 11, 14: 12, 15: 13, 16: 14, 17: 15, 18: 16, 19: 17,
+    20: 18, 21: 19, 22: 20, 23: 21, 24: 22, 25: 23, 27: 24, 28: 25,
+    31: 26, 32: 27, 33: 28, 34: 29, 35: 30, 36: 31, 37: 32, 38: 33,
+    39: 34, 40: 35, 41: 36, 42: 37, 43: 38, 44: 39, 46: 40, 47: 41,
+    48: 42, 49: 43, 50: 44, 51: 45, 52: 46, 53: 47, 54: 48, 55: 49,
+    56: 50, 57: 51, 58: 52, 59: 53, 60: 54, 61: 55, 62: 56, 63: 57,
+    64: 58, 65: 59, 67: 60, 70: 61, 72: 62, 73: 63, 74: 64, 75: 65,
+    76: 66, 77: 67, 78: 68, 79: 69, 80: 70, 81: 71, 82: 72, 84: 73,
+    85: 74, 86: 75, 87: 76, 88: 77, 89: 78, 90: 79,
+}
+
 # COCO keypoint skeleton (for flip mapping)
 KPT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
 
@@ -83,13 +113,13 @@ class COCOMultiTaskDataset(Dataset):
     Returns dict with:
         'image': [3, 640, 640] normalized tensor
         'boxes': [M, 4] xyxy in 640x640 space
-        'classes': [M] 0..19 (0=person)
+        'classes': [M] 0..79 by default (0=person)
         'kpts': [M, 17, 3] keypoints (only valid for person class)
     """
 
     def __init__(self, data_dir, img_dir, label_dir=None,
                  input_size=640, use_mosaic=True, augment=True,
-                 class_id_format='coco20',
+                 class_id_format='yolo80',
                  hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
                  flip_lr=0.5, mosaic_prob=0.5, person_only=False):
         self.data_dir = Path(data_dir)
@@ -122,8 +152,8 @@ class COCOMultiTaskDataset(Dataset):
                                 parts = line.strip().split()
                                 if parts:
                                     raw_cls = int(float(parts[0]))
-                                    cls_20 = self._map_class_id(raw_cls, len(parts) > 5)
-                                    if cls_20 is not None and cls_20 == 0:
+                                    mapped_cls = self._map_class_id(raw_cls, len(parts) > 5)
+                                    if mapped_cls is not None and mapped_cls == 0:
                                         has_person = True
                                         break
                     except Exception:
@@ -338,8 +368,8 @@ class COCOMultiTaskDataset(Dataset):
                     continue
                 cls = int(float(parts[0]))
                 has_kpts = len(parts) > 5
-                cls_20 = self._map_class_id(cls, has_kpts)
-                if cls_20 is None:
+                mapped_cls = self._map_class_id(cls, has_kpts)
+                if mapped_cls is None:
                     continue
 
                 xc, yc, w, h = map(float, parts[1:5])
@@ -351,11 +381,11 @@ class COCOMultiTaskDataset(Dataset):
                 y2 = y1 + h_px
 
                 boxes.append([x1, y1, x2, y2])
-                classes.append(cls_20)
+                classes.append(mapped_cls)
 
                 # Keypoints
                 kpt = np.zeros((17, 3), dtype=np.float32)
-                if has_kpts and cls_20 == 0:
+                if has_kpts and mapped_cls == 0:
                     kpt_data = parts[5:]
                     for j in range(min(17, len(kpt_data) // 3)):
                         px = float(kpt_data[j * 3]) * img_w
@@ -367,26 +397,31 @@ class COCOMultiTaskDataset(Dataset):
         return boxes, classes, kpts
 
     def _map_class_id(self, cls, has_kpts=False):
-        """Map source class id to internal 20-class id.
+        """Map source class id to the model's internal class id.
 
         label format:
-          - yolo80: standard YOLO COCO ids, person=0, car=2, ...
-          - coco: COCO category ids, person=1, car=3, ...
-          - coco20/internal: already remapped ids 0..19 used by this model.
+          - yolo80/internal80: standard YOLO COCO ids, person=0, car=2, ...
+          - coco/coco80: COCO category ids, person=1, car=3, ...
+          - coco20/internal20: already remapped legacy ids 0..19.
+          - coco_category20/coco20_category: COCO category ids mapped to legacy 20.
           - auto: prefer yolo80, except keypoint person annotations may be 0 or 1.
         """
         fmt = str(self.class_id_format).lower()
+        if fmt in ('yolo80', 'internal80'):
+            return cls if 0 <= cls < len(COCO80_CLASSES) else None
+        if fmt in ('coco', 'coco80'):
+            return COCO_CATEGORY_ID_TO_80.get(cls)
         if fmt in ('coco20', 'internal', 'internal20'):
             return cls if 0 <= cls < len(COCO20_CLASSES) else None
-        if fmt == 'coco':
+        if fmt in ('coco_category20', 'coco20_category', 'coco20_ids'):
             return COCO_CATEGORY_ID_TO_20.get(cls)
         if fmt == 'auto':
             if has_kpts and cls in (0, 1):
                 return 0
-            if cls in YOLO80_ID_TO_20:
-                return YOLO80_ID_TO_20[cls]
-            return COCO_CATEGORY_ID_TO_20.get(cls)
-        return YOLO80_ID_TO_20.get(cls)
+            if 0 <= cls < len(COCO80_CLASSES):
+                return cls
+            return COCO_CATEGORY_ID_TO_80.get(cls)
+        return cls if 0 <= cls < len(COCO80_CLASSES) else None
 
     def _sanitize_targets(self, boxes, classes, kpts):
         """Clip targets to the training image and drop invalid annotations."""
@@ -520,7 +555,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       use_mosaic=True, augment=True,
                       shuffle=True, num_workers=4,
                       distributed=False, rank=0, world_size=1,
-                      drop_last=True, class_id_format='coco20',
+                      drop_last=True, class_id_format='yolo80',
                       hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
                       flip_lr=0.5, mosaic_prob=0.5, person_only=False):
     """Create DataLoader for COCO dataset."""

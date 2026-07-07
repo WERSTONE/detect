@@ -1,11 +1,12 @@
-"""Prepare COCO 2017 20-class subset for multi-head verification.
+"""Prepare COCO 2017 labels for multi-head verification.
 
 Merges instances_*.json (bbox for all 80 classes) with
 person_keypoints_*.json (keypoints for person class) to produce
-a complete 20-class dataset in YOLO label format.
+a YOLO label dataset. By default it writes the legacy 20-class subset;
+with --full80 it writes standard COCO 80-class ids.
 
 Usage:
-    python test_model/data/prepare_coco20.py --data-dir /data/coco2017 [--download]
+    python test_model/data/prepare_coco20.py --data-dir /data/coco2017 [--download] [--full80]
 """
 
 import argparse
@@ -40,6 +41,19 @@ CLASS_MAP = {
     44: 17,  # bottle
     47: 18,  # cup
     77: 19,  # cell phone
+}
+
+COCO80_CLASS_MAP = {
+    1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
+    11: 10, 13: 11, 14: 12, 15: 13, 16: 14, 17: 15, 18: 16, 19: 17,
+    20: 18, 21: 19, 22: 20, 23: 21, 24: 22, 25: 23, 27: 24, 28: 25,
+    31: 26, 32: 27, 33: 28, 34: 29, 35: 30, 36: 31, 37: 32, 38: 33,
+    39: 34, 40: 35, 41: 36, 42: 37, 43: 38, 44: 39, 46: 40, 47: 41,
+    48: 42, 49: 43, 50: 44, 51: 45, 52: 46, 53: 47, 54: 48, 55: 49,
+    56: 50, 57: 51, 58: 52, 59: 53, 60: 54, 61: 55, 62: 56, 63: 57,
+    64: 58, 65: 59, 67: 60, 70: 61, 72: 62, 73: 63, 74: 64, 75: 65,
+    76: 66, 77: 67, 78: 68, 79: 69, 80: 70, 81: 71, 82: 72, 84: 73,
+    85: 74, 86: 75, 87: 76, 88: 77, 89: 78, 90: 79,
 }
 
 COCO_URLS = {
@@ -77,7 +91,7 @@ def download_coco(data_dir):
             print(f"  Done")
 
 
-def filter_coco_to_yolo(data_dir):
+def filter_coco_to_yolo(data_dir, class_map=None, label_name='20-class'):
     """Merge instances + person_keypoints → 20-class YOLO labels.
 
     Strategy:
@@ -86,6 +100,7 @@ def filter_coco_to_yolo(data_dir):
       3. Write labels: bbox from instances, kpts from person_keypoints for person class
       4. Include ALL images with >=1 annotation from our 20 classes
     """
+    class_map = class_map or CLASS_MAP
     data_dir = Path(data_dir)
     ann_dir = data_dir / 'annotations'
 
@@ -126,14 +141,14 @@ def filter_coco_to_yolo(data_dir):
         img_anns = {}  # {image_id: [(ann, cls_20), ...]}
         for ann in instances['annotations']:
             cat_id = ann['category_id']
-            if cat_id not in CLASS_MAP:
+            if cat_id not in class_map:
                 continue
             img_id = ann['image_id']
             if img_id not in img_anns:
                 img_anns[img_id] = []
-            img_anns[img_id].append((ann, CLASS_MAP[cat_id]))
+            img_anns[img_id].append((ann, class_map[cat_id]))
 
-        print(f"    {len(img_anns)} images with 20-class annotations")
+        print(f"    {len(img_anns)} images with {label_name} annotations")
 
         # ---- Write YOLO labels ----
         label_dir = data_dir / 'labels' / split
@@ -154,17 +169,17 @@ def filter_coco_to_yolo(data_dir):
             label_path = label_dir / f"{img_info['file_name'].rsplit('.', 1)[0]}.txt"
 
             lines = []
-            for ann, cls_20 in anns:
+            for ann, mapped_cls in anns:
                 bx, by, bw, bh = ann['bbox']
                 xc = (bx + bw / 2) / img_w
                 yc = (by + bh / 2) / img_h
                 nw = bw / img_w
                 nh = bh / img_h
 
-                line = f"{cls_20} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}"
+                line = f"{mapped_cls} {xc:.6f} {yc:.6f} {nw:.6f} {nh:.6f}"
 
                 # Keypoints: merge from person_keypoints if available
-                if cls_20 == 0:
+                if mapped_cls == 0:
                     ann_id = ann['id']
                     kpt_data = kpt_lookup.get(img_id, {}).get(ann_id, [0] * 51)
                     for j in range(17):
@@ -188,7 +203,7 @@ def filter_coco_to_yolo(data_dir):
             print(f"    Skipped {skipped_no_image} annotations (missing image)")
 
 
-def verify_labels(data_dir):
+def verify_labels(data_dir, expected_num_classes=None):
     data_dir = Path(data_dir)
     for split in ('train2017', 'val2017'):
         img_dir = data_dir / 'images' / split
@@ -200,11 +215,39 @@ def verify_labels(data_dir):
         img_files |= {p.stem for p in img_dir.glob('*.png')}
         missing_imgs = label_files - img_files
         missing_labels = img_files - label_files
+        bad_class = 0
+        bad_format = 0
+        total_rows = 0
+        for label_path in label_dir.glob('*.txt'):
+            with open(label_path, encoding='utf-8') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if not parts:
+                        continue
+                    total_rows += 1
+                    if len(parts) not in (5, 56):
+                        bad_format += 1
+                        continue
+                    try:
+                        cls_id = int(float(parts[0]))
+                    except ValueError:
+                        bad_format += 1
+                        continue
+                    if expected_num_classes is not None and not (0 <= cls_id < expected_num_classes):
+                        bad_class += 1
         print(f"\n  {split}: {len(img_files)} images, {len(label_files)} labels")
         if missing_labels:
             print(f"    Images without labels: {len(missing_labels)}")
         if missing_imgs:
             print(f"    Labels without images: {len(missing_imgs)}")
+        if total_rows:
+            print(f"    Label rows checked: {total_rows}")
+        if bad_format:
+            print(f"    Invalid label rows: {bad_format}")
+        if bad_class:
+            print(f"    Out-of-range class ids: {bad_class}")
+        if missing_imgs or bad_format or bad_class:
+            raise RuntimeError(f"Label verification failed for {split}")
 
 
 def main():
@@ -212,18 +255,24 @@ def main():
     p.add_argument('--data-dir', type=str, required=True)
     p.add_argument('--download', action='store_true')
     p.add_argument('--verify-only', action='store_true')
+    p.add_argument('--full80', action='store_true',
+                   help='Write standard COCO/YOLO 80-class ids instead of the legacy 20-class subset')
     args = p.parse_args()
 
     data_dir = Path(args.data_dir)
+    expected_num_classes = 80 if args.full80 else 20
     if args.verify_only:
-        verify_labels(data_dir)
+        verify_labels(data_dir, expected_num_classes=expected_num_classes)
         return
     if args.download:
         print("Downloading COCO 2017...")
         download_coco(data_dir)
-    print("\nConverting COCO → YOLO 20-class (merging bbox + keypoints)...")
-    filter_coco_to_yolo(data_dir)
-    verify_labels(data_dir)
+    print("\nConverting COCO labels (merging bbox + keypoints)...")
+    if args.full80:
+        filter_coco_to_yolo(data_dir, class_map=COCO80_CLASS_MAP, label_name='80-class')
+    else:
+        filter_coco_to_yolo(data_dir)
+    verify_labels(data_dir, expected_num_classes=expected_num_classes)
     print("\nDone!")
 
 

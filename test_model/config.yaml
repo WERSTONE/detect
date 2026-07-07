@@ -7,8 +7,8 @@
 
 # ---- Model ----
 model: dual_head        # dual_head | unified_head | dual_neck | attn_dual | bifpn_dual
-num_classes: 20         # total classes (including person)
-num_det_classes: 19     # non-person detection classes (20 - 1 person)
+num_classes: 80         # total COCO classes (including person)
+num_det_classes: 80     # detection head predicts all COCO classes, including person
 num_kpts: 17            # COCO keypoints
 reg_max: 16             # DFL max bin
 
@@ -22,11 +22,11 @@ data:
   val_img: val2017
   val_label: labels/val2017
   input_size: 640
-  class_id_format: coco20   # coco20 for remapped 0..19 labels; yolo80/coco for source ids
+  class_id_format: yolo80   # yolo80 for standard COCO YOLO labels; coco/coco80 for category ids
 
 # ---- Training ----
 training:
-  epochs: 200
+  epochs: 80
   batch_size: 32            # 24GB GPU: start with 24; reduce to 16/12 if OOM
   workers: 16
 
@@ -64,7 +64,28 @@ training:
   close_mosaic_epochs: 10  # disable mosaic for last N epochs
   no_mosaic: false         # completely disable mosaic
 
-  # Two-stage training (dual-head models only)
+  # Early stopping on validation loss. With val_interval=5 and patience=4,
+  # training stops after about 20 epochs without meaningful validation gain.
+  early_stop:
+    enabled: true
+    patience: 4
+    min_delta: 0.01
+    start_epoch: 35
+
+  # Dynamic task weights at the task level.
+  # Sub-loss weights stay in the loss section below; DWA only adjusts
+  # the outer task weights for L_det and L_pose.
+  dynamic_weights:
+    enabled: true
+    method: dwa
+    temperature: 2.0
+    det_min: 0.2
+    det_max: 5.0
+    pose_min: 0.2
+    pose_max: 5.0
+    eps: 1.0e-8
+
+  # Two-stage training (dual-head models only; keep disabled for the 80-class setup)
   # Stage 1: train pose head only → Stage 2: train both heads
   two_stage:
     enabled: false

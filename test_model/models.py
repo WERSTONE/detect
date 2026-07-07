@@ -118,6 +118,8 @@ class _BaseModel(nn.Module):
         self.strides = list(strides)
         self.reg_max = reg_max
         self.assigner = TaskAlignedAssigner(topk=13, alpha=1.0, beta=3.0)
+        self.det_task_weight = 1.0
+        self.pose_task_weight = 1.0
         # Loss function set in subclass init
 
     @property
@@ -126,6 +128,10 @@ class _BaseModel(nn.Module):
 
     def _forward_backbone_neck(self, x):
         raise NotImplementedError
+
+    def set_task_weights(self, det_weight=1.0, pose_weight=1.0):
+        self.det_task_weight = float(det_weight)
+        self.pose_task_weight = float(pose_weight)
 
     @torch.no_grad()
     def _get_decoded_preds(self, head_outs, feat_sizes):
@@ -257,7 +263,7 @@ class _BaseModel(nn.Module):
 class _DualHeadModel(_BaseModel):
     """Shared logic for all dual-head models."""
 
-    def __init__(self, num_det_classes=19, num_kpts=17, reg_max=16):
+    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16):
         super().__init__(reg_max=reg_max)
         self.num_det_classes = num_det_classes
         self.num_kpts = num_kpts
@@ -273,9 +279,17 @@ class _DualHeadModel(_BaseModel):
             w_pose=0.0, w_kobj=0.0, reg_max=reg_max,
             num_det_classes=num_det_classes, unified_head=False)
         self.pose_loss = MultiTaskLoss(
-            w_box=7.5, w_cls=0.5, w_dfl=1.5,
+            w_box=0.0, w_cls=0.0, w_dfl=0.0,
             w_pose=12.0, w_kobj=1.0, reg_max=reg_max,
             num_det_classes=1, unified_head=False)
+
+    def disable_pose_proposal_training(self):
+        """Freeze unused pose cls/reg branches; detection head owns boxes/classes."""
+        for name in ('cls_tower', 'cls_pred', 'reg_tower', 'reg_pred'):
+            module = getattr(self.pose_head, name, None)
+            if module is not None:
+                for p in module.parameters():
+                    p.requires_grad = False
 
     def freeze_head(self, name):
         """Freeze a head. name: 'det' or 'pose'."""
@@ -296,47 +310,14 @@ class _DualHeadModel(_BaseModel):
 
     @torch.no_grad()
     def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6, max_det=300):
-        """Merge det and pose head predictions."""
+        """Decode boxes/classes from det head and attach pose keypoints to person detections."""
         self.eval()
         device = next(self.parameters()).device
         images = images.to(device)
-        B = images.shape[0]
-
         det_out, pose_out = self._forward_head(images)
-
-        # Decode detection head (classes 1..19 → shifted to 1..19)
-        det_results = self._decode_predictions(
-            det_out['cls'], det_out['reg'], None, score_thresh, iou_thresh,
-            cls_offset=1, max_det=max_det)  # det classes are 0..18 internally, output as 1..19
-
-        # Decode pose head (class 0 = person)
-        pose_results = self._decode_predictions(
-            pose_out['cls'], pose_out['reg'], pose_out.get('kpt'),
+        return self._decode_predictions(
+            det_out['cls'], det_out['reg'], pose_out.get('kpt'),
             score_thresh, iou_thresh, cls_offset=0, max_det=max_det)
-
-        # Merge
-        merged = []
-        for b in range(B):
-            d = det_results[b]
-            p = pose_results[b]
-            boxes = torch.cat([p['boxes'], d['boxes']]) if p['boxes'].numel() + d['boxes'].numel() > 0 else torch.zeros(0, 4, device=device)
-            scores = torch.cat([p['scores'], d['scores']]) if p['scores'].numel() + d['scores'].numel() > 0 else torch.zeros(0, device=device)
-            classes = torch.cat([p['classes'], d['classes']]) if p['classes'].numel() + d['classes'].numel() > 0 else torch.zeros(0, dtype=torch.long, device=device)
-            det_kpts = torch.zeros((len(d['boxes']), 17, 3), device=device)
-            kpts = torch.cat([p.get('kpts', torch.zeros(0, 17, 3, device=device)), det_kpts]) if len(boxes) else torch.zeros(0, 17, 3, device=device)
-            if max_det and len(scores) > max_det:
-                keep = scores.argsort(descending=True)[:max_det]
-                boxes = boxes[keep]
-                scores = scores[keep]
-                classes = classes[keep]
-                kpts = kpts[keep]
-            merged.append({
-                'boxes': boxes,
-                'scores': scores,
-                'classes': classes,
-                'kpts': kpts,
-            })
-        return merged
 
     def compute_loss(self, images, gt_dict_list):
         device = next(self.parameters()).device
@@ -350,19 +331,14 @@ class _DualHeadModel(_BaseModel):
         # Decode for assigner
         det_scores, det_boxes = self._get_decoded_preds(det_out, feat_sizes)
 
-        pose_scores, pose_boxes = [], []
-        with torch.no_grad():
-            for lvl in range(len(feat_sizes)):
-                # Pose head has only 1 class
-                cls_p = pose_out['cls'][lvl].permute(0, 2, 3, 1).reshape(B, -1, 1)
-                pose_scores.append(cls_p.sigmoid())
-                H, W = feat_sizes[lvl]
-                grid = _make_grid(W, H, device) * self.strides[lvl]
-                pose_boxes.append(_dfl_decode(pose_out['reg'][lvl], self.reg_max, self.strides[lvl], grid))
+        # Pose head only predicts keypoints. Person anchors are assigned from the
+        # detector's person scores/boxes so keypoints align with final detections.
+        pose_scores = [scores[..., 0:1] for scores in det_scores]
+        pose_boxes = det_boxes
 
         # Separate GTs by head
         det_boxes_list = []
-        det_cls_list = []   # 0..18 (shifted)
+        det_cls_list = []
         det_batch_list = []
         pose_boxes_list = []
         pose_cls_list = []  # always 0
@@ -377,16 +353,14 @@ class _DualHeadModel(_BaseModel):
             if len(boxes) == 0:
                 continue
 
-            person_mask = classes == 0
-            det_mask = ~person_mask
-
-            if det_mask.any():
-                det_gt_boxes_batch = boxes[det_mask]
+            if len(boxes):
+                det_gt_boxes_batch = boxes
                 det_boxes_list.append(det_gt_boxes_batch.to(device, non_blocking=True))
-                det_cls_list.append((classes[det_mask] - 1).to(device, non_blocking=True))
+                det_cls_list.append(classes.to(device, non_blocking=True))
                 det_batch_list.append(torch.full(
                     (len(det_gt_boxes_batch),), b, device=device, dtype=torch.long))
 
+            person_mask = classes == 0
             if person_mask.any():
                 pose_gt_boxes_batch = boxes[person_mask]
                 pose_boxes_list.append(pose_gt_boxes_batch.to(device, non_blocking=True))
@@ -455,13 +429,19 @@ class _DualHeadModel(_BaseModel):
         det_ciou = det_l['ciou'] * mult
         det_dfl = det_l['dfl'] * mult
 
-        total = det_cls + det_ciou + det_dfl
+        det_total = det_cls + det_ciou + det_dfl
+        pose_total = torch.tensor(0.0, device=device)
         if 'kpt' in pose_l:
-            total = total + pose_l['kpt'] + pose_l.get('kobj', 0.0)
-        total = total + pose_l['cls'] + pose_l['ciou'] + pose_l['dfl']
+            pose_total = pose_l['kpt'] + pose_l.get('kobj', 0.0)
+        total = (self.det_task_weight * det_total +
+                 self.pose_task_weight * pose_total)
 
         loss_dict = {
             'total': total,
+            'det_total': det_total.detach(),
+            'pose_total': pose_total.detach(),
+            'task_w_det': torch.tensor(self.det_task_weight, device=device),
+            'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
             'det_cls': det_cls.detach(),
             'det_ciou': det_ciou.detach(),
             'det_dfl': det_dfl.detach(),
@@ -484,7 +464,7 @@ class _DualHeadModel(_BaseModel):
 class ModelA_DualHead(_DualHeadModel):
     """M-A: Standard dual-head."""
 
-    def __init__(self, num_det_classes=19, num_kpts=17, reg_max=16,
+    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
                  backbone_depth=0.67, backbone_width=0.75):
         super().__init__(num_det_classes, num_kpts, reg_max)
         self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
@@ -493,6 +473,7 @@ class ModelA_DualHead(_DualHeadModel):
         ch = self.neck.out_channels
         self.det_head = DetectHead(ch[0], num_classes=num_det_classes, reg_max=reg_max)
         self.pose_head = PoseHead(ch[0], num_kpts=num_kpts, reg_max=reg_max)
+        self.disable_pose_proposal_training()
 
     def _forward_head(self, x):
         feats = self.backbone(x)
@@ -506,7 +487,7 @@ class ModelA_DualHead(_DualHeadModel):
 class ModelB_UnifiedHead(_BaseModel):
     """M-B: Unified head."""
 
-    def __init__(self, num_classes=20, num_kpts=17, reg_max=16,
+    def __init__(self, num_classes=80, num_kpts=17, reg_max=16,
                  backbone_depth=0.67, backbone_width=0.75):
         super().__init__(reg_max=reg_max)
         self.num_classes = num_classes
@@ -579,11 +560,20 @@ class ModelB_UnifiedHead(_BaseModel):
 
         losses = self.loss_fn(head_outs, targets, self.strides, feat_sizes, head_type='unified')
 
-        total = losses['cls'] + losses['ciou'] + losses['dfl']
+        det_total = losses['cls'] + losses['ciou'] + losses['dfl']
+        pose_total = torch.tensor(0.0, device=device)
         if 'kpt' in losses:
-            total = total + losses['kpt'] + losses.get('kobj', 0.0)
+            pose_total = losses['kpt'] + losses.get('kobj', 0.0)
+        total = (self.det_task_weight * det_total +
+                 self.pose_task_weight * pose_total)
 
-        result = {'total': total}
+        result = {
+            'total': total,
+            'det_total': det_total.detach(),
+            'pose_total': pose_total.detach(),
+            'task_w_det': torch.tensor(self.det_task_weight, device=device),
+            'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
+        }
         result.update({k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in losses.items()})
         return result
 
@@ -591,7 +581,7 @@ class ModelB_UnifiedHead(_BaseModel):
 class ModelC_DualNeck(_DualHeadModel):
     """M-C: Dual-neck dual-head."""
 
-    def __init__(self, num_det_classes=19, num_kpts=17, reg_max=16,
+    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
                  backbone_depth=0.67, backbone_width=0.75):
         super().__init__(num_det_classes, num_kpts, reg_max)
         self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
@@ -601,6 +591,7 @@ class ModelC_DualNeck(_DualHeadModel):
                                    num_classes=num_det_classes, reg_max=reg_max)
         self.pose_head = PoseHead(self.pose_neck.out_channels[0],
                                    num_kpts=num_kpts, reg_max=reg_max)
+        self.disable_pose_proposal_training()
 
     def _forward_head(self, x):
         p2, p3, p4, p5 = self.backbone(x)
@@ -615,7 +606,7 @@ class ModelC_DualNeck(_DualHeadModel):
 class ModelD_AttentionDual(_DualHeadModel):
     """M-D: ECA backbone + dual-head."""
 
-    def __init__(self, num_det_classes=19, num_kpts=17, reg_max=16,
+    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
                  backbone_depth=0.67, backbone_width=0.75):
         super().__init__(num_det_classes, num_kpts, reg_max)
         self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width, use_eca=True)
@@ -624,6 +615,7 @@ class ModelD_AttentionDual(_DualHeadModel):
         ch = self.neck.out_channels
         self.det_head = DetectHead(ch[0], num_classes=num_det_classes, reg_max=reg_max)
         self.pose_head = PoseHead(ch[0], num_kpts=num_kpts, reg_max=reg_max)
+        self.disable_pose_proposal_training()
 
     def _forward_head(self, x):
         feats = self.backbone(x)
@@ -637,7 +629,7 @@ class ModelD_AttentionDual(_DualHeadModel):
 class ModelE_BiFPN(_DualHeadModel):
     """M-E: BiFPN neck + dual-head."""
 
-    def __init__(self, num_det_classes=19, num_kpts=17, reg_max=16,
+    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
                  backbone_depth=0.67, backbone_width=0.75):
         super().__init__(num_det_classes, num_kpts, reg_max)
         self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
@@ -646,6 +638,7 @@ class ModelE_BiFPN(_DualHeadModel):
         ch = self.neck.out_channels
         self.det_head = DetectHead(ch[0], num_classes=num_det_classes, reg_max=reg_max)
         self.pose_head = PoseHead(ch[0], num_kpts=num_kpts, reg_max=reg_max)
+        self.disable_pose_proposal_training()
 
     def _forward_head(self, x):
         feats = self.backbone(x)

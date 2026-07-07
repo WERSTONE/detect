@@ -110,7 +110,7 @@ class MultiTaskLoss(nn.Module):
 
     def __init__(self, w_box=7.5, w_cls=0.5, w_dfl=1.5,
                  w_pose=12.0, w_kobj=1.0, reg_max=16,
-                 num_det_classes=19, unified_head=False):
+                 num_det_classes=80, unified_head=False):
         super().__init__()
         self.w_box = w_box
         self.w_cls = w_cls
@@ -142,7 +142,7 @@ class MultiTaskLoss(nn.Module):
         if head_type == 'pose':
             num_cls = 1
         elif self.unified_head:
-            num_cls = 20
+            num_cls = self.num_det_classes
 
         proj = torch.arange(self.reg_max, device=device, dtype=torch.float32)
 
