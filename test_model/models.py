@@ -445,9 +445,6 @@ class _DualHeadModel(_BaseModel):
             'det_cls': det_cls.detach(),
             'det_ciou': det_ciou.detach(),
             'det_dfl': det_dfl.detach(),
-            'pose_cls': pose_l['cls'].detach(),
-            'pose_ciou': pose_l['ciou'].detach(),
-            'pose_dfl': pose_l['dfl'].detach(),
         }
         if 'kpt' in pose_l:
             loss_dict['pose_kpt'] = pose_l['kpt'].detach()
@@ -633,16 +630,18 @@ class ModelE_BiFPN(_DualHeadModel):
                  backbone_depth=0.67, backbone_width=0.75):
         super().__init__(num_det_classes, num_kpts, reg_max)
         self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
-        self.neck = BiFPN(self.backbone.out_channels[1:],
+        self.neck = BiFPN(self.backbone.out_channels,
                           depth=backbone_depth, width=backbone_width)
         ch = self.neck.out_channels
-        self.det_head = DetectHead(ch[0], num_classes=num_det_classes, reg_max=reg_max)
-        self.pose_head = PoseHead(ch[0], num_kpts=num_kpts, reg_max=reg_max)
+        self.det_head = DetectHead(
+            ch[0], num_classes=num_det_classes, reg_max=reg_max, tower_depth=3)
+        self.pose_head = PoseHead(
+            ch[0], num_kpts=num_kpts, reg_max=reg_max, tower_depth=3)
         self.disable_pose_proposal_training()
 
     def _forward_head(self, x):
         feats = self.backbone(x)
-        neck_feats = self.neck(feats[1:])
+        neck_feats = self.neck(feats)
         return self.det_head(neck_feats), self.pose_head(neck_feats)
 
     def forward(self, x):
