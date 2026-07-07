@@ -22,12 +22,12 @@ class Conv(nn.Module):
 
 
 class Bottleneck(nn.Module):
-    """Standard bottleneck: 1x1 reduce -> 3x3 -> 1x1 expand, residual."""
-    def __init__(self, in_ch, out_ch, shortcut=True, e=0.5):
+    """Standard YOLOv8 bottleneck."""
+    def __init__(self, in_ch, out_ch, shortcut=True, g=1, k=(3, 3), e=0.5):
         super().__init__()
         h = int(out_ch * e)
-        self.cv1 = Conv(in_ch, h, 1)
-        self.cv2 = Conv(h, out_ch, 3)
+        self.cv1 = Conv(in_ch, h, k[0], 1)
+        self.cv2 = Conv(h, out_ch, k[1], 1, g=g)
         self.shortcut = shortcut and in_ch == out_ch
 
     def forward(self, x):
@@ -36,12 +36,14 @@ class Bottleneck(nn.Module):
 
 class C2f(nn.Module):
     """CSP bottleneck with 2 convolutions (YOLOv8)."""
-    def __init__(self, in_ch, out_ch, n=1, shortcut=True, e=0.5):
+    def __init__(self, in_ch, out_ch, n=1, shortcut=False, g=1, e=0.5):
         super().__init__()
         self.c = int(out_ch * e)
         self.cv1 = Conv(in_ch, 2 * self.c, 1)
         self.cv2 = Conv((2 + n) * self.c, out_ch, 1)
-        self.m = nn.ModuleList(Bottleneck(self.c, self.c, shortcut, e=1.0) for _ in range(n))
+        self.m = nn.ModuleList(
+            Bottleneck(self.c, self.c, shortcut, g, k=(3, 3), e=1.0) for _ in range(n)
+        )
 
     def forward(self, x):
         y = list(self.cv1(x).chunk(2, dim=1))

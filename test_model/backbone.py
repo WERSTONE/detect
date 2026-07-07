@@ -29,7 +29,7 @@ class CSPDarkNet(nn.Module):
         super().__init__()
 
         def ch(x):
-            return make_divisible(min(int(x * width), max_ch))
+            return make_divisible(min(x, max_ch) * width)
 
         def n_blocks(x):
             return max(1, int(round(x * depth)))
