@@ -6,7 +6,7 @@
 #   uv run python test_model/scripts/run_train.py --config test_model/config.yaml --model dual_head --epochs 100
 
 # ---- Model ----
-model: dual_head        # dual_head | unified_head | dual_neck | attn_dual | bifpn_dual
+model: bifpn_dual        # dual_head | unified_head | dual_neck | attn_dual | bifpn_dual
 num_classes: 80         # total COCO classes (including person)
 num_det_classes: 80     # detection head predicts all COCO classes, including person
 num_kpts: 17            # COCO keypoints
@@ -26,20 +26,20 @@ data:
 
 # ---- Training ----
 training:
-  epochs: 80
+  epochs: 200
   batch_size: 32            # 24GB GPU: start with 24; reduce to 16/12 if OOM
   workers: 16
 
   # Optimizer (SGD matches YOLOv8 official recipe)
   optimizer: sgd           # sgd | adamw
-  lr0: 0.005               # stable initial LR for dual-head training at batch 24
+  lr0: 0.01               # stable initial LR for dual-head training at batch 24
   lrf: 0.01                # final LR = lr0 * lrf
   momentum: 0.937
   weight_decay: 0.0005     # 5e-4
   nesterov: true
 
   # LR schedule
-  warmup_epochs: 3
+  warmup_epochs: 5
   cos_lr: true             # cosine annealing
 
   # Regularization
@@ -50,8 +50,8 @@ training:
   amp: true
 
   # Validation & checkpoint
-  val_interval: 5          # validate every N epochs
-  save_interval: 50        # save intermediate checkpoint every N epochs
+  val_interval: 2          # validate every N epochs
+  save_interval: 20        # save intermediate checkpoint every N epochs
   save_best_by: loss       # loss | score
   # Saved as checkpoints/<model_name>/ inside the project directory.
   save_dir: checkpoints
@@ -61,16 +61,16 @@ training:
   log_interval: 50          # console log every N optimizer steps
 
   # Mosaic augmentation
-  close_mosaic_epochs: 10  # disable mosaic for last N epochs
+  close_mosaic_epochs: 20  # disable mosaic for last N epochs
   no_mosaic: false         # completely disable mosaic
 
   # Early stopping on validation loss. With val_interval=5 and patience=4,
   # training stops after about 20 epochs without meaningful validation gain.
   early_stop:
-    enabled: true
-    patience: 4
+    enabled: false
+    patience: 20
     min_delta: 0.01
-    start_epoch: 35
+    start_epoch: 100
 
   # Dynamic task weights at the task level.
   # Sub-loss weights stay in the loss section below; DWA only adjusts

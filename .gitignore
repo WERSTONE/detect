@@ -14,6 +14,7 @@ venv/
 .conda/
 .env
 .env.local
+.claude/
 
 # Tool caches
 .ruff_cache/
@@ -42,3 +43,11 @@ outputs_vis_preview*.jpg
 run*/
 yolo_cpu_demo/runs/
 data/
+.claude/settings.local.json
+presentation/
+checkpoints/**/*.pt
+checkpoints/plots/
+tools/
+.claude/settings.local.json
+checkpoints/metrics_data.json
+

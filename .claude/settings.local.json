@@ -24,7 +24,27 @@
       "Bash(git filter-branch *)",
       "Bash(git count-objects *)",
       "Bash(git reflog *)",
-      "Bash(git gc *)"
+      "Bash(git gc *)",
+      "Bash(git commit *)",
+      "Bash(git fetch *)",
+      "Bash(git log *)",
+      "Bash(git rebase *)",
+      "Bash(git checkout *)",
+      "Bash(python -c \"from test_model.models import create_model; m = create_model\\('dual_head'\\); print\\('freeze_head:', hasattr\\(m, 'freeze_head'\\)\\); print\\('unfreeze_all:', hasattr\\(m, 'unfreeze_all'\\)\\); print\\('train_det:', m.train_det\\); print\\('det_weight_mult:', m.det_weight_mult\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('test_model/train.py', doraise=True\\); py_compile.compile\\('test_model/dataset.py', doraise=True\\); print\\('OK'\\)\")",
+      "Bash(python -c \"import py_compile; py_compile.compile\\('test_model/train.py', doraise=True\\); print\\('OK'\\)\")",
+      "WebFetch(domain:api.autodl.com)",
+      "Bash(python -c \"import tensorboard; print\\('tensorboard available'\\)\")",
+      "Bash(python tools/extract_metrics.py)",
+      "Bash(python -c \"import tensorboard; print\\('tensorboard ok'\\)\")",
+      "Bash(python -c \"import matplotlib; import tikzplotlib; print\\('matplotlib and tikzplotlib ok'\\)\")",
+      "Bash(pip install *)",
+      "Bash(python extract_and_plot.py)",
+      "Bash(fc-list :lang=zh)",
+      "Bash(kpsewhich ctexbeamer.cls)",
+      "Bash(kpsewhich ctex.sty)",
+      "Bash(xelatex -interaction=nonstopmode beamer.tex)",
+      "Bash(python tools/make_plots.py)"
     ]
   }
 }
