@@ -12,6 +12,16 @@ num_det_classes: 80     # detection head predicts all COCO classes, including pe
 num_kpts: 17            # COCO keypoints
 reg_max: 16             # DFL max bin
 
+# ---- Pretrained ----
+pretrained:
+  backbone:
+    enabled: true
+    weights: auto        # explicit path, filename, or auto to infer yolov8m* weights
+    auto_download: true  # auto-download official YOLOv8 weights if not found locally
+    prefer_pose: false    # prefer yolov8m-pose.pt before yolov8m.pt for backbone init
+    cache_dir: checkpoints/yolo
+    strict: false        # if true, require a near-complete backbone match
+
 # ---- Data ----
 data:
   # AutoDL: /root/autodl-tmp/coco2017 (fast SSD)

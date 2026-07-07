@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import os
+import shutil
 import sys
 from pathlib import Path
 
@@ -20,6 +21,27 @@ sys.path.insert(0, str(PROJECT_ROOT))
 from test_model.models import create_model
 from test_model.dataset import create_dataloader
 from test_model.trainer import Trainer
+
+OFFICIAL_BACKBONE_PREFIX_MAP = {
+    'model.0': 'stem.0',
+    'model.1': 'stem.1',
+    'model.2': 'stem.2',
+    'model.3': 'stage3.0',
+    'model.4': 'stage3.1',
+    'model.5': 'stage4.0',
+    'model.6': 'stage4.1',
+    'model.7': 'stage5_down',
+    'model.8': 'stage5_c2f',
+    'model.9': 'stage5_sppf',
+}
+
+YOLOV8_SCALE_BY_OUT_CHANNELS = {
+    (32, 64, 128, 256): 'n',
+    (64, 128, 256, 512): 's',
+    (96, 192, 384, 768): 'm',
+    (128, 256, 512, 512): 'l',
+    (160, 320, 512, 512): 'x',
+}
 
 
 def parse_args():
@@ -40,6 +62,10 @@ def parse_args():
     p.add_argument('--save-dir', type=str, default=None)
     p.add_argument('--resume', type=str, default=None,
                    help='Resume from checkpoint')
+    p.add_argument('--backbone-weights', type=str, default=None,
+                   help='Path to backbone pretrained weights (YOLO official or compatible checkpoint)')
+    p.add_argument('--backbone-strict', action='store_true', default=None,
+                   help='Require a near-complete backbone match when loading pretrained weights')
     p.add_argument('--no-mosaic', action='store_true', default=None)
     p.add_argument('--no-amp', action='store_true', default=None)
     p.add_argument('--debug', action='store_true', default=None)
@@ -81,6 +107,12 @@ def load_config(args):
         not cfg.get('training', {}).get('amp', True)
     )
     debug = args.debug if args.debug is not None else cfg.get('debug', False)
+    pretrained_cfg = cfg.setdefault('pretrained', {}).setdefault('backbone', {})
+    if args.backbone_weights is not None:
+        pretrained_cfg['enabled'] = True
+        pretrained_cfg['weights'] = args.backbone_weights
+    if args.backbone_strict is not None:
+        pretrained_cfg['strict'] = args.backbone_strict
 
     return {
         'model': model_name,
@@ -97,6 +129,286 @@ def load_config(args):
         'debug': debug,
         'config': cfg,
     }, args.resume
+
+
+def _extract_checkpoint_state_dict(checkpoint):
+    """Extract a state dict from common checkpoint layouts."""
+    if hasattr(checkpoint, 'state_dict'):
+        return checkpoint.state_dict()
+
+    if not isinstance(checkpoint, dict):
+        raise TypeError(f"Unsupported checkpoint type: {type(checkpoint)!r}")
+
+    for key in ('ema', 'model'):
+        module = checkpoint.get(key)
+        if hasattr(module, 'state_dict'):
+            return module.state_dict()
+
+    for key in ('state_dict', 'model_state_dict'):
+        state_dict = checkpoint.get(key)
+        if isinstance(state_dict, dict):
+            return state_dict
+
+    if checkpoint and all(isinstance(v, torch.Tensor) for v in checkpoint.values()):
+        return checkpoint
+
+    raise KeyError("Could not find a compatible state_dict in checkpoint")
+
+
+def _map_backbone_key(source_key):
+    """Map checkpoint key names to local backbone key names."""
+    if source_key.startswith('backbone.'):
+        return source_key[len('backbone.'):]
+
+    for official_prefix, local_prefix in OFFICIAL_BACKBONE_PREFIX_MAP.items():
+        if source_key == official_prefix:
+            return local_prefix
+        if source_key.startswith(official_prefix + '.'):
+            return local_prefix + source_key[len(official_prefix):]
+
+    return source_key
+
+
+def _infer_yolov8_scale(model):
+    """Infer YOLOv8 scale from backbone channel dimensions."""
+    out_channels = tuple(int(v) for v in getattr(model.backbone, 'out_channels', ()))
+    return YOLOV8_SCALE_BY_OUT_CHANNELS.get(out_channels)
+
+
+def _official_backbone_assets(model, backbone_cfg, explicit_name=None):
+    """Return preferred official asset filenames for this backbone."""
+    assets = []
+    if explicit_name:
+        assets.append(explicit_name)
+
+    scale = backbone_cfg.get('scale', 'auto')
+    if scale in (None, '', 'auto'):
+        scale = _infer_yolov8_scale(model)
+    if not scale:
+        scale = 'm'
+
+    pose_asset = f'yolov8{scale}-pose.pt'
+    detect_asset = f'yolov8{scale}.pt'
+    ordered = [pose_asset, detect_asset] if backbone_cfg.get('prefer_pose', True) else [detect_asset, pose_asset]
+    for asset in ordered:
+        if asset not in assets:
+            assets.append(asset)
+    return assets
+
+
+def _candidate_weight_paths(weights_value, cache_dir, asset_names):
+    """Return candidate local paths to try before downloading."""
+    paths = []
+    seen = set()
+
+    search_dirs = [
+        PROJECT_ROOT,
+        cache_dir,
+        PROJECT_ROOT / 'checkpoints',
+        PROJECT_ROOT / 'checkpoints' / 'yolo_pose',
+        PROJECT_ROOT / 'weights',
+    ]
+
+    def _add(path_obj):
+        path_obj = Path(path_obj)
+        key = str(path_obj).lower()
+        if key not in seen:
+            seen.add(key)
+            paths.append(path_obj)
+
+    if weights_value and str(weights_value).strip().lower() not in ('auto', 'none', 'null'):
+        raw_path = Path(str(weights_value))
+        _add(raw_path)
+        if not raw_path.is_absolute():
+            for base in search_dirs:
+                _add(base / raw_path)
+
+    for asset in asset_names:
+        for base in search_dirs:
+            _add(base / asset)
+
+    return paths
+
+
+def _download_ultralytics_asset(asset_name, cache_dir):
+    """Download an official Ultralytics asset into the project cache directory."""
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    os.environ.setdefault('YOLO_CONFIG_DIR', str(PROJECT_ROOT / '.ultralytics'))
+
+    try:
+        from ultralytics.utils.downloads import attempt_download_asset
+    except Exception as exc:
+        raise RuntimeError(f"Ultralytics download helper is unavailable: {exc}") from exc
+
+    cwd = Path.cwd()
+    try:
+        os.chdir(cache_dir)
+        downloaded = Path(attempt_download_asset(asset_name))
+    finally:
+        os.chdir(cwd)
+
+    if not downloaded.is_absolute():
+        downloaded = cache_dir / downloaded
+    downloaded = downloaded.resolve()
+
+    if not downloaded.exists():
+        raise FileNotFoundError(f"Ultralytics reported {downloaded}, but the file does not exist")
+
+    target = (cache_dir / asset_name).resolve()
+    if downloaded != target:
+        if not target.exists():
+            shutil.copy2(downloaded, target)
+        return target
+    return downloaded
+
+
+def _resolve_backbone_weights_path(model, cfg):
+    """Resolve local or downloadable official backbone weights."""
+    backbone_cfg = cfg.get('pretrained', {}).get('backbone', {})
+    weights_value = backbone_cfg.get('weights', 'auto')
+    cache_dir = Path(backbone_cfg.get('cache_dir', 'checkpoints/yolo_pose'))
+    if not cache_dir.is_absolute():
+        cache_dir = (PROJECT_ROOT / cache_dir).resolve()
+
+    explicit_name = None
+    if weights_value and str(weights_value).strip().lower() not in ('auto', 'none', 'null'):
+        explicit_name = Path(str(weights_value)).name
+
+    asset_names = _official_backbone_assets(model, backbone_cfg, explicit_name=explicit_name)
+    candidate_paths = _candidate_weight_paths(weights_value, cache_dir, asset_names)
+    for candidate in candidate_paths:
+        if candidate.exists():
+            return candidate.resolve()
+
+    if backbone_cfg.get('auto_download', True):
+        download_errors = []
+        for asset_name in asset_names:
+            try:
+                print(f"[Backbone preload] Local file missing, downloading official asset: {asset_name}")
+                return _download_ultralytics_asset(asset_name, cache_dir)
+            except Exception as exc:
+                download_errors.append(f"{asset_name}: {exc}")
+        joined = "; ".join(download_errors)
+        raise FileNotFoundError(
+            f"Backbone weights were not found locally and auto-download failed. Tried assets: {asset_names}. "
+            f"Details: {joined}"
+        )
+
+    searched = ", ".join(str(p) for p in candidate_paths[:8])
+    raise FileNotFoundError(
+        f"Backbone weights not found. Searched candidates such as: {searched}. "
+        f"Enable pretrained.backbone.auto_download or provide a valid weights path."
+    )
+
+
+def _load_pretrained_backbone(model, cfg, resume_path=None):
+    """Load backbone weights from a compatible checkpoint if configured."""
+    backbone_cfg = cfg.get('pretrained', {}).get('backbone', {})
+    if not backbone_cfg.get('enabled', False):
+        return None
+
+    if resume_path:
+        print(f"[Backbone preload] Resume is set ({resume_path}); skipping backbone preload.")
+        return None
+
+    weights_path = _resolve_backbone_weights_path(model, cfg)
+
+    print(f"[Backbone preload] Loading checkpoint: {weights_path}")
+    checkpoint = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+    source_state = _extract_checkpoint_state_dict(checkpoint)
+    target_state_full = model.backbone.state_dict()
+    target_state = {
+        key: value for key, value in target_state_full.items()
+        if not key.endswith('num_batches_tracked')
+    }
+
+    matched_state = {}
+    matched_keys = []
+    mismatched = []
+    candidate_keys = 0
+
+    for source_key, tensor in source_state.items():
+        if source_key.endswith('num_batches_tracked'):
+            continue
+        local_key = _map_backbone_key(source_key)
+        if local_key not in target_state:
+            continue
+        candidate_keys += 1
+        if tuple(target_state[local_key].shape) != tuple(tensor.shape):
+            mismatched.append({
+                'source_key': source_key,
+                'target_key': local_key,
+                'source_shape': tuple(tensor.shape),
+                'target_shape': tuple(target_state[local_key].shape),
+            })
+            continue
+        matched_state[local_key] = tensor
+        matched_keys.append((source_key, local_key))
+
+    missing_keys = [key for key in target_state.keys() if key not in matched_state]
+    optional_missing_keys = [key for key in missing_keys if key.startswith('eca_')]
+    required_missing_keys = [key for key in missing_keys if key not in optional_missing_keys]
+    strict = bool(backbone_cfg.get('strict', False))
+
+    if strict and (mismatched or required_missing_keys):
+        mismatch_msg = ""
+        if mismatched:
+            first = mismatched[0]
+            mismatch_msg = (
+                f"; first mismatch {first['source_key']} -> {first['target_key']} "
+                f"{first['source_shape']} != {first['target_shape']}"
+            )
+        raise RuntimeError(
+            f"Backbone strict preload failed: loaded {len(matched_state)}/{len(target_state)} keys, "
+            f"missing_required {len(required_missing_keys)}, optional_missing {len(optional_missing_keys)}, "
+            f"mismatched {len(mismatched)}{mismatch_msg}"
+        )
+
+    if not matched_state:
+        print(
+            "[Backbone preload] No compatible backbone tensors were loaded. "
+            "Check whether the checkpoint scale matches this YOLOv8m-style backbone."
+        )
+        if mismatched:
+            first = mismatched[0]
+            print(
+                f"  First mismatch: {first['source_key']} -> {first['target_key']} "
+                f"{first['source_shape']} != {first['target_shape']}"
+            )
+        return {
+            'loaded': 0,
+            'total': len(target_state),
+            'missing': len(missing_keys),
+            'missing_required': len(required_missing_keys),
+            'mismatched': len(mismatched),
+            'weights_path': str(weights_path),
+        }
+
+    model.backbone.load_state_dict(matched_state, strict=False)
+    print(
+        f"[Backbone preload] Loaded {len(matched_state)}/{len(target_state)} backbone tensors "
+        f"from {weights_path.name}; matched candidates={candidate_keys}, "
+        f"missing={len(missing_keys)} (required={len(required_missing_keys)}), "
+        f"mismatched={len(mismatched)}"
+    )
+    if matched_keys:
+        preview = ", ".join(f"{src}->{dst}" for src, dst in matched_keys[:5])
+        print(f"  Sample matches: {preview}")
+    if mismatched:
+        first = mismatched[0]
+        print(
+            f"  First shape mismatch: {first['source_key']} -> {first['target_key']} "
+            f"{first['source_shape']} != {first['target_shape']}"
+        )
+
+    return {
+        'loaded': len(matched_state),
+        'total': len(target_state),
+        'missing': len(missing_keys),
+        'missing_required': len(required_missing_keys),
+        'mismatched': len(mismatched),
+        'weights_path': str(weights_path),
+    }
 
 
 def main():
@@ -137,6 +449,7 @@ def main():
 
     model = create_model(model_name, **model_kwargs)
     print(f"Parameters: {model.num_params / 1e6:.2f}M")
+    _load_pretrained_backbone(model, cfg, resume_path=resume)
 
     # Set loss weights (override defaults)
     if hasattr(model, 'det_loss'):

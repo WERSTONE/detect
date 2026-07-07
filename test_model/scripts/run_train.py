@@ -49,6 +49,10 @@ def parse_args():
     p.add_argument('--gpu-id', type=int, default=None)
     p.add_argument('--save-dir', type=str, default=None)
     p.add_argument('--resume', type=str, default=None, help='Resume from checkpoint')
+    p.add_argument('--backbone-weights', type=str, default=None,
+                   help='Path to backbone pretrained weights')
+    p.add_argument('--backbone-strict', action='store_true', default=None,
+                   help='Require a near-complete backbone match for preload')
     p.add_argument('--no-mosaic', action='store_true', default=None,
                    help='Disable mosaic augmentation')
     p.add_argument('--no-amp', action='store_true', default=None,
@@ -87,6 +91,11 @@ def load_config(args):
         cfg['gpu_id'] = args.gpu_id
     if args.save_dir is not None:
         overrides.setdefault('training', {})['save_dir'] = args.save_dir
+    if args.backbone_weights is not None:
+        overrides.setdefault('pretrained', {}).setdefault('backbone', {})['enabled'] = True
+        overrides['pretrained']['backbone']['weights'] = args.backbone_weights
+    if args.backbone_strict is not None:
+        overrides.setdefault('pretrained', {}).setdefault('backbone', {})['strict'] = args.backbone_strict
     if args.debug is not None:
         cfg['debug'] = args.debug
     if args.no_mosaic is not None:
@@ -107,6 +116,7 @@ def print_config(cfg):
     t = cfg.get('training', {})
     l = cfg.get('loss', {})
     ts = t.get('two_stage', {})
+    pb = cfg.get('pretrained', {}).get('backbone', {})
     lines = [f"""
 {'='*60}
 Training Config
@@ -121,6 +131,8 @@ EMA:         {t.get('ema_decay', 0)} | AMP: {t.get('amp', True)}
 Mosaic:      close_mosaic={t.get('close_mosaic_epochs', 10)}
 Loss:        box={l.get('w_box', 7.5)} cls={l.get('w_cls', 0.5)} dfl={l.get('w_dfl', 1.5)}
              pose={l.get('w_pose', 12.0)} kobj={l.get('w_kobj', 1.0)}
+Backbone PT: enabled={pb.get('enabled', False)} weights={pb.get('weights', None)} strict={pb.get('strict', False)}
+             auto_download={pb.get('auto_download', True)} prefer_pose={pb.get('prefer_pose', True)} cache_dir={pb.get('cache_dir', 'checkpoints/yolo_pose')}
 Save:        {t.get('save_dir', 'checkpoints')}/{cfg['model']}
 Device:      {cfg.get('device', 'cuda')}:{cfg.get('gpu_id', 0)}
 Debug:       {cfg.get('debug', False)}"""]
