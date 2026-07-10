@@ -7,6 +7,7 @@ Usage:
 """
 
 import argparse
+import gc
 import os
 import shutil
 import sys
@@ -412,6 +413,17 @@ def _load_pretrained_backbone(model, cfg, resume_path=None):
     }
 
 
+def _load_model_weights_for_staged_resume(model, path, device):
+    """Load model weights only; staged training creates a fresh optimizer per stage."""
+    ckpt = torch.load(path, map_location=device, weights_only=False)
+    state_dict = ckpt.get('model_state_dict', ckpt if isinstance(ckpt, dict) else None)
+    if not isinstance(state_dict, dict):
+        raise KeyError(f"Could not find model_state_dict in resume checkpoint: {path}")
+    model.load_state_dict(state_dict, strict=True)
+    print(f"[Resume] Loaded model weights from {path} (epoch {ckpt.get('epoch', 'unknown')})")
+    return ckpt
+
+
 def main():
     args = parse_args()
     opts, resume = load_config(args)
@@ -649,8 +661,27 @@ def main():
                 cb(epoch)
         return _callback
 
+    def _dispose_trainer(trainer):
+        if trainer is None:
+            return
+        writer = getattr(trainer, 'writer', None)
+        if writer is not None:
+            writer.close()
+            trainer.writer = None
+        if hasattr(trainer, '_ema_state'):
+            trainer._ema_state.clear()
+        trainer.optimizer = None
+        trainer.scaler = None
+        trainer.model = None
+
+    def _release_cuda_cache():
+        gc.collect()
+        if device == 'cuda':
+            torch.cuda.empty_cache()
+
     def _run_preflight(train_loader, val_loader_to_check=None, tag='train'):
         print(f"\n[Preflight] Checking one {tag} batch...")
+        model.to(device)
         model.train()
         batch = next(iter(train_loader))
         images = batch['image'].to(device, non_blocking=True)
@@ -659,9 +690,16 @@ def main():
             'classes': batch['classes'][i],
             'kpts': batch['kpts'][i],
         } for i in range(len(images))]
-        losses = model.compute_loss(images, gt_list)
+        with torch.no_grad():
+            if (not opts['no_amp']) and device == 'cuda':
+                with torch.amp.autocast('cuda'):
+                    losses = model.compute_loss(images, gt_list)
+            else:
+                losses = model.compute_loss(images, gt_list)
         print("  loss ok: " + " ".join(
             f"{k}={v:.4f}" for k, v in sorted(losses.items()) if isinstance(v, torch.Tensor)))
+        del losses, images, gt_list, batch
+        _release_cuda_cache()
 
         if val_loader_to_check is not None:
             print(f"[Preflight] Checking one {tag} val decode batch...")
@@ -678,6 +716,8 @@ def main():
                 raise RuntimeError(
                     f"predict_val returned {len(predictions)} predictions for {len(val_images)} images")
             print(f"  decode ok: batch={len(val_images)} preds={len(predictions)}")
+            del predictions, val_images, val_batch
+            _release_cuda_cache()
 
     def _set_trainable_stage(stage_cfg):
         if not is_dual_head:
@@ -736,8 +776,25 @@ def main():
         if not stages:
             raise ValueError("training.staged_training.enabled=true requires a non-empty stages list")
 
+        start_stage = int(staged_cfg.get('start_stage', 1))
+        if resume:
+            _load_model_weights_for_staged_resume(model, resume, device='cpu')
+            resume_name = Path(resume).name.lower()
+            resume_parent = Path(resume).parent.name.lower()
+            for idx, candidate_stage in enumerate(stages, start=1):
+                candidate_name = str(candidate_stage.get('name', f'stage{idx}')).lower()
+                if candidate_name in resume_name or candidate_name in resume_parent:
+                    start_stage = max(start_stage, idx + 1)
+                    break
+            print(f"[Resume] Staged training will start from stage {start_stage}")
+
         print(f"\nStaged training: {len(stages)} stages")
+        trainer_stage = None
         for stage_index, stage_cfg in enumerate(stages, start=1):
+            if stage_index < start_stage:
+                print(f"Skipping stage {stage_index}: {stage_cfg.get('name', f'stage{stage_index}')}")
+                continue
+
             task_loss_history.clear()
             stage_name = stage_cfg.get('name', f'stage{stage_index}')
             stage_epochs = min(3, stage_cfg.get('epochs', 1)) if opts['debug'] else int(stage_cfg.get('epochs', 1))
@@ -779,7 +836,11 @@ def main():
 
             if hasattr(train_loader_stage, '_iterator') and train_loader_stage._iterator is not None:
                 train_loader_stage._iterator._shutdown_workers()
+            _dispose_trainer(trainer_stage)
             del train_loader_stage
+            del trainer_stage
+            trainer_stage = None
+            _release_cuda_cache()
 
         print(f"\nStaged training complete for {model_name}!")
     elif two_stage.get('enabled') and is_dual_head:

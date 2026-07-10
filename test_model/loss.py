@@ -136,13 +136,18 @@ class MultiTaskLoss(nn.Module):
             norm_pos: Optional shared normalizer for cls/box/dfl. This keeps
                 dual-head losses comparable with unified-head losses.
         """
-        device = head_outs['cls'][0].device
-        B = head_outs['cls'][0].shape[0]
+        first_out = head_outs['cls'][0] if head_outs.get('cls') else head_outs['kpt'][0]
+        device = first_out.device
+        B = first_out.shape[0]
         num_cls = self.num_det_classes
         if head_type == 'pose':
             num_cls = 1
         elif self.unified_head:
             num_cls = self.num_det_classes
+        need_box_terms = not (
+            head_type == 'pose' and
+            self.w_box == 0 and self.w_cls == 0 and self.w_dfl == 0
+        )
 
         proj = torch.arange(self.reg_max, device=device, dtype=torch.float32)
 
@@ -159,13 +164,17 @@ class MultiTaskLoss(nn.Module):
             targets = assign_targets[lvl]
             N_lvl = H * W
 
-            cls_p_all = head_outs['cls'][lvl].permute(0, 2, 3, 1).reshape(B, N_lvl, -1)
-            cls_tgt_all = torch.zeros(B, N_lvl, cls_p_all.shape[-1], device=device)
-            total_cls_items += cls_tgt_all.numel()
+            cls_p_all = None
+            cls_tgt_all = None
+            if need_box_terms:
+                cls_p_all = head_outs['cls'][lvl].permute(0, 2, 3, 1).reshape(B, N_lvl, -1)
+                cls_tgt_all = torch.zeros(B, N_lvl, cls_p_all.shape[-1], device=device)
+                total_cls_items += cls_tgt_all.numel()
 
             if targets is None:
-                loss_cls += _cls_loss(cls_p_all.reshape(-1, cls_p_all.shape[-1]),
-                                      cls_tgt_all.reshape(-1, cls_p_all.shape[-1]))
+                if need_box_terms:
+                    loss_cls += _cls_loss(cls_p_all.reshape(-1, cls_p_all.shape[-1]),
+                                          cls_tgt_all.reshape(-1, cls_p_all.shape[-1]))
                 continue
 
             N_pos = len(targets['gt_boxes'])
@@ -177,62 +186,63 @@ class MultiTaskLoss(nn.Module):
             batch_idx = targets['batch_idx'].to(device)
             gx, gy = grid[:, 0], grid[:, 1]
 
-            # Extract predictions at positive positions
-            reg_p = head_outs['reg'][lvl][batch_idx, :, gy, gx]
             kpt_p = head_outs['kpt'][lvl][batch_idx, :, gy, gx] if 'kpt' in head_outs else None
-
-            # DFL decode
-            reg_rs = reg_p.view(N_pos, 4, self.reg_max)
-            reg_probs = reg_rs.softmax(dim=-1)
-            reg_delta = (reg_probs * proj.view(1, 1, self.reg_max)).sum(dim=-1) * stride
 
             locs_x = (gx.float() + 0.5) * stride
             locs_y = (gy.float() + 0.5) * stride
 
-            l, t = reg_delta[:, 0], reg_delta[:, 1]
-            r, b = reg_delta[:, 2], reg_delta[:, 3]
+            if need_box_terms:
+                # Extract predictions at positive positions
+                reg_p = head_outs['reg'][lvl][batch_idx, :, gy, gx]
 
-            pred_xyxy = torch.stack([locs_x - l, locs_y - t, locs_x + r, locs_y + b], dim=-1)
+                # DFL decode
+                reg_rs = reg_p.view(N_pos, 4, self.reg_max)
+                reg_probs = reg_rs.softmax(dim=-1)
+                reg_delta = (reg_probs * proj.view(1, 1, self.reg_max)).sum(dim=-1) * stride
 
-            iou, _, _ = _iou_xyxy(pred_xyxy, gt_boxes)
+                l, t = reg_delta[:, 0], reg_delta[:, 1]
+                r, b = reg_delta[:, 2], reg_delta[:, 3]
 
-            # Classification targets
-            cls_tgt_flat = cls_tgt_all.view(-1, cls_tgt_all.shape[-1])
-            flat_idx = batch_idx * N_lvl + gy * W + gx
-            if head_type == 'det':
-                # Dual-head detection classes are already shifted to 0..18.
-                valid_cls = (gt_classes >= 0) & (gt_classes < cls_tgt_all.shape[-1])
-                if valid_cls.any():
-                    cls_tgt_flat[flat_idx[valid_cls], gt_classes[valid_cls]] = 1.0
-            elif head_type == 'pose':
-                person_pos = gt_classes == 0
-                if person_pos.any():
-                    cls_tgt_flat[flat_idx[person_pos], 0] = 1.0
-            elif self.unified_head:
-                valid_cls = (gt_classes >= 0) & (gt_classes < cls_tgt_all.shape[-1])
-                if valid_cls.any():
-                    cls_tgt_flat[flat_idx[valid_cls], gt_classes[valid_cls]] = 1.0
+                pred_xyxy = torch.stack([locs_x - l, locs_y - t, locs_x + r, locs_y + b], dim=-1)
 
-            loss_cls += _cls_loss(cls_p_all.reshape(-1, cls_p_all.shape[-1]),
-                                  cls_tgt_all.reshape(-1, cls_tgt_all.shape[-1]))
+                iou, _, _ = _iou_xyxy(pred_xyxy, gt_boxes)
 
-            # CIoU loss
-            loss_ciou += _ciou_loss(pred_xyxy, gt_boxes) * N_pos
+                # Classification targets
+                cls_tgt_flat = cls_tgt_all.view(-1, cls_tgt_all.shape[-1])
+                flat_idx = batch_idx * N_lvl + gy * W + gx
+                if head_type == 'det':
+                    valid_cls = (gt_classes >= 0) & (gt_classes < cls_tgt_all.shape[-1])
+                    if valid_cls.any():
+                        cls_tgt_flat[flat_idx[valid_cls], gt_classes[valid_cls]] = 1.0
+                elif head_type == 'pose':
+                    person_pos = gt_classes == 0
+                    if person_pos.any():
+                        cls_tgt_flat[flat_idx[person_pos], 0] = 1.0
+                elif self.unified_head:
+                    valid_cls = (gt_classes >= 0) & (gt_classes < cls_tgt_all.shape[-1])
+                    if valid_cls.any():
+                        cls_tgt_flat[flat_idx[valid_cls], gt_classes[valid_cls]] = 1.0
 
-            # DFL loss
-            gt_l = ((locs_x - gt_boxes[:, 0]) / stride).clamp(0, self.reg_max - 1e-6)
-            gt_t = ((locs_y - gt_boxes[:, 1]) / stride).clamp(0, self.reg_max - 1e-6)
-            gt_r = ((gt_boxes[:, 2] - locs_x) / stride).clamp(0, self.reg_max - 1e-6)
-            gt_b = ((gt_boxes[:, 3] - locs_y) / stride).clamp(0, self.reg_max - 1e-6)
-            gt_bins = torch.stack([gt_l, gt_t, gt_r, gt_b], dim=1)
+                loss_cls += _cls_loss(cls_p_all.reshape(-1, cls_p_all.shape[-1]),
+                                      cls_tgt_all.reshape(-1, cls_tgt_all.shape[-1]))
 
-            iou_d = iou.detach().clamp(min=0.2)
-            loss_dfl += _dfl_loss(
-                reg_rs.reshape(-1, self.reg_max),
-                gt_bins.reshape(-1),
-                weight=iou_d.repeat_interleave(4),
-                reg_max=self.reg_max,
-            ) * N_pos
+                # CIoU loss
+                loss_ciou += _ciou_loss(pred_xyxy, gt_boxes) * N_pos
+
+                # DFL loss
+                gt_l = ((locs_x - gt_boxes[:, 0]) / stride).clamp(0, self.reg_max - 1e-6)
+                gt_t = ((locs_y - gt_boxes[:, 1]) / stride).clamp(0, self.reg_max - 1e-6)
+                gt_r = ((gt_boxes[:, 2] - locs_x) / stride).clamp(0, self.reg_max - 1e-6)
+                gt_b = ((gt_boxes[:, 3] - locs_y) / stride).clamp(0, self.reg_max - 1e-6)
+                gt_bins = torch.stack([gt_l, gt_t, gt_r, gt_b], dim=1)
+
+                iou_d = iou.detach().clamp(min=0.2)
+                loss_dfl += _dfl_loss(
+                    reg_rs.reshape(-1, self.reg_max),
+                    gt_bins.reshape(-1),
+                    weight=iou_d.repeat_interleave(4),
+                    reg_max=self.reg_max,
+                ) * N_pos
 
             # Keypoint loss (only for person class)
             person_mask = gt_classes == 0

@@ -317,6 +317,8 @@ class _DualHeadModel(_BaseModel):
 
     def disable_pose_proposal_training(self):
         """Freeze unused pose cls/reg branches; detection head owns boxes/classes."""
+        if hasattr(self.pose_head, 'enable_proposal_branches'):
+            self.pose_head.enable_proposal_branches(False)
         for name in ('cls_tower', 'cls_pred', 'reg_tower', 'reg_pred'):
             module = getattr(self.pose_head, name, None)
             if module is not None:

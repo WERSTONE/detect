@@ -84,6 +84,7 @@ class PoseHead(nn.Module):
         self.num_classes = 1
         self.num_kpts = num_kpts
         self.reg_max = reg_max
+        self.proposal_branches_enabled = True
 
         self.cls_tower = _make_tower(in_ch, in_ch, tower_depth)
         self.cls_pred = nn.Conv2d(in_ch, 1, 1)
@@ -113,15 +114,19 @@ class PoseHead(nn.Module):
             reg_bias[e * self.reg_max:(e + 1) * self.reg_max] = torch.linspace(1.0, -1.0, self.reg_max)
         self.reg_pred.bias.data.copy_(reg_bias)
 
+    def enable_proposal_branches(self, enabled=True):
+        self.proposal_branches_enabled = bool(enabled)
+
     def forward(self, features):
         outs = {'cls': [], 'reg': [], 'kpt': []}
         for f in features:
-            cls_feat = self.cls_tower(f)
-            reg_feat = self.reg_tower(f)
             kpt_feat = self.kpt_tower(f)
-            outs['cls'].append(self.cls_pred(cls_feat))
-            outs['reg'].append(self.reg_pred(reg_feat))
             outs['kpt'].append(self.kpt_pred(kpt_feat))
+            if self.proposal_branches_enabled:
+                cls_feat = self.cls_tower(f)
+                reg_feat = self.reg_tower(f)
+                outs['cls'].append(self.cls_pred(cls_feat))
+                outs['reg'].append(self.reg_pred(reg_feat))
         return outs
 
 
