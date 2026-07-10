@@ -38,11 +38,11 @@ data:
 training:
   epochs: 200
   batch_size: 32            # 24GB GPU: start with 24; reduce to 16/12 if OOM
-  workers: 16
+  workers: 14
 
   # Optimizer (SGD matches YOLOv8 official recipe)
   optimizer: sgd           # sgd | adamw
-  lr0: 0.01               # stable initial LR for dual-head training at batch 24
+  lr0: 0.005               # stable initial LR for dual-head training at batch 24
   lrf: 0.01                # final LR = lr0 * lrf
   momentum: 0.937
   weight_decay: 0.0005     # 5e-4
@@ -60,9 +60,9 @@ training:
   amp: true
 
   # Validation & checkpoint
-  val_interval: 2          # validate every N epochs
+  val_interval: 1          # validate every N epochs
   save_interval: 20        # save intermediate checkpoint every N epochs
-  save_best_by: loss       # loss | score
+  save_best_by: loss       # loss | joint_mAP50_95 | mean_mAP50_95 | mAP@0.5:0.95 | AP_pose@0.5:0.95
   # Saved as checkpoints/<model_name>/ inside the project directory.
   save_dir: checkpoints
 
@@ -74,26 +74,75 @@ training:
   close_mosaic_epochs: 20  # disable mosaic for last N epochs
   no_mosaic: false         # completely disable mosaic
 
-  # Early stopping on validation loss. With val_interval=5 and patience=4,
-  # training stops after about 20 epochs without meaningful validation gain.
+  # Early stopping follows save_best_by. The default best checkpoint is
+  # selected by validation loss; AP is only used when save_best_by is changed.
   early_stop:
-    enabled: false
-    patience: 20
-    min_delta: 0.01
-    start_epoch: 100
+    enabled: true
+    patience: 12
+    min_delta: 0.002
+    start_epoch: 80
+
+  # Optional AP validation. It is skipped when save_best_by: loss.
+  score_validation:
+    interval: 1
+    max_samples: 1200
+    det_metric: "mAP@0.5:0.95"
+    pose_metric: "AP_pose@0.5:0.95"
 
   # Dynamic task weights at the task level.
-  # Sub-loss weights stay in the loss section below; DWA only adjusts
-  # the outer task weights for L_det and L_pose.
+  # Sub-loss weights stay in the loss section below.
   dynamic_weights:
     enabled: true
-    method: dwa
+    method: uncertainty    # uncertainty | dwa
     temperature: 2.0
     det_min: 0.2
     det_max: 5.0
     pose_min: 0.2
     pose_max: 5.0
     eps: 1.0e-8
+
+  # Staged recipe when only the pretrained YOLOv8 backbone is reused.
+  # 1) Freeze backbone and learn the new BiFPN/adapters/detection head.
+  # 2) Keep backbone frozen and add pose supervision with person-heavy batches.
+  # 3) Unfreeze backbone and jointly fine-tune at a lower LR.
+  staged_training:
+    enabled: true
+    stages:
+      - name: frozen_det_warmup
+        epochs: 25
+        lr0: 0.003
+        person_only: false
+        train_det: true
+        train_pose: false
+        freeze_backbone: true
+        det_weight: 1.0
+        pose_weight: 0.0
+        use_dynamic_weights: false
+        close_mosaic_epochs: 0
+
+      - name: frozen_pose_warmup
+        epochs: 45
+        lr0: 0.002
+        person_only: true
+        train_det: true
+        train_pose: true
+        freeze_backbone: true
+        det_weight: 0.5
+        pose_weight: 1.5
+        use_dynamic_weights: false
+        close_mosaic_epochs: 10
+
+      - name: unfrozen_joint_tune
+        epochs: 130
+        lr0: 0.0008
+        person_only: false
+        train_det: true
+        train_pose: true
+        freeze_backbone: false
+        det_weight: 1.0
+        pose_weight: 1.0
+        use_dynamic_weights: true
+        close_mosaic_epochs: 20
 
   # Two-stage training (dual-head models only; keep disabled for the 80-class setup)
   # Stage 1: train pose head only → Stage 2: train both heads

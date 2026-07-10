@@ -14,12 +14,13 @@ from pathlib import Path
 
 import torch
 import yaml
+from torch.utils.data import DataLoader, Subset
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from test_model.models import create_model
-from test_model.dataset import create_dataloader
+from test_model.dataset import create_dataloader, collate_fn
 from test_model.trainer import Trainer
 
 OFFICIAL_BACKBONE_PREFIX_MAP = {
@@ -490,6 +491,31 @@ def main():
     )
     print(f"Val: {len(val_loader.dataset)} samples")
 
+    score_cfg = t_cfg.get('score_validation', {})
+    score_loader = None
+    if t_cfg.get('save_best_by', 'loss') != 'loss':
+        score_loader = val_loader
+        score_samples = int(score_cfg.get('max_samples', 0) or 0)
+        if score_samples > 0 and score_samples < len(val_loader.dataset):
+            score_loader = DataLoader(
+                Subset(val_loader.dataset, range(score_samples)),
+                batch_size=cfg.get('eval', {}).get('batch_size', opts['batch']),
+                shuffle=False,
+                num_workers=opts['workers'],
+                collate_fn=collate_fn,
+                pin_memory=(device == 'cuda'),
+            )
+            print(f"AP validation: first {score_samples} val samples")
+        else:
+            print("AP validation: full val set")
+
+    score_eval_kwargs = {
+        'score_thresh': cfg.get('eval', {}).get('score_thresh', 0.01),
+        'iou_thresh': cfg.get('eval', {}).get('iou_thresh', 0.6),
+        'max_det': cfg.get('eval', {}).get('max_det', 300),
+        'num_classes': cfg.get('num_classes', 80),
+    }
+
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
 
     def _make_trainer(lr, save_dir_suffix=''):
@@ -518,6 +544,11 @@ def main():
             early_stop_patience=t_cfg.get('early_stop', {}).get('patience', 0),
             early_stop_min_delta=t_cfg.get('early_stop', {}).get('min_delta', 0.0),
             early_stop_start_epoch=t_cfg.get('early_stop', {}).get('start_epoch', 0),
+            score_interval=score_cfg.get('interval', 1),
+            score_det_baseline=score_cfg.get('det_baseline_mAP50_95', 1.0),
+            score_pose_baseline=score_cfg.get('pose_baseline_mAP50_95', 1.0),
+            score_det_metric=score_cfg.get('det_metric', 'mAP@0.5:0.95'),
+            score_pose_metric=score_cfg.get('pose_metric', 'AP_pose@0.5:0.95'),
         )
 
     def _make_train_loader(person_only=False):
@@ -543,19 +574,36 @@ def main():
 
     dynamic_cfg = t_cfg.get('dynamic_weights', {})
     task_loss_history = []
+    dynamic_method = str(dynamic_cfg.get('method', 'dwa')).lower()
+    if dynamic_cfg.get('enabled', False) and dynamic_method == 'uncertainty':
+        if not hasattr(model, 'enable_uncertainty_weighting'):
+            raise ValueError("uncertainty dynamic weighting is only supported by dual-head models")
+        if hasattr(model, 'set_uncertainty_weight_bounds'):
+            model.set_uncertainty_weight_bounds(
+                det_min=dynamic_cfg.get('det_min', None),
+                det_max=dynamic_cfg.get('det_max', None),
+                pose_min=dynamic_cfg.get('pose_min', None),
+                pose_max=dynamic_cfg.get('pose_max', None),
+            )
+        model.enable_uncertainty_weighting(True)
+        print("Dynamic weights: uncertainty weighting enabled")
 
     def _apply_dynamic_weights(epoch):
         if hasattr(model, 'disable_pose_proposal_training'):
             model.disable_pose_proposal_training()
-        if hasattr(model, 'train_det') and not model.train_det:
-            if hasattr(model, 'set_task_weights'):
-                model.set_task_weights(1.0, 1.0)
+        if hasattr(model, 'train_det') and hasattr(model, 'train_pose'):
+            if not model.train_det or not model.train_pose:
+                if hasattr(model, 'set_task_weights'):
+                    model.set_task_weights(1.0 if model.train_det else 0.0,
+                                           1.0 if model.train_pose else 0.0)
+                return
+        if dynamic_method == 'uncertainty':
             return
         if not dynamic_cfg.get('enabled', False):
             if hasattr(model, 'set_task_weights'):
                 model.set_task_weights(1.0, 1.0)
             return
-        method = str(dynamic_cfg.get('method', 'dwa')).lower()
+        method = dynamic_method
         if method != 'dwa':
             raise ValueError(f"Unsupported dynamic weight method: {method}")
 
@@ -631,10 +679,110 @@ def main():
                     f"predict_val returned {len(predictions)} predictions for {len(val_images)} images")
             print(f"  decode ok: batch={len(val_images)} preds={len(predictions)}")
 
+    def _set_trainable_stage(stage_cfg):
+        if not is_dual_head:
+            return
+        model.unfreeze_all()
+        if hasattr(model, 'disable_pose_proposal_training'):
+            model.disable_pose_proposal_training()
+
+        model.train_det = bool(stage_cfg.get('train_det', True))
+        model.train_pose = bool(stage_cfg.get('train_pose', True))
+        model.det_weight_mult = float(stage_cfg.get('det_weight_mult', 1.0))
+        if hasattr(model, 'set_task_weights'):
+            model.set_task_weights(
+                stage_cfg.get('det_weight', 1.0 if model.train_det else 0.0),
+                stage_cfg.get('pose_weight', 1.0 if model.train_pose else 0.0),
+            )
+
+        if stage_cfg.get('freeze_backbone', False):
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+        if stage_cfg.get('freeze_neck', False):
+            for module_name in ('neck', 'det_neck', 'pose_neck'):
+                module = getattr(model, module_name, None)
+                if module is not None:
+                    for p in module.parameters():
+                        p.requires_grad = False
+        if stage_cfg.get('freeze_det_head', False):
+            model.freeze_head('det')
+        if stage_cfg.get('freeze_pose_head', False):
+            model.freeze_head('pose')
+
+        use_stage_uncertainty = (
+            dynamic_cfg.get('enabled', False) and
+            dynamic_method == 'uncertainty' and
+            stage_cfg.get('use_dynamic_weights', False)
+        )
+        if hasattr(model, 'enable_uncertainty_weighting'):
+            model.enable_uncertainty_weighting(use_stage_uncertainty)
+
+    def _stage_epoch_callback(stage_cfg):
+        def _callback(epoch):
+            _set_trainable_stage(stage_cfg)
+            if stage_cfg.get('det_weight_warmup_epochs', 0) and hasattr(model, 'det_weight_warmup_epochs'):
+                model.det_weight_warmup_epochs = int(stage_cfg.get('det_weight_warmup_epochs', 0))
+                model.update_det_weight(epoch)
+            if stage_cfg.get('use_dynamic_weights', False):
+                _apply_dynamic_weights(epoch)
+        return _callback
+
     # Two-stage training for dual-head models
     two_stage = t_cfg.get('two_stage', {})
+    staged_cfg = t_cfg.get('staged_training', {})
     is_dual_head = model_name in ('dual_head', 'dual_neck', 'attn_dual', 'bifpn_dual')
-    if two_stage.get('enabled') and is_dual_head:
+    if staged_cfg.get('enabled') and is_dual_head:
+        stages = staged_cfg.get('stages', [])
+        if not stages:
+            raise ValueError("training.staged_training.enabled=true requires a non-empty stages list")
+
+        print(f"\nStaged training: {len(stages)} stages")
+        for stage_index, stage_cfg in enumerate(stages, start=1):
+            task_loss_history.clear()
+            stage_name = stage_cfg.get('name', f'stage{stage_index}')
+            stage_epochs = min(3, stage_cfg.get('epochs', 1)) if opts['debug'] else int(stage_cfg.get('epochs', 1))
+            stage_lr = float(stage_cfg.get('lr0', opts['lr']))
+            person_only = bool(stage_cfg.get('person_only', False))
+
+            _set_trainable_stage(stage_cfg)
+            train_loader_stage = _make_train_loader(person_only=person_only)
+            print(f"\n{'='*60}")
+            print(f"Stage {stage_index}: {stage_name} | Epochs: {stage_epochs} | LR: {stage_lr}")
+            print(
+                f"  train_det={getattr(model, 'train_det', True)} "
+                f"train_pose={getattr(model, 'train_pose', True)} "
+                f"freeze_backbone={stage_cfg.get('freeze_backbone', False)} "
+                f"person_only={person_only} "
+                f"dynamic={stage_cfg.get('use_dynamic_weights', False)}"
+            )
+            trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+            total = sum(p.numel() for p in model.parameters())
+            print(f"  trainable={trainable / 1e6:.2f}M / {total / 1e6:.2f}M")
+            print(f"  samples={len(train_loader_stage.dataset)}")
+            print(f"{'='*60}")
+
+            _run_preflight(train_loader_stage, val_loader, tag=stage_name)
+            trainer_stage = _make_trainer(
+                stage_lr,
+                save_dir_suffix='' if stage_index == len(stages) else f'_{stage_name}')
+            trainer_stage.fit(
+                epochs=stage_epochs,
+                train_loader=train_loader_stage,
+                val_loader=val_loader,
+                save_prefix=model_name if stage_index == len(stages) else f"{model_name}_{stage_name}",
+                close_mosaic_epochs=stage_cfg.get('close_mosaic_epochs', close_mosaic),
+                on_epoch_start=_stage_epoch_callback(stage_cfg),
+                on_epoch_end=_record_task_losses,
+                score_loader=score_loader,
+                score_eval_kwargs=score_eval_kwargs,
+            )
+
+            if hasattr(train_loader_stage, '_iterator') and train_loader_stage._iterator is not None:
+                train_loader_stage._iterator._shutdown_workers()
+            del train_loader_stage
+
+        print(f"\nStaged training complete for {model_name}!")
+    elif two_stage.get('enabled') and is_dual_head:
         s1 = two_stage['stage1']
         s2 = two_stage['stage2']
 
@@ -674,6 +822,8 @@ def main():
             close_mosaic_epochs=close_mosaic,
             on_epoch_start=_apply_dynamic_weights,
             on_epoch_end=_record_task_losses,
+            score_loader=score_loader,
+            score_eval_kwargs=score_eval_kwargs,
         )
 
         # Release stage1 loader workers before creating full loader
@@ -712,6 +862,8 @@ def main():
             close_mosaic_epochs=close_mosaic,
             on_epoch_start=_compose_epoch_callbacks(_on_epoch_start, _apply_dynamic_weights),
             on_epoch_end=_record_task_losses,
+            score_loader=score_loader,
+            score_eval_kwargs=score_eval_kwargs,
         )
 
         print(f"\nTwo-stage training complete for {model_name}!")
@@ -735,6 +887,8 @@ def main():
             close_mosaic_epochs=close_mosaic,
             on_epoch_start=_apply_dynamic_weights,
             on_epoch_end=_record_task_losses,
+            score_loader=score_loader,
+            score_eval_kwargs=score_eval_kwargs,
         )
 
         print(f"\nTraining complete for {model_name}!")

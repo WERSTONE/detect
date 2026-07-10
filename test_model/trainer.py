@@ -48,7 +48,10 @@ class Trainer:
                  ema_decay=0.9999, save_best_by='loss',
                  use_tensorboard=False, check_finite_loss=False,
                  early_stop_enabled=False, early_stop_patience=0,
-                 early_stop_min_delta=0.0, early_stop_start_epoch=0):
+                 early_stop_min_delta=0.0, early_stop_start_epoch=0,
+                 score_interval=1, score_det_baseline=1.0,
+                 score_pose_baseline=1.0, score_det_metric='mAP@0.5:0.95',
+                 score_pose_metric='AP_pose@0.5:0.95'):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.grad_clip = grad_clip
@@ -91,6 +94,11 @@ class Trainer:
         self.early_stop_min_delta = float(early_stop_min_delta)
         self.early_stop_start_epoch = int(early_stop_start_epoch)
         self.early_stop_bad_epochs = 0
+        self.score_interval = max(1, int(score_interval))
+        self.score_det_baseline = max(float(score_det_baseline), 1e-8)
+        self.score_pose_baseline = max(float(score_pose_baseline), 1e-8)
+        self.score_det_metric = score_det_metric
+        self.score_pose_metric = score_pose_metric
 
         # EMA
         self.ema_decay = ema_decay
@@ -147,6 +155,40 @@ class Trainer:
         if self.save_best_by == 'loss':
             return current < self.best_metric - self.early_stop_min_delta
         return current > self.best_metric + self.early_stop_min_delta
+
+    @staticmethod
+    def _score_from_metrics(metrics, det_metric, pose_metric, det_baseline, pose_baseline):
+        det_value = float(metrics.get(det_metric, 0.0) or 0.0)
+        pose_value = float(metrics.get(pose_metric, 0.0) or 0.0)
+        det_ratio = det_value / det_baseline
+        pose_ratio = pose_value / pose_baseline
+        return {
+            'score': min(det_ratio, pose_ratio),
+            'joint_mAP50_95': min(det_value, pose_value),
+            'mean_mAP50_95': 0.5 * (det_value + pose_value),
+            'det_ratio': det_ratio,
+            'pose_ratio': pose_ratio,
+            'score_det_value': det_value,
+            'score_pose_value': pose_value,
+        }
+
+    @torch.no_grad()
+    def validate_score(self, loader, score_thresh=0.01, iou_thresh=0.6,
+                       max_det=300, num_classes=80):
+        """Run AP validation and return metrics plus a joint target score."""
+        from test_model.eval import compute_all_metrics, evaluate
+
+        self._swap_ema(to_ema=True)
+        all_preds, all_gts = evaluate(
+            self.model, loader, self.device, score_thresh=score_thresh,
+            iou_thresh=iou_thresh, max_det=max_det)
+        self._swap_ema(to_ema=True)
+
+        metrics = compute_all_metrics(all_preds, all_gts, num_classes=num_classes)
+        metrics.update(self._score_from_metrics(
+            metrics, self.score_det_metric, self.score_pose_metric,
+            self.score_det_baseline, self.score_pose_baseline))
+        return metrics
 
     def train_epoch(self, loader, max_epochs, epoch, close_mosaic=None):
         """Train one epoch.
@@ -312,7 +354,8 @@ class Trainer:
 
     def fit(self, epochs, train_loader, val_loader=None,
             save_prefix='model', close_mosaic_epochs=10,
-            on_epoch_start=None, on_epoch_end=None):
+            on_epoch_start=None, on_epoch_end=None,
+            score_loader=None, score_eval_kwargs=None):
         """Main training loop.
 
         Args:
@@ -353,12 +396,36 @@ class Trainer:
                 val_m = self.validate(val_loader)
                 log += " | " + " ".join(f"{k}={v:.4f}" for k, v in sorted(val_m.items()))
 
-                current = val_m.get('val_total', float('inf'))
+                metric_payload = dict(val_m)
+                needs_ap_metrics = self.save_best_by != 'loss'
+                if needs_ap_metrics:
+                    if score_loader is None:
+                        raise RuntimeError(f"save_best_by='{self.save_best_by}' requires a score_loader")
+                    if (epoch + 1) % self.score_interval == 0:
+                        score_kwargs = score_eval_kwargs or {}
+                        score_m = self.validate_score(score_loader, **score_kwargs)
+                        metric_payload.update(score_m)
+                        metric_name = self.save_best_by
+                        metric_value = metric_payload.get(metric_name)
+                        if metric_value is None:
+                            raise RuntimeError(
+                                f"save_best_by='{metric_name}' was not produced by AP validation. "
+                                f"Available keys include: {sorted(metric_payload)[:20]}"
+                            )
+                        log += f" | {metric_name}={float(metric_value):.4f}"
+                    else:
+                        score_m = None
+                else:
+                    score_m = None
+
+                current = (metric_payload.get(self.save_best_by, -float('inf'))
+                           if self.save_best_by != 'loss'
+                           else metric_payload.get('val_total', float('inf')))
                 improved = self._is_improved(current)
                 if improved:
                     self.best_metric = current
                     self.early_stop_bad_epochs = 0
-                    self.save(self.save_dir / f"{save_prefix}_best.pt", val_m)
+                    self.save(self.save_dir / f"{save_prefix}_best.pt", metric_payload)
                     log += " [BEST]"
                 elif (self.early_stop_enabled and
                       epoch + 1 >= self.early_stop_start_epoch):
@@ -388,7 +455,7 @@ class Trainer:
 
         # Save last checkpoint
         self.save(self.save_dir / f"{save_prefix}_last.pt")
-        print(f"\nBest val_loss: {self.best_metric:.4f}")
+        print(f"\nBest {self.save_best_by}: {self.best_metric:.4f}")
         print(f"Checkpoints saved to: {self.save_dir}")
         if self.writer:
             self.writer.close()

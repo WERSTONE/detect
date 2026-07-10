@@ -12,6 +12,8 @@ Each model implements:
 - predict_val(images): validation predictions for mAP computation
 """
 
+import math
+
 import torch
 import torch.nn as nn
 
@@ -19,6 +21,7 @@ from test_model.backbone import CSPDarkNet
 from test_model.neck import FPNPANNeck, BiFPN, DetNeck, PoseNeck
 from test_model.heads import DetectHead, PoseHead, UnifiedHead
 from test_model.assigner import TaskAlignedAssigner
+from test_model.common import Conv
 from test_model.loss import MultiTaskLoss
 
 try:
@@ -273,6 +276,13 @@ class _DualHeadModel(_BaseModel):
         self.train_pose = True
         self.det_weight_mult = 1.0
         self.det_weight_warmup_epochs = 0
+        self.use_uncertainty_weighting = False
+        self.log_var_det = nn.Parameter(torch.zeros(()))
+        self.log_var_pose = nn.Parameter(torch.zeros(()))
+        self.det_uncertainty_weight_min = None
+        self.det_uncertainty_weight_max = None
+        self.pose_uncertainty_weight_min = None
+        self.pose_uncertainty_weight_max = None
 
         self.det_loss = MultiTaskLoss(
             w_box=7.5, w_cls=0.5, w_dfl=1.5,
@@ -282,6 +292,28 @@ class _DualHeadModel(_BaseModel):
             w_box=0.0, w_cls=0.0, w_dfl=0.0,
             w_pose=12.0, w_kobj=1.0, reg_max=reg_max,
             num_det_classes=1, unified_head=False)
+
+    def enable_uncertainty_weighting(self, enabled=True):
+        self.use_uncertainty_weighting = bool(enabled)
+
+    def set_uncertainty_weight_bounds(self, det_min=None, det_max=None,
+                                      pose_min=None, pose_max=None):
+        self.det_uncertainty_weight_min = det_min
+        self.det_uncertainty_weight_max = det_max
+        self.pose_uncertainty_weight_min = pose_min
+        self.pose_uncertainty_weight_max = pose_max
+
+    @staticmethod
+    def _bounded_log_var(log_var, weight_min=None, weight_max=None):
+        min_log_var = None if weight_max is None else -math.log(float(weight_max))
+        max_log_var = None if weight_min is None else -math.log(float(weight_min))
+        if min_log_var is None and max_log_var is None:
+            return log_var
+        if min_log_var is None:
+            return torch.clamp(log_var, max=max_log_var)
+        if max_log_var is None:
+            return torch.clamp(log_var, min=min_log_var)
+        return torch.clamp(log_var, min=min_log_var, max=max_log_var)
 
     def disable_pose_proposal_training(self):
         """Freeze unused pose cls/reg branches; detection head owns boxes/classes."""
@@ -404,10 +436,13 @@ class _DualHeadModel(_BaseModel):
         else:
             det_targets = [None] * len(feat_sizes)
 
-        pose_targets = self.assigner(
-            pose_scores, pose_boxes, pose_gt_boxes, pose_gt_classes,
-            pose_gt_kpts, feat_sizes, self.strides, pose_gt_batch,
-            num_det_classes=1)
+        if self.train_pose:
+            pose_targets = self.assigner(
+                pose_scores, pose_boxes, pose_gt_boxes, pose_gt_classes,
+                pose_gt_kpts, feat_sizes, self.strides, pose_gt_batch,
+                num_det_classes=1)
+        else:
+            pose_targets = [None] * len(feat_sizes)
 
         # Loss
         if self.train_det:
@@ -419,9 +454,15 @@ class _DualHeadModel(_BaseModel):
                      'ciou': torch.tensor(0.0, device=device),
                      'dfl': torch.tensor(0.0, device=device)}
 
-        pose_l = self.pose_loss(
-            pose_out, pose_targets, self.strides, feat_sizes,
-            head_type='pose')
+        if self.train_pose:
+            pose_l = self.pose_loss(
+                pose_out, pose_targets, self.strides, feat_sizes,
+                head_type='pose')
+        else:
+            pose_l = {
+                'kpt': torch.tensor(0.0, device=device),
+                'kobj': torch.tensor(0.0, device=device),
+            }
 
         # Apply det_weight_mult during training only (val uses full weight)
         mult = self.det_weight_mult if self.training else 1.0
@@ -433,8 +474,27 @@ class _DualHeadModel(_BaseModel):
         pose_total = torch.tensor(0.0, device=device)
         if 'kpt' in pose_l:
             pose_total = pose_l['kpt'] + pose_l.get('kobj', 0.0)
-        total = (self.det_task_weight * det_total +
-                 self.pose_task_weight * pose_total)
+        if self.use_uncertainty_weighting and self.training:
+            total = torch.tensor(0.0, device=device)
+            det_log_var = self._bounded_log_var(
+                self.log_var_det,
+                self.det_uncertainty_weight_min,
+                self.det_uncertainty_weight_max,
+            )
+            pose_log_var = self._bounded_log_var(
+                self.log_var_pose,
+                self.pose_uncertainty_weight_min,
+                self.pose_uncertainty_weight_max,
+            )
+            if self.train_det:
+                total = total + torch.exp(-det_log_var) * det_total + det_log_var
+            if self.train_pose:
+                total = total + torch.exp(-pose_log_var) * pose_total + pose_log_var
+        else:
+            det_log_var = self.log_var_det
+            pose_log_var = self.log_var_pose
+            total = (self.det_task_weight * det_total +
+                     self.pose_task_weight * pose_total)
 
         loss_dict = {
             'total': total,
@@ -442,6 +502,10 @@ class _DualHeadModel(_BaseModel):
             'pose_total': pose_total.detach(),
             'task_w_det': torch.tensor(self.det_task_weight, device=device),
             'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
+            'log_var_det': self.log_var_det.detach(),
+            'log_var_pose': self.log_var_pose.detach(),
+            'uncertainty_w_det': torch.exp(-det_log_var.detach()),
+            'uncertainty_w_pose': torch.exp(-pose_log_var.detach()),
             'det_cls': det_cls.detach(),
             'det_ciou': det_ciou.detach(),
             'det_dfl': det_dfl.detach(),
@@ -633,6 +697,8 @@ class ModelE_BiFPN(_DualHeadModel):
         self.neck = BiFPN(self.backbone.out_channels,
                           depth=backbone_depth, width=backbone_width)
         ch = self.neck.out_channels
+        self.det_adapter = nn.ModuleList(Conv(c, c, 1) for c in ch)
+        self.pose_adapter = nn.ModuleList(Conv(c, c, 1) for c in ch)
         self.det_head = DetectHead(
             ch[0], num_classes=num_det_classes, reg_max=reg_max, tower_depth=3)
         self.pose_head = PoseHead(
@@ -642,7 +708,9 @@ class ModelE_BiFPN(_DualHeadModel):
     def _forward_head(self, x):
         feats = self.backbone(x)
         neck_feats = self.neck(feats)
-        return self.det_head(neck_feats), self.pose_head(neck_feats)
+        det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
+        pose_feats = [adapter(feat) for adapter, feat in zip(self.pose_adapter, neck_feats)]
+        return self.det_head(det_feats), self.pose_head(pose_feats)
 
     def forward(self, x):
         return self._forward_head(x)
