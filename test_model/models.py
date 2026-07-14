@@ -489,17 +489,26 @@ class _DualHeadModel(_BaseModel):
                 self.pose_uncertainty_weight_max,
             )
             if self.train_det:
-                total = total + torch.exp(-det_log_var) * det_total + det_log_var
+                det_objective = torch.exp(-det_log_var) * det_total + det_log_var
+                total = total + det_objective
+            else:
+                det_objective = torch.tensor(0.0, device=device)
             if self.train_pose:
-                total = total + torch.exp(-pose_log_var) * pose_total + pose_log_var
+                pose_objective = torch.exp(-pose_log_var) * pose_total + pose_log_var
+                total = total + pose_objective
+            else:
+                pose_objective = torch.tensor(0.0, device=device)
         else:
             det_log_var = self.log_var_det
             pose_log_var = self.log_var_pose
-            total = (self.det_task_weight * det_total +
-                     self.pose_task_weight * pose_total)
+            det_objective = self.det_task_weight * det_total
+            pose_objective = self.pose_task_weight * pose_total
+            total = det_objective + pose_objective
 
         loss_dict = {
             'total': total,
+            '_gp_det_loss': det_objective,
+            '_gp_pose_loss': pose_objective,
             'det_total': det_total.detach(),
             'pose_total': pose_total.detach(),
             'task_w_det': torch.tensor(self.det_task_weight, device=device),

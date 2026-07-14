@@ -51,7 +51,9 @@ class Trainer:
                  early_stop_min_delta=0.0, early_stop_start_epoch=0,
                  score_interval=1, score_det_baseline=1.0,
                  score_pose_baseline=1.0, score_det_metric='mAP@0.5:0.95',
-                 score_pose_metric='AP_pose@0.5:0.95'):
+                 score_pose_metric='AP_pose@0.5:0.95',
+                 gradient_projection_enabled=False,
+                 gradient_projection_eps=1.0e-12):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.grad_clip = grad_clip
@@ -99,6 +101,8 @@ class Trainer:
         self.score_pose_baseline = max(float(score_pose_baseline), 1e-8)
         self.score_det_metric = score_det_metric
         self.score_pose_metric = score_pose_metric
+        self.gradient_projection_enabled = bool(gradient_projection_enabled)
+        self.gradient_projection_eps = float(gradient_projection_eps)
 
         # EMA
         self.ema_decay = ema_decay
@@ -110,6 +114,91 @@ class Trainer:
         # AMP
         self.use_amp = use_amp and device == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+
+    @staticmethod
+    def _should_log_loss_key(key):
+        return not str(key).startswith('_')
+
+    def _collect_task_grads(self, task_loss, params, retain_graph):
+        self.optimizer.zero_grad(set_to_none=True)
+        if self.scaler:
+            self.scaler.scale(task_loss).backward(retain_graph=retain_graph)
+        else:
+            task_loss.backward(retain_graph=retain_graph)
+        grads = []
+        for p in params:
+            grads.append(None if p.grad is None else p.grad.detach().clone())
+        return grads
+
+    def _grad_dot(self, grads_a, grads_b):
+        dot = None
+        for ga, gb in zip(grads_a, grads_b):
+            if ga is None or gb is None:
+                continue
+            value = torch.sum(ga * gb)
+            dot = value if dot is None else dot + value
+        if dot is None:
+            return torch.tensor(0.0, device=self.device)
+        return dot
+
+    def _grad_norm_sq(self, grads):
+        norm = None
+        for grad in grads:
+            if grad is None:
+                continue
+            value = torch.sum(grad * grad)
+            norm = value if norm is None else norm + value
+        if norm is None:
+            return torch.tensor(0.0, device=self.device)
+        return norm
+
+    def _apply_gradient_projection(self, losses, total_loss):
+        det_loss = losses.get('_gp_det_loss')
+        pose_loss = losses.get('_gp_pose_loss')
+        task_losses = [
+            loss for loss in (det_loss, pose_loss)
+            if isinstance(loss, torch.Tensor) and loss.requires_grad
+        ]
+        if len(task_losses) < 2:
+            if self.scaler:
+                self.scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
+            return False
+
+        params = [p for p in self.model.parameters() if p.requires_grad]
+        task_grads = [
+            self._collect_task_grads(loss, params, retain_graph=(idx < len(task_losses) - 1))
+            for idx, loss in enumerate(task_losses)
+        ]
+
+        projected = []
+        for i, grads_i in enumerate(task_grads):
+            grads_proj = [None if g is None else g.clone() for g in grads_i]
+            for j, grads_j in enumerate(task_grads):
+                if i == j:
+                    continue
+                dot = self._grad_dot(grads_proj, grads_j)
+                if dot.item() >= 0:
+                    continue
+                denom = self._grad_norm_sq(grads_j) + self.gradient_projection_eps
+                scale = dot / denom
+                for k, (g_proj, g_ref) in enumerate(zip(grads_proj, grads_j)):
+                    if g_proj is not None and g_ref is not None:
+                        grads_proj[k] = g_proj - scale * g_ref
+            projected.append(grads_proj)
+
+        self.optimizer.zero_grad(set_to_none=True)
+        for param_index, p in enumerate(params):
+            grad_sum = None
+            for grads in projected:
+                grad = grads[param_index]
+                if grad is None:
+                    continue
+                grad_sum = grad if grad_sum is None else grad_sum + grad
+            if grad_sum is not None:
+                p.grad = grad_sum
+        return True
 
     def _build_ema(self):
         for name, p in self.model.named_parameters():
@@ -245,7 +334,19 @@ class Trainer:
                 continue
 
             self.optimizer.zero_grad(set_to_none=True)
-            if self.scaler:
+            if self.gradient_projection_enabled:
+                self._apply_gradient_projection(losses, total_loss)
+                if self.scaler:
+                    if self.grad_clip > 0:
+                        self.scaler.unscale_(self.optimizer)
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.scaler.step(self.optimizer)
+                    self.scaler.update()
+                else:
+                    if self.grad_clip > 0:
+                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                    self.optimizer.step()
+            elif self.scaler:
                 self.scaler.scale(total_loss).backward()
                 if self.grad_clip > 0:
                     self.scaler.unscale_(self.optimizer)
@@ -265,7 +366,7 @@ class Trainer:
                 self._update_ema()
 
             for k, v in losses.items():
-                if isinstance(v, torch.Tensor):
+                if isinstance(v, torch.Tensor) and self._should_log_loss_key(k):
                     value = v.detach()
                     running[k] = running.get(k, torch.zeros_like(value)) + value
                     metrics[k] = metrics.get(k, torch.zeros_like(value)) + value
@@ -312,7 +413,7 @@ class Trainer:
                 losses = self.model.compute_loss(images, gt_list)
 
             for k, v in losses.items():
-                if isinstance(v, torch.Tensor):
+                if isinstance(v, torch.Tensor) and self._should_log_loss_key(k):
                     key = 'val_' + k
                     value = v.detach()
                     metrics[key] = metrics.get(key, torch.zeros_like(value)) + value

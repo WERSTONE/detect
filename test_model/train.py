@@ -530,8 +530,15 @@ def main():
 
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
 
-    def _make_trainer(lr, save_dir_suffix=''):
+    gradient_projection_cfg = t_cfg.get('gradient_projection', {})
+
+    def _make_trainer(lr, save_dir_suffix='', gradient_projection_enabled=None):
         save_path = Path(opts['save_dir']) / (model_name + save_dir_suffix)
+        use_gradient_projection = (
+            gradient_projection_cfg.get('enabled', False)
+            if gradient_projection_enabled is None
+            else gradient_projection_enabled
+        )
         return Trainer(
             model=model,
             device=device,
@@ -561,6 +568,8 @@ def main():
             score_pose_baseline=score_cfg.get('pose_baseline_mAP50_95', 1.0),
             score_det_metric=score_cfg.get('det_metric', 'mAP@0.5:0.95'),
             score_pose_metric=score_cfg.get('pose_metric', 'AP_pose@0.5:0.95'),
+            gradient_projection_enabled=use_gradient_projection,
+            gradient_projection_eps=gradient_projection_cfg.get('eps', 1.0e-12),
         )
 
     def _make_train_loader(person_only=False):
@@ -697,7 +706,8 @@ def main():
             else:
                 losses = model.compute_loss(images, gt_list)
         print("  loss ok: " + " ".join(
-            f"{k}={v:.4f}" for k, v in sorted(losses.items()) if isinstance(v, torch.Tensor)))
+            f"{k}={v:.4f}" for k, v in sorted(losses.items())
+            if isinstance(v, torch.Tensor) and not str(k).startswith('_')))
         del losses, images, gt_list, batch
         _release_cuda_cache()
 
@@ -810,7 +820,8 @@ def main():
                 f"train_pose={getattr(model, 'train_pose', True)} "
                 f"freeze_backbone={stage_cfg.get('freeze_backbone', False)} "
                 f"person_only={person_only} "
-                f"dynamic={stage_cfg.get('use_dynamic_weights', False)}"
+                f"dynamic={stage_cfg.get('use_dynamic_weights', False)} "
+                f"grad_proj={stage_cfg.get('use_gradient_projection', gradient_projection_cfg.get('enabled', False))}"
             )
             trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
             total = sum(p.numel() for p in model.parameters())
@@ -821,7 +832,11 @@ def main():
             _run_preflight(train_loader_stage, val_loader, tag=stage_name)
             trainer_stage = _make_trainer(
                 stage_lr,
-                save_dir_suffix='' if stage_index == len(stages) else f'_{stage_name}')
+                save_dir_suffix='' if stage_index == len(stages) else f'_{stage_name}',
+                gradient_projection_enabled=stage_cfg.get(
+                    'use_gradient_projection',
+                    gradient_projection_cfg.get('enabled', False),
+                ))
             trainer_stage.fit(
                 epochs=stage_epochs,
                 train_loader=train_loader_stage,

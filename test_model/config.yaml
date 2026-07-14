@@ -36,12 +36,12 @@ data:
 
 # ---- Training ----
 training:
-  epochs: 200
+  epochs: 100
   batch_size: 32            # 24GB GPU: start with 24; reduce to 16/12 if OOM
   workers: 14
 
   # Optimizer (SGD matches YOLOv8 official recipe)
-  optimizer: sgd           # sgd | adamw
+  optimizer: adamw           # sgd | adamw
   lr0: 0.005               # stable initial LR for dual-head training at batch 24
   lrf: 0.01                # final LR = lr0 * lrf
   momentum: 0.937
@@ -64,7 +64,7 @@ training:
   save_interval: 20        # save intermediate checkpoint every N epochs
   save_best_by: loss       # loss | joint_mAP50_95 | mean_mAP50_95 | mAP@0.5:0.95 | AP_pose@0.5:0.95
   # Saved as checkpoints/<model_name>/ inside the project directory.
-  save_dir: checkpoints
+  save_dir: checkpoints/re
 
   # Logging
   tensorboard: true         # write TensorBoard logs to save_dir/tensorboard/
@@ -78,7 +78,7 @@ training:
   # selected by validation loss; AP is only used when save_best_by is changed.
   early_stop:
     enabled: true
-    patience: 12
+    patience: 10
     min_delta: 0.002
     start_epoch: 80
 
@@ -101,6 +101,15 @@ training:
     pose_max: 5.0
     eps: 1.0e-8
 
+  # Gradient projection for multi-task optimization.
+  # When enabled, det and pose losses are backpropagated separately and
+  # conflicting task gradients are projected before optimizer.step().
+  # Recommended for joint stages only; keep off for single-task warmups.
+  gradient_projection:
+    enabled: true
+    method: pcgrad
+    eps: 1.0e-12
+
   # Staged recipe when only the pretrained YOLOv8 backbone is reused.
   # 1) Freeze backbone and learn the new BiFPN/adapters/detection head.
   # 2) Keep backbone frozen and add pose supervision with person-heavy batches.
@@ -109,7 +118,7 @@ training:
     enabled: true
     stages:
       - name: frozen_det_warmup
-        epochs: 25
+        epochs: 30
         lr0: 0.003
         person_only: false
         train_det: true
@@ -118,10 +127,11 @@ training:
         det_weight: 1.0
         pose_weight: 0.0
         use_dynamic_weights: false
+        use_gradient_projection: false
         close_mosaic_epochs: 0
 
       - name: frozen_pose_warmup
-        epochs: 45
+        epochs: 40
         lr0: 0.002
         person_only: true
         train_det: true
@@ -130,18 +140,20 @@ training:
         det_weight: 0.5
         pose_weight: 1.5
         use_dynamic_weights: false
+        use_gradient_projection: false
         close_mosaic_epochs: 10
 
       - name: unfrozen_joint_tune
-        epochs: 130
-        lr0: 0.0008
+        epochs: 80
+        lr0: 0.0005
         person_only: false
         train_det: true
         train_pose: true
         freeze_backbone: false
         det_weight: 1.0
-        pose_weight: 1.0
+        pose_weight: 1.2
         use_dynamic_weights: true
+        use_gradient_projection: true
         close_mosaic_epochs: 20
 
   # Two-stage training (dual-head models only; keep disabled for the 80-class setup)
