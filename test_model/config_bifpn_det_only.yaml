@@ -1,0 +1,134 @@
+# BiFPN single-task baseline: COCO80 detection only.
+
+model: bifpn_dual
+num_classes: 80
+num_det_classes: 80
+num_kpts: 17
+reg_max: 16
+
+pretrained:
+  backbone:
+    enabled: true
+    weights: auto
+    auto_download: true
+    prefer_pose: false
+    cache_dir: checkpoints/yolo
+    strict: false
+
+data:
+  root: /root/autodl-tmp/coco2017
+  train_img: train2017
+  train_label: labels/train2017
+  val_img: val2017
+  val_label: labels/val2017
+  input_size: 640
+  class_id_format: yolo80
+
+training:
+  epochs: 200
+  batch_size: 32
+  workers: 14
+
+  # Aligned with the official YOLOv8m COCO recipe where possible.
+  optimizer: sgd
+  lr0: 0.01
+  lrf: 0.01
+  momentum: 0.937
+  weight_decay: 0.001
+  nesterov: true
+
+  warmup_epochs: 3
+  cos_lr: false
+  grad_clip: 10.0
+  ema_decay: 0.9999
+  amp: true
+
+  val_interval: 1
+  save_interval: 20
+  save_best_by: loss
+  save_dir: checkpoints/single_bifpn_det
+  tensorboard: true
+  log_interval: 50
+
+  close_mosaic_epochs: 10
+  no_mosaic: false
+
+  early_stop:
+    enabled: true
+    patience: 10
+    min_delta: 0.002
+    start_epoch: 170
+
+  score_validation:
+    interval: 1
+    max_samples: 1200
+    det_metric: "mAP@0.5:0.95"
+    pose_metric: "AP_pose@0.5:0.95"
+
+  dynamic_weights:
+    enabled: false
+
+  gradient_projection:
+    enabled: false
+    method: pcgrad
+    eps: 1.0e-12
+
+  staged_training:
+    enabled: true
+    stages:
+      - name: frozen_det_head_warmup
+        epochs: 30
+        lr0: 0.01
+        person_only: false
+        train_det: true
+        train_pose: false
+        freeze_backbone: true
+        det_weight: 1.0
+        pose_weight: 0.0
+        use_dynamic_weights: false
+        use_gradient_projection: false
+        close_mosaic_epochs: 0
+
+      - name: unfrozen_det_finetune
+        epochs: 170
+        lr0: 0.003
+        person_only: false
+        train_det: true
+        train_pose: false
+        freeze_backbone: false
+        det_weight: 1.0
+        pose_weight: 0.0
+        use_dynamic_weights: false
+        use_gradient_projection: false
+        close_mosaic_epochs: 10
+
+  two_stage:
+    enabled: false
+
+loss:
+  w_box: 7.5
+  w_cls: 0.5
+  w_dfl: 1.5
+  w_pose: 12.0
+  w_kobj: 1.0
+
+augmentation:
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  flip_lr: 0.5
+  mosaic_prob: 0.3
+
+eval:
+  auto_after_train: true
+  checkpoints:
+    - last
+    - best
+  score_thresh: 0.01
+  iou_thresh: 0.6
+  max_det: 300
+  batch_size: 16
+
+device: cuda
+gpu_id: 0
+debug: false
