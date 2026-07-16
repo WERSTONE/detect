@@ -593,6 +593,13 @@ def main():
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else e_cfg.get('iou_thresh', 0.6)
     max_det = args.max_det if args.max_det is not None else e_cfg.get('max_det', 300)
     num_classes = cfg.get('num_classes', 80)
+    keep_classes = d_cfg.get('keep_classes', None)
+    if keep_classes is None and (
+        cfg.get('num_det_classes', 80) == 1 or args.provider == 'ultralytics_pose'
+    ):
+        keep_classes = [0]
+    if keep_classes is not None:
+        keep_classes = [int(c) for c in keep_classes]
 
     device = args.device
     if device == 'cuda' and not torch.cuda.is_available():
@@ -610,6 +617,7 @@ def main():
         shuffle=False,
         num_workers=workers,
         class_id_format=class_id_format,
+        keep_classes=keep_classes,
     )
     if args.max_samples and 0 < args.max_samples < len(loader.dataset):
         loader = DataLoader(
@@ -621,7 +629,8 @@ def main():
             pin_memory=True,
         )
     print(f"Eval samples: {len(loader.dataset)} | input_size={input_size} | "
-          f"class_id_format={class_id_format} | provider={args.provider} | max_det={max_det}")
+          f"class_id_format={class_id_format} | provider={args.provider} | "
+          f"max_det={max_det} | keep_classes={keep_classes}")
 
     # Evaluate
     if args.provider == 'test_model':

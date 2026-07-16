@@ -39,6 +39,12 @@ training:
   weight_decay: 0.001
   nesterov: false
 
+  # Non-backbone parameters use lr0. Trainable backbone parameters use a lower
+  # LR for stable pretrained-feature fine-tuning.
+  lr_groups:
+    backbone_lr_mult: 0.1
+    backbone_lr:
+
   warmup_epochs: 3
   cos_lr: false
   grad_clip: 10.0
@@ -93,7 +99,8 @@ training:
 
       - name: partial_backbone_det_finetune
         epochs: 175
-        lr0: 0.0004
+        lr0: 0.0004          # neck/head LR
+        backbone_lr: 0.00004 # 0.1x lr0 for the partially unfrozen backbone
         person_only: false
         train_det: true
         train_pose: false
@@ -123,8 +130,20 @@ augmentation:
   hsv_h: 0.015
   hsv_s: 0.7
   hsv_v: 0.4
+  degrees: 0.0
+  translate: 0.1
+  scale: 0.5
+  shear: 0.0
+  perspective: 0.0
   flip_lr: 0.5
+  flip_ud: 0.0
+  bgr: 0.0
   mosaic_prob: 0.3
+  mixup_prob: 0.10
+  cutmix_prob: 0.05
+  copy_paste_prob: 0.05
+  copy_paste_ioa: 0.3
+  copy_paste_max_objects: 8
 
 eval:
   auto_after_train: true

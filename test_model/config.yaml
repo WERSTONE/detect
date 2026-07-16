@@ -48,6 +48,13 @@ training:
   weight_decay: 0.0005     # 5e-4
   nesterov: true
 
+  # Optional per-module LR groups. By default, non-backbone parameters use
+  # lr0, while backbone parameters use lr0 * backbone_lr_mult. Set
+  # backbone_lr to an absolute LR if you want it to override the multiplier.
+  lr_groups:
+    backbone_lr_mult: 0.1
+    backbone_lr:
+
   # LR schedule
   warmup_epochs: 5
   cos_lr: true             # cosine annealing
@@ -70,8 +77,8 @@ training:
   tensorboard: true         # write TensorBoard logs to save_dir/tensorboard/
   log_interval: 50          # console log every N optimizer steps
 
-  # Mosaic augmentation
-  close_mosaic_epochs: 20  # disable mosaic for last N epochs
+  # Strong composite augmentations are disabled for the last N epochs.
+  close_mosaic_epochs: 20
   no_mosaic: false         # completely disable mosaic
 
   # Early stopping follows save_best_by. The current default selects the best
@@ -147,7 +154,8 @@ training:
 
       - name: unfrozen_joint_tune
         epochs: 80
-        lr0: 0.0005
+        lr0: 0.0005          # neck/head LR
+        backbone_lr: 0.00005 # 0.1x lr0 for pretrained backbone fine-tuning
         person_only: false
         train_det: true
         train_pose: true
@@ -186,10 +194,20 @@ augmentation:
   hsv_h: 0.015             # hue
   hsv_s: 0.7               # saturation
   hsv_v: 0.4               # value
-  flip_lr: 0.5             # horizontal flip probability
-  scale: 0.5               # scale
   translate: 0.1           # translation
-  mosaic_prob: 0.5         # mosaic probability (0=never, 1=always)
+  scale: 0.5               # scale
+  degrees: 0.0
+  shear: 0.0
+  perspective: 0.0
+  flip_lr: 0.5             # horizontal flip probability
+  flip_ud: 0.0
+  bgr: 0.0
+  mosaic_prob: 0.3         # mosaic probability (0=never, 1=always)
+  mixup_prob: 0.05
+  cutmix_prob: 0.03
+  copy_paste_prob: 0.03    # box crop copy-paste; keep low without masks
+  copy_paste_ioa: 0.3
+  copy_paste_max_objects: 8
 
 # ---- Evaluation ----
 eval:

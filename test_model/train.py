@@ -488,6 +488,12 @@ def main():
     data_root = Path(opts['data_root'])
     class_id_format = d_cfg.get('class_id_format', 'yolo80')
     print(f"Label format: {class_id_format} (internal COCO ids 0..79)")
+    keep_classes = d_cfg.get('keep_classes', None)
+    if keep_classes is None and cfg.get('num_det_classes', 80) == 1:
+        keep_classes = [0]
+    if keep_classes is not None:
+        keep_classes = [int(c) for c in keep_classes]
+        print(f"Target class filter: keep_classes={keep_classes}")
     val_loader = create_dataloader(
         data_dir=data_root,
         img_dir=d_cfg.get('val_img', 'images/val2017'),
@@ -500,6 +506,7 @@ def main():
         num_workers=opts['workers'],
         drop_last=False,
         class_id_format=class_id_format,
+        keep_classes=keep_classes,
     )
     print(f"Val: {len(val_loader.dataset)} samples")
 
@@ -532,13 +539,22 @@ def main():
 
     gradient_projection_cfg = t_cfg.get('gradient_projection', {})
 
-    def _make_trainer(lr, save_dir_suffix='', gradient_projection_enabled=None):
+    def _make_trainer(lr, save_dir_suffix='', gradient_projection_enabled=None,
+                      stage_cfg=None):
         save_path = Path(opts['save_dir']) / (model_name + save_dir_suffix)
         use_gradient_projection = (
             gradient_projection_cfg.get('enabled', False)
             if gradient_projection_enabled is None
             else gradient_projection_enabled
         )
+        lr_groups_cfg = t_cfg.get('lr_groups', {}) or {}
+        stage_cfg = stage_cfg or {}
+        backbone_lr = stage_cfg.get(
+            'backbone_lr',
+            lr_groups_cfg.get('backbone_lr', None))
+        backbone_lr_mult = stage_cfg.get(
+            'backbone_lr_mult',
+            lr_groups_cfg.get('backbone_lr_mult', 1.0))
         return Trainer(
             model=model,
             device=device,
@@ -548,6 +564,8 @@ def main():
             weight_decay=t_cfg.get('weight_decay', 5e-4),
             nesterov=t_cfg.get('nesterov', True),
             final_lr_ratio=t_cfg.get('lrf', 0.01),
+            backbone_lr=backbone_lr,
+            backbone_lr_mult=backbone_lr_mult,
             cos_lr=t_cfg.get('cos_lr', True),
             warmup_epochs=t_cfg.get('warmup_epochs', 3),
             grad_clip=t_cfg.get('grad_clip', 10.0),
@@ -588,8 +606,21 @@ def main():
             hsv_h=a_cfg.get('hsv_h', 0.015),
             hsv_s=a_cfg.get('hsv_s', 0.7),
             hsv_v=a_cfg.get('hsv_v', 0.4),
+            degrees=a_cfg.get('degrees', 0.0),
+            translate=a_cfg.get('translate', 0.1),
+            scale=a_cfg.get('scale', 0.5),
+            shear=a_cfg.get('shear', 0.0),
+            perspective=a_cfg.get('perspective', 0.0),
             flip_lr=a_cfg.get('flip_lr', 0.5),
+            flip_ud=a_cfg.get('flip_ud', 0.0),
+            bgr=a_cfg.get('bgr', 0.0),
             mosaic_prob=a_cfg.get('mosaic_prob', 0.5),
+            mixup_prob=a_cfg.get('mixup_prob', 0.0),
+            cutmix_prob=a_cfg.get('cutmix_prob', 0.0),
+            copy_paste_prob=a_cfg.get('copy_paste_prob', 0.0),
+            copy_paste_ioa=a_cfg.get('copy_paste_ioa', 0.3),
+            copy_paste_max_objects=a_cfg.get('copy_paste_max_objects', 8),
+            keep_classes=keep_classes,
             person_only=person_only,
         )
 
@@ -854,7 +885,8 @@ def main():
                 gradient_projection_enabled=stage_cfg.get(
                     'use_gradient_projection',
                     gradient_projection_cfg.get('enabled', False),
-                ))
+                ),
+                stage_cfg=stage_cfg)
             trainer_stage.fit(
                 epochs=stage_epochs,
                 train_loader=train_loader_stage,
@@ -919,7 +951,8 @@ def main():
         print(f"{'='*60}")
         _run_preflight(train_loader_s1, val_loader, tag='stage1')
 
-        trainer1 = _make_trainer(s1_lr, save_dir_suffix='_stage1')
+        trainer1 = _make_trainer(s1_lr, save_dir_suffix='_stage1',
+                                 stage_cfg=s1)
         trainer1.fit(
             epochs=s1_epochs,
             train_loader=train_loader_s1,
@@ -959,7 +992,7 @@ def main():
         print(f"{'='*60}")
 
         _run_preflight(train_loader, val_loader, tag='stage2')
-        trainer2 = _make_trainer(s2_lr)
+        trainer2 = _make_trainer(s2_lr, stage_cfg=s2)
         trainer2.fit(
             epochs=s2_epochs,
             train_loader=train_loader,

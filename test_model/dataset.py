@@ -1,9 +1,9 @@
-"""COCO dataset with YOLO-format labels, augmentations (mosaic, HSV, flip).
+"""COCO dataset with YOLO-format labels and YOLO-style augmentations.
 
 Supports:
 - YOLO-format label loading with keypoints
 - Mosaic (4-image composition)
-- HSV, scale, translate, flip augmentations
+- HSV, affine/perspective-style geometry, flip, MixUp, CutMix, Copy-Paste
 - Letterbox resize to 640x640
 - Multi-GPU distributed sampling
 """
@@ -121,7 +121,12 @@ class COCOMultiTaskDataset(Dataset):
                  input_size=640, use_mosaic=True, augment=True,
                  class_id_format='yolo80',
                  hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-                 flip_lr=0.5, mosaic_prob=0.5, person_only=False):
+                 degrees=0.0, translate=0.1, scale=0.5, shear=0.0,
+                 perspective=0.0, flip_lr=0.5, flip_ud=0.0, bgr=0.0,
+                 mosaic_prob=0.5, mixup_prob=0.0, cutmix_prob=0.0,
+                 copy_paste_prob=0.0, copy_paste_ioa=0.3,
+                 copy_paste_max_objects=8, keep_classes=None,
+                 person_only=False):
         self.data_dir = Path(data_dir)
         self.img_dir = self.data_dir / img_dir
         self.label_dir = self.data_dir / label_dir if label_dir else None
@@ -133,7 +138,26 @@ class COCOMultiTaskDataset(Dataset):
         self.hsv_h = hsv_h
         self.hsv_s = hsv_s
         self.hsv_v = hsv_v
+        self.degrees = degrees
+        self.translate = translate
+        self.scale = scale
+        self.shear = shear
+        self.perspective = perspective
         self.flip_lr = flip_lr
+        self.flip_ud = flip_ud
+        self.bgr = bgr
+        self.mixup_prob = mixup_prob
+        self.cutmix_prob = cutmix_prob
+        self.copy_paste_prob = copy_paste_prob
+        self.copy_paste_ioa = copy_paste_ioa
+        self.copy_paste_max_objects = int(copy_paste_max_objects)
+        self.keep_classes = (
+            None if keep_classes is None else {int(c) for c in keep_classes}
+        )
+        self._base_use_mosaic = self.use_mosaic
+        self._base_mixup_prob = self.mixup_prob
+        self._base_cutmix_prob = self.cutmix_prob
+        self._base_copy_paste_prob = self.copy_paste_prob
 
         # Collect image-label pairs
         self.samples = []
@@ -190,7 +214,26 @@ class COCOMultiTaskDataset(Dataset):
     def __len__(self):
         return len(self.samples)
 
+    def set_close_mosaic(self, close=False):
+        """Disable strong composite augmentations during final fine-tuning."""
+        if close:
+            self.use_mosaic = False
+            self.mixup_prob = 0.0
+            self.cutmix_prob = 0.0
+            self.copy_paste_prob = 0.0
+        else:
+            self.use_mosaic = self._base_use_mosaic
+            self.mixup_prob = self._base_mixup_prob
+            self.cutmix_prob = self._base_cutmix_prob
+            self.copy_paste_prob = self._base_copy_paste_prob
+
     def __getitem__(self, idx):
+        sample = self._load_composed(idx)
+        if self.augment:
+            sample = self._apply_composite_augmentations(sample)
+        return sample
+
+    def _load_composed(self, idx):
         if self.use_mosaic and random.random() < self.mosaic_prob:
             return self._load_mosaic(idx)
         return self._load_single(idx)
@@ -205,6 +248,7 @@ class COCOMultiTaskDataset(Dataset):
         boxes, classes, kpts = [], [], []
         if label_path and Path(label_path).exists():
             boxes, classes, kpts = self._parse_yolo_label(label_path, img.shape[1], img.shape[0])
+        boxes, classes, kpts = self._filter_targets_by_class(boxes, classes, kpts)
 
         # Augment
         if self.augment:
@@ -269,6 +313,8 @@ class COCOMultiTaskDataset(Dataset):
             if label_path and Path(label_path).exists():
                 boxes_i, classes_i, kpts_i = self._parse_yolo_label(
                     label_path, img.shape[1], img.shape[0])
+            boxes_i, classes_i, kpts_i = self._filter_targets_by_class(
+                boxes_i, classes_i, kpts_i)
 
             h0, w0 = img.shape[:2]
             y1, x1, y2, x2 = placements[i]
@@ -320,9 +366,10 @@ class COCOMultiTaskDataset(Dataset):
                         k[outside & visible, 2] = 0
                         mosaic_kpts.append(k)
 
-        # HSV augment on mosaic
+        # HSV/geometric augment on mosaic
         if self.augment:
-            mosaic_img = self._hsv_augment(mosaic_img, self.hsv_h, self.hsv_s, self.hsv_v)
+            mosaic_img, mosaic_boxes, mosaic_kpts = self._augment(
+                mosaic_img, mosaic_boxes, mosaic_kpts)
 
         mosaic_boxes, mosaic_classes, mosaic_kpts = self._sanitize_targets(
             mosaic_boxes, mosaic_classes, mosaic_kpts)
@@ -392,6 +439,18 @@ class COCOMultiTaskDataset(Dataset):
                 kpts.append(kpt)
 
         return boxes, classes, kpts
+
+    def _filter_targets_by_class(self, boxes, classes, kpts):
+        if self.keep_classes is None or not classes:
+            return boxes, classes, kpts
+        keep = [i for i, cls in enumerate(classes) if int(cls) in self.keep_classes]
+        if len(keep) == len(classes):
+            return boxes, classes, kpts
+        return (
+            [boxes[i] for i in keep],
+            [classes[i] for i in keep],
+            [kpts[i] for i in keep] if kpts else [],
+        )
 
     def _map_class_id(self, cls, has_kpts=False):
         """Map source class id to the model's internal class id.
@@ -469,8 +528,30 @@ class COCOMultiTaskDataset(Dataset):
         return boxes_np.tolist(), classes_np.tolist(), [k for k in kpts_np]
 
     def _augment(self, img, boxes, kpts):
-        """Apply HSV + flip augmentations."""
+        """Apply HSV, geometry, channel, and flip augmentations."""
         img = self._hsv_augment(img, self.hsv_h, self.hsv_s, self.hsv_v)
+        img, boxes, kpts = self._random_affine(
+            img, boxes, kpts,
+            degrees=self.degrees,
+            translate=self.translate,
+            scale=self.scale,
+            shear=self.shear,
+            perspective=self.perspective,
+        )
+
+        if self.bgr > 0 and random.random() < self.bgr:
+            img = img[..., ::-1].copy()
+
+        if self.flip_ud > 0 and random.random() < self.flip_ud:
+            img = img[::-1, :, :].copy()
+            h = img.shape[0]
+            for i, box in enumerate(boxes):
+                x1, y1, x2, y2 = box
+                boxes[i] = [x1, h - y2, x2, h - y1]
+            for i, k in enumerate(kpts):
+                if k.any():
+                    k[:, 1] = h - k[:, 1]
+                    kpts[i] = k
 
         # Horizontal flip
         if random.random() < self.flip_lr:
@@ -485,6 +566,231 @@ class COCOMultiTaskDataset(Dataset):
                     kpts[i] = k[KPT_FLIP_MAP]
 
         return img, boxes, kpts
+
+    def _random_affine(self, img, boxes, kpts, degrees=0.0, translate=0.1,
+                       scale=0.5, shear=0.0, perspective=0.0):
+        """YOLO-style random affine transform with synchronized targets."""
+        h, w = img.shape[:2]
+        if max(abs(degrees), abs(translate), abs(scale), abs(shear), abs(perspective)) <= 0:
+            return img, boxes, kpts
+
+        c = np.eye(3, dtype=np.float32)
+        c[0, 2] = -w / 2
+        c[1, 2] = -h / 2
+
+        p = np.eye(3, dtype=np.float32)
+        p[2, 0] = random.uniform(-perspective, perspective)
+        p[2, 1] = random.uniform(-perspective, perspective)
+
+        r = np.eye(3, dtype=np.float32)
+        angle = random.uniform(-degrees, degrees)
+        scale_factor = random.uniform(1 - scale, 1 + scale)
+        r[:2] = cv2.getRotationMatrix2D((0, 0), angle, scale_factor)
+
+        s = np.eye(3, dtype=np.float32)
+        s[0, 1] = math.tan(math.radians(random.uniform(-shear, shear)))
+        s[1, 0] = math.tan(math.radians(random.uniform(-shear, shear)))
+
+        t = np.eye(3, dtype=np.float32)
+        t[0, 2] = random.uniform(0.5 - translate, 0.5 + translate) * w
+        t[1, 2] = random.uniform(0.5 - translate, 0.5 + translate) * h
+
+        m = t @ s @ r @ p @ c
+        if perspective:
+            img = cv2.warpPerspective(
+                img, m, dsize=(w, h), borderValue=(114, 114, 114))
+        else:
+            img = cv2.warpAffine(
+                img, m[:2], dsize=(w, h), borderValue=(114, 114, 114))
+
+        if not boxes:
+            return img, boxes, kpts
+
+        boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
+        n = len(boxes_np)
+        corners = np.ones((n * 4, 3), dtype=np.float32)
+        corners[:, :2] = boxes_np[:, [0, 1, 2, 1, 2, 3, 0, 3]].reshape(n * 4, 2)
+        warped = corners @ m.T
+        warped_xy = warped[:, :2] / warped[:, 2:3].clip(1e-6)
+        warped_xy = warped_xy.reshape(n, 4, 2)
+        new_boxes = np.concatenate(
+            (warped_xy.min(axis=1), warped_xy.max(axis=1)), axis=1)
+        new_boxes[:, [0, 2]] = np.clip(new_boxes[:, [0, 2]], 0, w - 1)
+        new_boxes[:, [1, 3]] = np.clip(new_boxes[:, [1, 3]], 0, h - 1)
+
+        new_kpts = []
+        if kpts:
+            kpts_np = np.asarray(kpts, dtype=np.float32).reshape(-1, 17, 3)
+            pts = np.ones((kpts_np.shape[0] * 17, 3), dtype=np.float32)
+            pts[:, :2] = kpts_np[..., :2].reshape(-1, 2)
+            warped_pts = pts @ m.T
+            warped_pts_xy = warped_pts[:, :2] / warped_pts[:, 2:3].clip(1e-6)
+            warped_pts_xy = warped_pts_xy.reshape(kpts_np.shape[0], 17, 2)
+            kpts_np[..., :2] = warped_pts_xy
+            outside = (
+                (kpts_np[..., 0] < 0) | (kpts_np[..., 0] > w - 1) |
+                (kpts_np[..., 1] < 0) | (kpts_np[..., 1] > h - 1)
+            )
+            kpts_np[..., 2] = np.where(outside, 0.0, kpts_np[..., 2])
+            kpts_np[..., 0] = np.clip(kpts_np[..., 0], 0, w - 1)
+            kpts_np[..., 1] = np.clip(kpts_np[..., 1], 0, h - 1)
+            new_kpts = [k for k in kpts_np]
+
+        return img, new_boxes.tolist(), new_kpts
+
+    def _apply_composite_augmentations(self, sample):
+        """Apply sample-mixing augmentations after resize to input_size."""
+        if self.copy_paste_prob > 0 and random.random() < self.copy_paste_prob:
+            sample = self._copy_paste(sample, random.randrange(len(self)))
+        if self.cutmix_prob > 0 and random.random() < self.cutmix_prob:
+            sample = self._cutmix(sample, random.randrange(len(self)))
+        if self.mixup_prob > 0 and random.random() < self.mixup_prob:
+            sample = self._mixup(sample, random.randrange(len(self)))
+        return sample
+
+    def _mixup(self, sample, src_idx):
+        src = self._load_composed(src_idx)
+        ratio = float(np.random.beta(32.0, 32.0))
+        sample['image'] = sample['image'] * ratio + src['image'] * (1.0 - ratio)
+        sample['boxes'] = self._cat_targets(sample['boxes'], src['boxes'], 4, torch.float32)
+        sample['classes'] = self._cat_targets(sample['classes'], src['classes'], 0, torch.long)
+        sample['kpts'] = self._cat_targets(sample['kpts'], src['kpts'], (17, 3), torch.float32)
+        return sample
+
+    def _copy_paste(self, sample, src_idx):
+        src = self._load_composed(src_idx)
+        if len(src['boxes']) == 0:
+            return sample
+        order = torch.randperm(len(src['boxes']))[:self.copy_paste_max_objects]
+        for j in order.tolist():
+            box = src['boxes'][j].round().long()
+            x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+            if x2 - x1 <= 4 or y2 - y1 <= 4:
+                continue
+            bw, bh = x2 - x1, y2 - y1
+            if bw >= self.input_size or bh >= self.input_size:
+                continue
+            nx1 = random.randint(0, self.input_size - bw)
+            ny1 = random.randint(0, self.input_size - bh)
+            new_box = torch.tensor(
+                [nx1, ny1, nx1 + bw, ny1 + bh], dtype=torch.float32)
+            if self._max_ioa(new_box, sample['boxes']) > self.copy_paste_ioa:
+                continue
+
+            patch = src['image'][:, y1:y2, x1:x2]
+            sample['image'][:, ny1:ny1 + bh, nx1:nx1 + bw] = patch
+            sample['boxes'] = self._cat_targets(
+                sample['boxes'], new_box.view(1, 4), 4, torch.float32)
+            sample['classes'] = self._cat_targets(
+                sample['classes'], src['classes'][j].view(1), 0, torch.long)
+            new_kpts = src['kpts'][j].clone()
+            new_kpts[:, 0] += nx1 - x1
+            new_kpts[:, 1] += ny1 - y1
+            outside = (
+                (new_kpts[:, 0] < nx1) | (new_kpts[:, 0] > nx1 + bw) |
+                (new_kpts[:, 1] < ny1) | (new_kpts[:, 1] > ny1 + bh)
+            )
+            new_kpts[outside, 2] = 0
+            sample['kpts'] = self._cat_targets(
+                sample['kpts'], new_kpts.view(1, 17, 3), (17, 3), torch.float32)
+        return sample
+
+    def _cutmix(self, sample, src_idx):
+        src = self._load_composed(src_idx)
+        if len(src['boxes']) == 0:
+            return sample
+        j = random.randrange(len(src['boxes']))
+        box = src['boxes'][j].round().long()
+        x1, y1, x2, y2 = [int(v) for v in box.tolist()]
+        if x2 - x1 <= 4 or y2 - y1 <= 4:
+            return sample
+        pad = random.uniform(0.0, 0.35)
+        bw, bh = x2 - x1, y2 - y1
+        cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+        pw, ph = min(self.input_size, int(bw * (1 + pad))), min(self.input_size, int(bh * (1 + pad)))
+        sx1 = max(0, int(cx - pw / 2))
+        sy1 = max(0, int(cy - ph / 2))
+        sx2 = min(self.input_size, sx1 + pw)
+        sy2 = min(self.input_size, sy1 + ph)
+        pw, ph = sx2 - sx1, sy2 - sy1
+        if pw <= 4 or ph <= 4:
+            return sample
+        tx1 = random.randint(0, self.input_size - pw)
+        ty1 = random.randint(0, self.input_size - ph)
+        patch_box = torch.tensor([tx1, ty1, tx1 + pw, ty1 + ph], dtype=torch.float32)
+        if self._max_ioa(patch_box, sample['boxes']) > self.copy_paste_ioa:
+            return sample
+
+        sample['image'][:, ty1:ty1 + ph, tx1:tx1 + pw] = src['image'][:, sy1:sy2, sx1:sx2]
+        dx, dy = tx1 - sx1, ty1 - sy1
+        keep_boxes, keep_classes, keep_kpts = [], [], []
+        for bi, src_box in enumerate(src['boxes']):
+            inter = self._intersect_box(src_box, torch.tensor([sx1, sy1, sx2, sy2], dtype=torch.float32))
+            if inter is None:
+                continue
+            old_area = max(float((src_box[2] - src_box[0]) * (src_box[3] - src_box[1])), 1.0)
+            new_area = float((inter[2] - inter[0]) * (inter[3] - inter[1]))
+            if new_area / old_area < 0.1:
+                continue
+            inter[[0, 2]] += dx
+            inter[[1, 3]] += dy
+            keep_boxes.append(inter)
+            keep_classes.append(src['classes'][bi])
+            kp = src['kpts'][bi].clone()
+            kp[:, 0] += dx
+            kp[:, 1] += dy
+            outside = (
+                (kp[:, 0] < tx1) | (kp[:, 0] > tx1 + pw) |
+                (kp[:, 1] < ty1) | (kp[:, 1] > ty1 + ph)
+            )
+            kp[outside, 2] = 0
+            keep_kpts.append(kp)
+        if keep_boxes:
+            sample['boxes'] = self._cat_targets(
+                sample['boxes'], torch.stack(keep_boxes), 4, torch.float32)
+            sample['classes'] = self._cat_targets(
+                sample['classes'], torch.stack(keep_classes), 0, torch.long)
+            sample['kpts'] = self._cat_targets(
+                sample['kpts'], torch.stack(keep_kpts), (17, 3), torch.float32)
+        return sample
+
+    @staticmethod
+    def _cat_targets(a, b, empty_shape, dtype):
+        if not torch.is_tensor(b):
+            b = torch.tensor(b, dtype=dtype)
+        if torch.is_tensor(a):
+            b = b.to(device=a.device, dtype=dtype)
+        else:
+            b = b.to(dtype=dtype)
+        if a.numel() == 0:
+            return b.clone()
+        if b.numel() == 0:
+            return a
+        return torch.cat([a, b], dim=0)
+
+    @staticmethod
+    def _intersect_box(box, crop):
+        x1 = max(float(box[0]), float(crop[0]))
+        y1 = max(float(box[1]), float(crop[1]))
+        x2 = min(float(box[2]), float(crop[2]))
+        y2 = min(float(box[3]), float(crop[3]))
+        if x2 - x1 <= 2 or y2 - y1 <= 2:
+            return None
+        return torch.tensor([x1, y1, x2, y2], dtype=torch.float32)
+
+    @staticmethod
+    def _max_ioa(box, boxes):
+        if boxes is None or len(boxes) == 0:
+            return 0.0
+        box = box.to(dtype=torch.float32)
+        boxes = boxes.to(dtype=torch.float32)
+        ix1 = torch.maximum(box[0], boxes[:, 0])
+        iy1 = torch.maximum(box[1], boxes[:, 1])
+        ix2 = torch.minimum(box[2], boxes[:, 2])
+        iy2 = torch.minimum(box[3], boxes[:, 3])
+        inter = (ix2 - ix1).clamp(min=0) * (iy2 - iy1).clamp(min=0)
+        area = ((box[2] - box[0]) * (box[3] - box[1])).clamp(min=1)
+        return float((inter / area).max().item())
 
     @staticmethod
     def _hsv_augment(img, hgain=0.015, sgain=0.7, vgain=0.4):
@@ -554,7 +860,12 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       distributed=False, rank=0, world_size=1,
                       drop_last=True, class_id_format='yolo80',
                       hsv_h=0.015, hsv_s=0.7, hsv_v=0.4,
-                      flip_lr=0.5, mosaic_prob=0.5, person_only=False):
+                      degrees=0.0, translate=0.1, scale=0.5, shear=0.0,
+                      perspective=0.0, flip_lr=0.5, flip_ud=0.0, bgr=0.0,
+                      mosaic_prob=0.5, mixup_prob=0.0, cutmix_prob=0.0,
+                      copy_paste_prob=0.0, copy_paste_ioa=0.3,
+                      copy_paste_max_objects=8, keep_classes=None,
+                      person_only=False):
     """Create DataLoader for COCO dataset."""
     dataset = COCOMultiTaskDataset(
         data_dir=data_dir,
@@ -567,8 +878,21 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
         hsv_h=hsv_h,
         hsv_s=hsv_s,
         hsv_v=hsv_v,
+        degrees=degrees,
+        translate=translate,
+        scale=scale,
+        shear=shear,
+        perspective=perspective,
         flip_lr=flip_lr,
+        flip_ud=flip_ud,
+        bgr=bgr,
         mosaic_prob=mosaic_prob,
+        mixup_prob=mixup_prob,
+        cutmix_prob=cutmix_prob,
+        copy_paste_prob=copy_paste_prob,
+        copy_paste_ioa=copy_paste_ioa,
+        copy_paste_max_objects=copy_paste_max_objects,
+        keep_classes=keep_classes,
         person_only=person_only,
     )
 

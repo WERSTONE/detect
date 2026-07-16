@@ -41,6 +41,7 @@ class Trainer:
     def __init__(self, model, device='cuda',
                  lr=0.01, momentum=0.937, weight_decay=5e-4,
                  optimizer='sgd', nesterov=True, final_lr_ratio=0.01,
+                 backbone_lr=None, backbone_lr_mult=1.0,
                  cos_lr=True,
                  warmup_epochs=3, grad_clip=10.0,
                  log_interval=20, save_interval=20, val_interval=5,
@@ -72,17 +73,20 @@ class Trainer:
             self.writer = SummaryWriter(log_dir=str(tb_dir))
 
         self.optimizer_name = str(optimizer).lower()
+        self.base_lr = lr
+        self.backbone_lr = None if backbone_lr is None else float(backbone_lr)
+        self.backbone_lr_mult = float(backbone_lr_mult)
+        param_groups = self._build_param_groups()
         if self.optimizer_name in ('adamw', 'adam'):
-            self.optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=weight_decay)
+            self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=weight_decay)
         elif self.optimizer_name == 'sgd':
             # Use regular SGD. Fused SGD can fail when multi-head batches leave
             # some head parameters without gradients.
             optim_kw = dict(lr=lr, momentum=momentum, weight_decay=weight_decay, nesterov=nesterov)
-            self.optimizer = torch.optim.SGD(model.parameters(), **optim_kw)
+            self.optimizer = torch.optim.SGD(param_groups, **optim_kw)
         else:
             raise ValueError(f"Unsupported optimizer: {optimizer}")
         self.warmup_epochs = warmup_epochs
-        self.base_lr = lr
         self.final_lr_ratio = final_lr_ratio
         self.cos_lr = cos_lr
 
@@ -114,6 +118,54 @@ class Trainer:
         # AMP
         self.use_amp = use_amp and device == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
+
+    def _build_param_groups(self):
+        backbone_params = []
+        other_params = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            if name.startswith('backbone.'):
+                backbone_params.append(param)
+            else:
+                other_params.append(param)
+
+        groups = []
+        if other_params:
+            groups.append({
+                'params': other_params,
+                'name': 'other',
+                'lr_mult': 1.0,
+            })
+        if backbone_params:
+            lr_mult = self.backbone_lr_mult
+            if self.backbone_lr is not None:
+                lr_mult = self.backbone_lr / max(self.base_lr, 1e-12)
+            groups.append({
+                'params': backbone_params,
+                'name': 'backbone',
+                'lr_mult': float(lr_mult),
+            })
+
+        if not groups:
+            raise ValueError("No trainable parameters found for optimizer")
+        return groups
+
+    def _configured_backbone_lr_mult(self):
+        if self.backbone_lr is not None:
+            return self.backbone_lr / max(self.base_lr, 1e-12)
+        return self.backbone_lr_mult
+
+    def _apply_configured_lr_groups(self):
+        for idx, group in enumerate(self.optimizer.param_groups):
+            name = group.get('name')
+            if name is None and len(self.optimizer.param_groups) == 2:
+                name = 'other' if idx == 0 else 'backbone'
+                group['name'] = name
+            if name == 'backbone':
+                group['lr_mult'] = float(self._configured_backbone_lr_mult())
+            elif name == 'other':
+                group['lr_mult'] = 1.0
 
     @staticmethod
     def _should_log_loss_key(key):
@@ -238,7 +290,7 @@ class Trainer:
 
     def _set_lr(self, lr):
         for pg in self.optimizer.param_groups:
-            pg['lr'] = lr
+            pg['lr'] = lr * float(pg.get('lr_mult', 1.0))
 
     def _is_improved(self, current):
         if self.save_best_by == 'loss':
@@ -291,8 +343,10 @@ class Trainer:
         self.model.train()
 
         # Set mosaic mode
-        if hasattr(loader.dataset, 'use_mosaic'):
-            if close_mosaic is not None:
+        if close_mosaic is not None:
+            if hasattr(loader.dataset, 'set_close_mosaic'):
+                loader.dataset.set_close_mosaic(close_mosaic)
+            elif hasattr(loader.dataset, 'use_mosaic'):
                 loader.dataset.use_mosaic = not close_mosaic
 
         metrics = {}
@@ -429,6 +483,14 @@ class Trainer:
             'global_step': self.global_step,
             'model_state_dict': self.model.state_dict(),
             'optimizer_state_dict': self.optimizer.state_dict(),
+            'lr_groups': [
+                {
+                    'name': group.get('name', f'group{i}'),
+                    'lr_mult': float(group.get('lr_mult', 1.0)),
+                    'params': sum(p.numel() for p in group['params']),
+                }
+                for i, group in enumerate(self.optimizer.param_groups)
+            ],
             'metrics': metrics,
         }
         if self.scaler:
@@ -443,7 +505,14 @@ class Trainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model_state_dict'])
         if 'optimizer_state_dict' in ckpt:
-            self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            try:
+                self.optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+                self._apply_configured_lr_groups()
+            except ValueError as exc:
+                print(
+                    "  WARNING: optimizer state was not loaded "
+                    f"({exc}). Model weights were loaded; optimizer was rebuilt."
+                )
         if self.scaler and 'scaler_state_dict' in ckpt:
             self.scaler.load_state_dict(ckpt['scaler_state_dict'])
         if self.ema_enabled and 'ema_state' in ckpt:
@@ -473,6 +542,13 @@ class Trainer:
               f"Device: {self.device} | Base LR: {self.base_lr}")
         print(f"Optimizer: {self.optimizer_name} | AMP: {self.use_amp} | EMA: {self.ema_enabled} "
               f"(decay={self.ema_decay})")
+        group_parts = []
+        for group in self.optimizer.param_groups:
+            n_params = sum(p.numel() for p in group['params'])
+            group_parts.append(
+                f"{group.get('name', 'group')}: lr_mult={float(group.get('lr_mult', 1.0)):.4g} "
+                f"params={n_params / 1e6:.2f}M")
+        print("LR groups: " + " | ".join(group_parts))
         print(f"Save dir: {self.save_dir}")
         print(f"{'='*60}")
 
