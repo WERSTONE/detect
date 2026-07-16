@@ -748,6 +748,23 @@ def main():
         if stage_cfg.get('freeze_backbone', False):
             for p in model.backbone.parameters():
                 p.requires_grad = False
+        elif stage_cfg.get('trainable_backbone_layers') is not None:
+            trainable_layers = stage_cfg.get('trainable_backbone_layers') or []
+            if isinstance(trainable_layers, str):
+                trainable_layers = [trainable_layers]
+            for p in model.backbone.parameters():
+                p.requires_grad = False
+            for layer_name in trainable_layers:
+                module = getattr(model.backbone, str(layer_name), None)
+                if module is None:
+                    raise ValueError(
+                        f"Unknown backbone layer '{layer_name}' in stage "
+                        f"'{stage_cfg.get('name', 'unnamed')}'. "
+                        f"Available examples: stem, stage3, stage4, "
+                        f"stage5_down, stage5_c2f, stage5_sppf."
+                    )
+                for p in module.parameters():
+                    p.requires_grad = True
         if stage_cfg.get('freeze_neck', False):
             for module_name in ('neck', 'det_neck', 'pose_neck'):
                 module = getattr(model, module_name, None)
@@ -819,6 +836,7 @@ def main():
                 f"  train_det={getattr(model, 'train_det', True)} "
                 f"train_pose={getattr(model, 'train_pose', True)} "
                 f"freeze_backbone={stage_cfg.get('freeze_backbone', False)} "
+                f"trainable_backbone_layers={stage_cfg.get('trainable_backbone_layers', 'all')} "
                 f"person_only={person_only} "
                 f"dynamic={stage_cfg.get('use_dynamic_weights', False)} "
                 f"grad_proj={stage_cfg.get('use_gradient_projection', gradient_projection_cfg.get('enabled', False))}"
@@ -848,6 +866,18 @@ def main():
                 score_loader=score_loader,
                 score_eval_kwargs=score_eval_kwargs,
             )
+
+            if stage_index < len(stages) and stage_cfg.get('load_best_for_next_stage', True):
+                stage_save_dir = Path(opts['save_dir']) / (
+                    model_name if stage_index == len(stages) else f"{model_name}_{stage_name}")
+                stage_save_prefix = (
+                    model_name if stage_index == len(stages) else f"{model_name}_{stage_name}")
+                best_ckpt = stage_save_dir / f"{stage_save_prefix}_best.pt"
+                if best_ckpt.exists():
+                    _load_model_weights_for_staged_resume(model, best_ckpt, device=device)
+                    print(f"[Stage handoff] Loaded best checkpoint for next stage: {best_ckpt}")
+                else:
+                    print(f"[Stage handoff] Best checkpoint not found, keeping last weights: {best_ckpt}")
 
             if hasattr(train_loader_stage, '_iterator') and train_loader_stage._iterator is not None:
                 train_loader_stage._iterator._shutdown_workers()

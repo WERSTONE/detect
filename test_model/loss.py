@@ -274,10 +274,12 @@ class MultiTaskLoss(nn.Module):
 
                     # OKS-based keypoint loss
                     area = ((p_boxes[:, 2] - p_boxes[:, 0]) *
-                            (p_boxes[:, 3] - p_boxes[:, 1])).clamp(min=1).sqrt()
+                            (p_boxes[:, 3] - p_boxes[:, 1])).clamp(min=1)
+                    scale = area.sqrt()
                     sigmas = self.sigmas.view(1, 17).to(device)
                     d2 = (pk_xy - gk_xy).pow(2).sum(dim=-1)
-                    k2 = sigmas.pow(2) * area.pow(2).unsqueeze(-1) + 1e-8
+                    # Match the OKS scale used by evaluation: (2 * sqrt(area))^2.
+                    k2 = sigmas.pow(2) * (2 * scale).pow(2).unsqueeze(-1) + 1e-8
                     oks = (d2 / (-2 * k2)).exp()
                     visible = gk_vis
                     per_sample_oks = (oks * visible).sum(dim=1) / visible.sum(dim=1).clamp(min=1)

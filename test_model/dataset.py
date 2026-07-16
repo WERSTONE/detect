@@ -184,9 +184,8 @@ class COCOMultiTaskDataset(Dataset):
         if not self.samples:
             raise RuntimeError(f"No samples found in {data_dir} / {img_dir}")
 
-        # Normalization stats (ImageNet)
-        self.mean = np.array([0.485, 0.456, 0.406], dtype=np.float32)
-        self.std = np.array([0.229, 0.224, 0.225], dtype=np.float32)
+        # YOLOv8 pretrained backbones are trained on images scaled to [0, 1],
+        # without ImageNet mean/std normalization.
 
     def __len__(self):
         return len(self.samples)
@@ -215,9 +214,8 @@ class COCOMultiTaskDataset(Dataset):
         img, boxes, kpts, (pad_l, pad_t), scale = self._letterbox(img, boxes, kpts)
         boxes, classes, kpts = self._sanitize_targets(boxes, classes, kpts)
 
-        # Normalize
+        # Normalize to YOLO-style [0, 1] tensors.
         img = img.astype(np.float32) / 255.0
-        img = (img - self.mean) / self.std
         img = torch.from_numpy(img).permute(2, 0, 1)
 
         boxes = torch.tensor(boxes, dtype=torch.float32) if boxes else torch.zeros(0, 4)
@@ -329,9 +327,8 @@ class COCOMultiTaskDataset(Dataset):
         mosaic_boxes, mosaic_classes, mosaic_kpts = self._sanitize_targets(
             mosaic_boxes, mosaic_classes, mosaic_kpts)
 
-        # Normalize
+        # Normalize to YOLO-style [0, 1] tensors.
         mosaic_img = mosaic_img.astype(np.float32) / 255.0
-        mosaic_img = (mosaic_img - self.mean) / self.std
         mosaic_img = torch.from_numpy(mosaic_img).permute(2, 0, 1)
 
         boxes_t = torch.tensor(mosaic_boxes, dtype=torch.float32) if mosaic_boxes else torch.zeros(0, 4)

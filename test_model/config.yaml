@@ -62,7 +62,7 @@ training:
   # Validation & checkpoint
   val_interval: 1          # validate every N epochs
   save_interval: 20        # save intermediate checkpoint every N epochs
-  save_best_by: loss       # loss | joint_mAP50_95 | mean_mAP50_95 | mAP@0.5:0.95 | AP_pose@0.5:0.95
+  save_best_by: mean_mAP50_95  # loss | joint_mAP50_95 | mean_mAP50_95 | mAP@0.5:0.95 | AP_pose@0.5:0.95
   # Saved as checkpoints/<model_name>/ inside the project directory.
   save_dir: checkpoints/re
 
@@ -74,8 +74,8 @@ training:
   close_mosaic_epochs: 20  # disable mosaic for last N epochs
   no_mosaic: false         # completely disable mosaic
 
-  # Early stopping follows save_best_by. The default best checkpoint is
-  # selected by validation loss; AP is only used when save_best_by is changed.
+  # Early stopping follows save_best_by. The current default selects the best
+  # checkpoint by AP, not validation loss.
   early_stop:
     enabled: true
     patience: 10
@@ -85,14 +85,14 @@ training:
   # Optional AP validation. It is skipped when save_best_by: loss.
   score_validation:
     interval: 1
-    max_samples: 1200
+    max_samples: 0        # 0 = full validation set for AP-based checkpointing
     det_metric: "mAP@0.5:0.95"
     pose_metric: "AP_pose@0.5:0.95"
 
   # Dynamic task weights at the task level.
   # Sub-loss weights stay in the loss section below.
   dynamic_weights:
-    enabled: true
+    enabled: false
     method: uncertainty    # uncertainty | dwa
     temperature: 2.0
     det_min: 0.2
@@ -106,7 +106,7 @@ training:
   # conflicting task gradients are projected before optimizer.step().
   # Recommended for joint stages only; keep off for single-task warmups.
   gradient_projection:
-    enabled: true
+    enabled: false
     method: pcgrad
     eps: 1.0e-12
 
@@ -128,6 +128,7 @@ training:
         pose_weight: 0.0
         use_dynamic_weights: false
         use_gradient_projection: false
+        load_best_for_next_stage: true
         close_mosaic_epochs: 0
 
       - name: frozen_pose_warmup
@@ -141,6 +142,7 @@ training:
         pose_weight: 1.5
         use_dynamic_weights: false
         use_gradient_projection: false
+        load_best_for_next_stage: true
         close_mosaic_epochs: 10
 
       - name: unfrozen_joint_tune
@@ -152,8 +154,8 @@ training:
         freeze_backbone: false
         det_weight: 1.0
         pose_weight: 1.2
-        use_dynamic_weights: true
-        use_gradient_projection: true
+        use_dynamic_weights: false
+        use_gradient_projection: false
         close_mosaic_epochs: 20
 
   # Two-stage training (dual-head models only; keep disabled for the 80-class setup)

@@ -29,13 +29,15 @@ training:
   batch_size: 32
   workers: 14
 
-  # Aligned with the official YOLOv8m COCO recipe where possible.
-  optimizer: sgd
-  lr0: 0.01
+  # AdamW is used for the custom BiFPN/head adaptation. The stage LR values
+  # below are intentionally lower than the official from-scratch YOLO recipe
+  # because the YOLOv8m backbone is pretrained.
+  optimizer: adamw
+  lr0: 0.002
   lrf: 0.01
   momentum: 0.937
   weight_decay: 0.001
-  nesterov: true
+  nesterov: false
 
   warmup_epochs: 3
   cos_lr: false
@@ -45,7 +47,7 @@ training:
 
   val_interval: 1
   save_interval: 20
-  save_best_by: loss
+  save_best_by: "mAP@0.5:0.95"
   save_dir: checkpoints/single_bifpn_det
   tensorboard: true
   log_interval: 50
@@ -55,9 +57,9 @@ training:
 
   early_stop:
     enabled: true
-    patience: 10
-    min_delta: 0.002
-    start_epoch: 170
+    patience: 15
+    min_delta: 0.001
+    start_epoch: 80
 
   score_validation:
     interval: 1
@@ -77,8 +79,8 @@ training:
     enabled: true
     stages:
       - name: frozen_det_head_warmup
-        epochs: 30
-        lr0: 0.01
+        epochs: 25
+        lr0: 0.002
         person_only: false
         train_det: true
         train_pose: false
@@ -89,13 +91,18 @@ training:
         use_gradient_projection: false
         close_mosaic_epochs: 0
 
-      - name: unfrozen_det_finetune
-        epochs: 170
-        lr0: 0.003
+      - name: partial_backbone_det_finetune
+        epochs: 175
+        lr0: 0.0004
         person_only: false
         train_det: true
         train_pose: false
         freeze_backbone: false
+        trainable_backbone_layers:
+          - stage4
+          - stage5_down
+          - stage5_c2f
+          - stage5_sppf
         det_weight: 1.0
         pose_weight: 0.0
         use_dynamic_weights: false
