@@ -1,5 +1,5 @@
 #!/usr/bin/env python
-"""Evaluate custom test_model checkpoints with official pycocotools COCOeval.
+"""Evaluate model checkpoints with official pycocotools COCOeval.
 
 This script exports model predictions to COCO result JSON files in original
 image coordinates, then runs COCOeval for bbox and/or keypoints.
@@ -33,7 +33,9 @@ COCO20_TO_CATEGORY_ID = {v: k for k, v in COCO_CATEGORY_ID_TO_20.items()}
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="Run official COCOeval on a custom test_model checkpoint")
+        description="Run official COCOeval on custom or Ultralytics checkpoints")
+    p.add_argument("--provider", type=str, default="test_model",
+                   choices=["test_model", "ultralytics_detect", "ultralytics_pose"])
     p.add_argument("--config", type=str, default=str(PROJECT_ROOT / "test_model/config.yaml"))
     p.add_argument("--weights", type=str, required=True)
     p.add_argument("--model", type=str, default=None,
@@ -90,6 +92,19 @@ def build_model(args, cfg, device):
     model.to(device).eval()
     print(f"Loaded checkpoint: {args.weights}")
     print(f"Model: {model_name} | params={model.num_params / 1e6:.2f}M")
+    return model
+
+
+def build_ultralytics_model(args):
+    try:
+        from ultralytics import YOLO
+    except ImportError as exc:
+        raise SystemExit(
+            "ultralytics is required for --provider ultralytics_detect/ultralytics_pose. "
+            "Install it with: pip install ultralytics"
+        ) from exc
+    model = YOLO(args.weights)
+    print(f"Loaded Ultralytics checkpoint: {args.weights}")
     return model
 
 
@@ -222,6 +237,82 @@ def export_predictions(model, loader, device, num_classes, keep_classes,
     return bbox_results, kpt_results, sorted(set(image_ids))
 
 
+def export_ultralytics_predictions(yolo_model, loader, device, input_size,
+                                   score_thresh, iou_thresh, max_det,
+                                   provider="ultralytics_detect"):
+    bbox_results = []
+    kpt_results = []
+    image_ids = []
+
+    for batch_idx, batch in enumerate(loader):
+        results = yolo_model.predict(
+            source=batch["img_path"],
+            imgsz=input_size,
+            conf=score_thresh,
+            iou=iou_thresh,
+            max_det=max_det,
+            device=device,
+            verbose=False,
+        )
+
+        for i, result in enumerate(results):
+            image_id = batch["image_id"][i]
+            if image_id is None:
+                img_path = batch["img_path"][i]
+                raise ValueError(f"Cannot infer COCO image_id from image path: {img_path}")
+            image_id = int(image_id)
+            image_ids.append(image_id)
+
+            if result.boxes is None or len(result.boxes) == 0:
+                continue
+
+            boxes = result.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+            scores = result.boxes.conf.detach().cpu().numpy().astype(np.float32)
+            classes = result.boxes.cls.detach().cpu().numpy().astype(np.int32)
+            for box, score, cls_id in zip(boxes, scores, classes):
+                x1, y1, x2, y2 = box.tolist()
+                w = max(0.0, x2 - x1)
+                h = max(0.0, y2 - y1)
+                if w <= 0.0 or h <= 0.0:
+                    continue
+                category_id = COCO80_TO_CATEGORY_ID.get(int(cls_id))
+                if category_id is None:
+                    continue
+                bbox_results.append({
+                    "image_id": image_id,
+                    "category_id": int(category_id),
+                    "bbox": [float(x1), float(y1), float(w), float(h)],
+                    "score": float(score),
+                })
+
+            if provider == "ultralytics_pose":
+                person_mask = classes == 0
+                if result.keypoints is not None and len(result.keypoints) == len(boxes):
+                    kpt_xy = result.keypoints.xy.detach().cpu().numpy().astype(np.float32)
+                    if getattr(result.keypoints, "conf", None) is not None:
+                        kpt_conf = result.keypoints.conf.detach().cpu().numpy().astype(np.float32)
+                    else:
+                        kpt_conf = np.ones(kpt_xy.shape[:2], dtype=np.float32)
+                    kpts = np.concatenate([kpt_xy, kpt_conf[..., None]], axis=-1)
+                    for box, score, kpt in zip(boxes[person_mask], scores[person_mask], kpts[person_mask]):
+                        x1, y1, x2, y2 = box.tolist()
+                        if (x2 - x1) <= 0.0 or (y2 - y1) <= 0.0:
+                            continue
+                        if not np.any(kpt[:, 2] > 0):
+                            continue
+                        kpt_results.append({
+                            "image_id": image_id,
+                            "category_id": 1,
+                            "keypoints": kpt.reshape(-1).astype(float).tolist(),
+                            "score": float(score),
+                        })
+
+        if (batch_idx + 1) % 50 == 0:
+            print(f"Processed {(batch_idx + 1) * loader.batch_size} images...")
+
+    return bbox_results, kpt_results, sorted(set(image_ids))
+
+
 def empty_metrics(task_name):
     return {
         f"{task_name}/AP": 0.0,
@@ -282,7 +373,7 @@ def main():
     e_cfg = cfg.get("eval", {})
 
     device = args.device
-    if device == "cuda" and not torch.cuda.is_available():
+    if args.provider == "test_model" and device == "cuda" and not torch.cuda.is_available():
         print("CUDA not available, falling back to CPU")
         device = "cpu"
 
@@ -304,6 +395,9 @@ def main():
     keep_classes = d_cfg.get("keep_classes", None)
     if keep_classes is None and cfg.get("num_det_classes", 80) == 1:
         keep_classes = [0]
+    if args.provider.startswith("ultralytics"):
+        num_classes = 80
+        keep_classes = [0] if args.provider == "ultralytics_pose" else None
     if keep_classes is not None:
         keep_classes = [int(c) for c in keep_classes]
 
@@ -311,7 +405,8 @@ def main():
     output_dir.mkdir(parents=True, exist_ok=True)
     prefix = args.prefix or Path(args.weights).stem
 
-    model = build_model(args, cfg, device)
+    model = (build_model(args, cfg, device) if args.provider == "test_model"
+             else build_ultralytics_model(args))
     loader = create_dataloader(
         data_dir=data_root,
         img_dir=img_dir,
@@ -338,13 +433,21 @@ def main():
 
     print(
         f"COCOeval export samples={len(loader.dataset)} input_size={input_size} "
+        f"provider={args.provider} "
         f"score={score_thresh} nms_iou={iou_thresh} max_det={max_det} "
         f"coco_max_det={args.coco_max_det} keep_classes={keep_classes}"
     )
-    bbox_results, kpt_results, image_ids = export_predictions(
-        model, loader, device, num_classes, keep_classes,
-        score_thresh, iou_thresh, max_det,
-    )
+    if args.provider == "test_model":
+        bbox_results, kpt_results, image_ids = export_predictions(
+            model, loader, device, num_classes, keep_classes,
+            score_thresh, iou_thresh, max_det,
+        )
+    else:
+        bbox_results, kpt_results, image_ids = export_ultralytics_predictions(
+            model, loader, device, input_size,
+            score_thresh, iou_thresh, max_det,
+            provider=args.provider,
+        )
 
     bbox_json = output_dir / f"{prefix}_bbox_predictions.json"
     kpt_json = output_dir / f"{prefix}_keypoint_predictions.json"
