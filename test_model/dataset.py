@@ -243,6 +243,7 @@ class COCOMultiTaskDataset(Dataset):
         img = cv2.imread(img_path)
         if img is None:
             raise RuntimeError(f"Cannot read image: {img_path}")
+        orig_h, orig_w = img.shape[:2]
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
         boxes, classes, kpts = [], [], []
@@ -275,6 +276,8 @@ class COCOMultiTaskDataset(Dataset):
             'scale': scale,
             'pad': (pad_l, pad_t),
             'img_path': img_path,
+            'orig_shape': (orig_h, orig_w),
+            'image_id': self._image_id_from_path(img_path),
         }
 
     def _load_mosaic(self, idx):
@@ -391,7 +394,14 @@ class COCOMultiTaskDataset(Dataset):
             'scale': 1.0,
             'pad': (0, 0),
             'img_path': '',
+            'orig_shape': (self.input_size, self.input_size),
+            'image_id': None,
         }
+
+    @staticmethod
+    def _image_id_from_path(img_path):
+        stem = Path(img_path).stem
+        return int(stem) if stem.isdigit() else None
 
     def _parse_yolo_label(self, label_path, img_w, img_h):
         """Parse YOLO-format label file.
@@ -850,6 +860,8 @@ def collate_fn(batch):
         'scale': [x.get('scale', 1.0) for x in batch],
         'pad': [x.get('pad', (0, 0)) for x in batch],
         'img_path': [x.get('img_path', '') for x in batch],
+        'orig_shape': [x.get('orig_shape', None) for x in batch],
+        'image_id': [x.get('image_id', None) for x in batch],
     }
 
 
