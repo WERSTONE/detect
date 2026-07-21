@@ -1,17 +1,11 @@
-"""Detection and pose heads (decoupled, YOLOv8-style).
-
-Head types:
-    DetectHead: cls(80) + reg(4*reg_max) - full COCO detection
-    PoseHead:   kpt(17*3) branch used for person keypoints
-    UnifiedHead: cls(80) + reg(4*reg_max) + kpt(17*3) - all-in-one
-"""
+﻿"""Detection and pose heads for the BiFPN model."""
 
 import math
 
 import torch
 import torch.nn as nn
 
-from test_model.common import Conv
+from test_model.model.common import Conv
 
 CLS_PRIOR_PROB = 0.01
 CLS_BIAS_INIT = math.log(CLS_PRIOR_PROB / (1 - CLS_PRIOR_PROB))
@@ -70,13 +64,67 @@ class DetectHead(nn.Module):
         return outs
 
 
+class YOLOLikeDetectHead(nn.Module):
+    """YOLOv8-style per-level detection head.
+
+    This follows the head layout used by the local yolov8m.pt checkpoint:
+    each detection level owns separate box and class towers.
+    """
+
+    def __init__(self, channels, num_classes=80, reg_max=16, strides=(8, 16, 32),
+                 img_size=640):
+        super().__init__()
+        if isinstance(channels, int):
+            channels = [channels] * len(strides)
+        self.channels = list(channels)
+        self.num_classes = num_classes
+        self.reg_max = reg_max
+        self.strides = list(strides)
+        self.img_size = int(img_size)
+
+        c2 = max(16, self.channels[0] // 4, self.reg_max * 4)
+        c3 = max(self.channels[0], min(self.num_classes, 100))
+        self.reg_branches = nn.ModuleList(
+            nn.Sequential(
+                Conv(ch, c2, 3),
+                Conv(c2, c2, 3),
+                nn.Conv2d(c2, 4 * self.reg_max, 1),
+            )
+            for ch in self.channels
+        )
+        self.cls_branches = nn.ModuleList(
+            nn.Sequential(
+                Conv(ch, c3, 3),
+                Conv(c3, c3, 3),
+                nn.Conv2d(c3, self.num_classes, 1),
+            )
+            for ch in self.channels
+        )
+        self.bias_init()
+
+    def bias_init(self):
+        for reg_branch, cls_branch, stride in zip(
+                self.reg_branches, self.cls_branches, self.strides):
+            reg_branch[-1].bias.data[:] = 2.0
+            cls_branch[-1].bias.data[:self.num_classes] = math.log(
+                5 / self.num_classes / (self.img_size / stride) ** 2)
+
+    def forward(self, features):
+        outs = {'cls': [], 'reg': []}
+        for feat, reg_branch, cls_branch in zip(
+                features, self.reg_branches, self.cls_branches):
+            outs['reg'].append(reg_branch(feat))
+            outs['cls'].append(cls_branch(feat))
+        return outs
+
+
 class PoseHead(nn.Module):
     """Pose head with keypoint prediction for person detections.
 
     Output per grid cell:
-        cls: [B, 1, H, W]   — person classification logit
-        reg: [B, 4*reg_max, H, W] — DFL distribution
-        kpt: [B, 51, H, W]  — 17 keypoints × (dx, dy, vis)
+        cls: [B, 1, H, W] person classification logit
+        reg: [B, 4*reg_max, H, W] DFL distribution
+        kpt: [B, 51, H, W] 17 keypoints x (dx, dy, vis)
     """
 
     def __init__(self, in_ch, num_kpts=17, reg_max=16, tower_depth=2):
@@ -130,56 +178,4 @@ class PoseHead(nn.Module):
         return outs
 
 
-class UnifiedHead(nn.Module):
-    """Unified head: all COCO classes + person keypoints from one head.
 
-    Output per grid cell:
-        cls: [B, num_classes, H, W] logits (incl. person at index 0)
-        reg: [B, 4*reg_max, H, W] — DFL distribution
-        kpt: [B, 51, H, W]  — only valid for person class
-    """
-
-    def __init__(self, in_ch, num_classes=80, num_kpts=17, reg_max=16, tower_depth=2):
-        super().__init__()
-        self.num_classes = num_classes
-        self.num_kpts = num_kpts
-        self.reg_max = reg_max
-
-        self.cls_tower = _make_tower(in_ch, in_ch, tower_depth)
-        self.cls_pred = nn.Conv2d(in_ch, num_classes, 1)
-
-        self.reg_tower = _make_tower(in_ch, in_ch, tower_depth)
-        self.reg_pred = nn.Conv2d(in_ch, 4 * reg_max, 1)
-
-        kpt_mid = max(in_ch // 2, 64)
-        self.kpt_tower = _make_tower(in_ch, kpt_mid, tower_depth)
-        self.kpt_pred = nn.Conv2d(kpt_mid, num_kpts * 3, 1)
-
-        self._init_weights()
-
-    def _init_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d) and m not in (self.cls_pred, self.reg_pred, self.kpt_pred):
-                nn.init.normal_(m.weight, 0, 0.01)
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-        nn.init.normal_(self.cls_pred.weight, 0, 0.01)
-        nn.init.constant_(self.cls_pred.bias, CLS_BIAS_INIT)
-        nn.init.normal_(self.reg_pred.weight, 0, 0.01)
-        nn.init.normal_(self.kpt_pred.weight, 0, 0.001)
-        nn.init.constant_(self.kpt_pred.bias, 0)
-        reg_bias = torch.zeros(4 * self.reg_max)
-        for e in range(4):
-            reg_bias[e * self.reg_max:(e + 1) * self.reg_max] = torch.linspace(1.0, -1.0, self.reg_max)
-        self.reg_pred.bias.data.copy_(reg_bias)
-
-    def forward(self, features):
-        outs = {'cls': [], 'reg': [], 'kpt': []}
-        for f in features:
-            cls_feat = self.cls_tower(f)
-            reg_feat = self.reg_tower(f)
-            kpt_feat = self.kpt_tower(f)
-            outs['cls'].append(self.cls_pred(cls_feat))
-            outs['reg'].append(self.reg_pred(reg_feat))
-            outs['kpt'].append(self.kpt_pred(kpt_feat))
-        return outs

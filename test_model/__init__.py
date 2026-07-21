@@ -1,1 +1,1 @@
-# test_model: YOLOv8 multi-head verification suite
+﻿"""BiFPN detector-pose training package."""

@@ -1,4 +1,4 @@
-"""YOLOv8 CSPDarkNet backbone (m: depth=0.67, width=0.75, max_ch=768).
+﻿"""YOLOv8 CSPDarkNet backbone (m: depth=0.67, width=0.75, max_ch=768).
 
 Matches the official YOLOv8 architecture precisely:
   P1: Conv(3, 64, s=2) -> Conv(64, 128, s=2) -> C2f(128, 128, n=3)  [P2, /4]
@@ -11,7 +11,7 @@ Scaled by width=0.75, depth=0.67 for m variant.
 
 import torch.nn as nn
 
-from test_model.common import C2f, Conv, SPPF, ECA, make_divisible
+from test_model.model.common import C2f, Conv, SPPF, ECA, make_divisible
 
 
 class CSPDarkNet(nn.Module):
@@ -85,3 +85,4 @@ class CSPDarkNet(nn.Module):
             p5 = self.eca_p5(p5)
 
         return p2, p3, p4, p5
+

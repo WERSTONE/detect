@@ -1,12 +1,12 @@
-# Multi-Head Verification Training Config
+﻿# Multi-Head Verification Training Config
 # All training parameters can be adjusted here.
 #
 # Usage:
-#   uv run python test_model/scripts/run_train.py --config test_model/config.yaml
-#   uv run python test_model/scripts/run_train.py --config test_model/config.yaml --model dual_head --epochs 100
+#   uv run python -m test_model.main --config test_model/config/bifpn_dual.yaml
+#   uv run python -m test_model.main --config test_model/config/bifpn_dual.yaml --model bifpn_dual --epochs 100
 
 # ---- Model ----
-model: bifpn_dual        # dual_head | unified_head | dual_neck | attn_dual | bifpn_dual
+model: bifpn_dual
 num_classes: 80         # total COCO classes (including person)
 num_det_classes: 80     # detection head predicts all COCO classes, including person
 num_kpts: 17            # COCO keypoints
@@ -69,7 +69,7 @@ training:
   # Validation & checkpoint
   val_interval: 1          # validate every N epochs
   save_interval: 20        # save intermediate checkpoint every N epochs
-  save_best_by: mean_mAP50_95  # loss | joint_mAP50_95 | mean_mAP50_95 | mAP@0.5:0.95 | AP_pose@0.5:0.95
+  save_best_by: loss
   # Saved as checkpoints/<model_name>/ inside the project directory.
   save_dir: checkpoints/re
 
@@ -81,20 +81,13 @@ training:
   close_mosaic_epochs: 20
   no_mosaic: false         # completely disable mosaic
 
-  # Early stopping follows save_best_by. The current default selects the best
-  # checkpoint by AP, not validation loss.
+  # Early stopping follows validation loss. COCOeval is run only after the
+  # final training stage finishes.
   early_stop:
     enabled: true
     patience: 10
     min_delta: 0.002
     start_epoch: 80
-
-  # Optional AP validation. It is skipped when save_best_by: loss.
-  score_validation:
-    interval: 1
-    max_samples: 0        # 0 = full validation set for AP-based checkpointing
-    det_metric: "mAP@0.5:0.95"
-    pose_metric: "AP_pose@0.5:0.95"
 
   # Dynamic task weights at the task level.
   # Sub-loss weights stay in the loss section below.
@@ -166,21 +159,6 @@ training:
         use_gradient_projection: false
         close_mosaic_epochs: 20
 
-  # Two-stage training (dual-head models only; keep disabled for the 80-class setup)
-  # Stage 1: train pose head only → Stage 2: train both heads
-  two_stage:
-    enabled: false
-
-    stage1:
-      epochs: 50                # stage 1 epochs
-      lr0: 0.005                # stage 1 learning rate
-      freeze_backbone: false    # freeze backbone in stage 1
-
-    stage2:
-      epochs: 150               # stage 2 epochs (count from 0)
-      lr0: 0.002                # stage 2 learning rate (usually lower)
-      det_weight_warmup_epochs: 5  # linearly increase det loss from 0→1 over N epochs
-
 # ---- Loss Weights ----
 loss:
   w_box: 7.5               # CIoU box loss
@@ -209,12 +187,18 @@ augmentation:
   copy_paste_ioa: 0.3
   copy_paste_max_objects: 8
 
+# ---- Validation ----
+validation:
+  backend: cocoeval
+  task: both
+  final_eval:
+    enabled: true
+    max_samples: 0        # 0 = full validation set
+    det_metric: bbox/AP
+    pose_metric: keypoints/AP
+
 # ---- Evaluation ----
 eval:
-  auto_after_train: true   # automatically evaluate after training
-  checkpoints:             # which checkpoints to evaluate
-    - last
-    - best
   score_thresh: 0.01       # NMS score threshold
   iou_thresh: 0.6          # NMS IoU threshold
   max_det: 300             # max detections per image, aligned with YOLO/COCO eval
@@ -226,3 +210,9 @@ gpu_id: 0                  # GPU index
 
 # ---- Debug ----
 debug: false               # quick smoke test (3 epochs, no val)
+
+
+
+
+
+

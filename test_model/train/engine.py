@@ -1,9 +1,9 @@
-"""Training entry point for multi-head verification.
+﻿"""Training engine for the BiFPN detector-pose model.
 
 Usage:
-    python -m test_model.train --model dual_head --data /data/coco2017
-    python -m test_model.train --config test_model/config.yaml
-    python -m test_model.train --config test_model/config.yaml --model dual_head --epochs 100
+    python -m test_model.main --config test_model/config/bifpn_dual.yaml
+    python -m test_model.main --config test_model/config/bifpn_det_only.yaml
+    python -m test_model.main --config test_model/config/bifpn_pose_only.yaml
 """
 
 import argparse
@@ -17,12 +17,12 @@ import torch
 import yaml
 from torch.utils.data import DataLoader, Subset
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from test_model.models import create_model
-from test_model.dataset import create_dataloader, collate_fn
-from test_model.trainer import Trainer
+from test_model.model import create_model
+from test_model.train.dataset import create_dataloader, collate_fn
+from test_model.train.trainer import Trainer
 
 OFFICIAL_BACKBONE_PREFIX_MAP = {
     'model.0': 'stem.0',
@@ -46,12 +46,28 @@ YOLOV8_SCALE_BY_OUT_CHANNELS = {
 }
 
 
+def _normalize_device(device, gpu_id=0):
+    device = str(device or 'cuda').strip()
+    if device.isdigit():
+        device = f'cuda:{device}'
+    if device == 'cuda' and torch.cuda.is_available() and torch.cuda.device_count() > 1:
+        device = f'cuda:{int(gpu_id) % torch.cuda.device_count()}'
+    if device.startswith('cuda') and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        return 'cpu'
+    return device
+
+
+def _is_cuda_device(device):
+    return torch.device(device).type == 'cuda'
+
+
 def parse_args():
     p = argparse.ArgumentParser(description='Train multi-head verification model')
     p.add_argument('--config', type=str, default=None,
                    help='Path to YAML config file')
     p.add_argument('--model', type=str, default=None,
-                   choices=['dual_head', 'unified_head', 'dual_neck', 'attn_dual', 'bifpn_dual'],
+                   choices=['bifpn', 'bifpn_dual', 'bifpn_detect', 'bifpn_det'],
                    help='Model variant (overrides config)')
     p.add_argument('--data', type=str, default=None,
                    help='Dataset root directory (overrides config)')
@@ -94,7 +110,7 @@ def load_config(args):
                 return section[name]
         return default
 
-    model_name = args.model or cfg.get('model', 'dual_head')
+    model_name = args.model or cfg.get('model', 'bifpn_dual')
     data_root = args.data or cfg.get('data', {}).get('root', '/data/coco2017')
     epochs = _get('epochs', 300, 'training')
     batch = _get('batch', 16, 'training', aliases=('batch_size',))
@@ -434,17 +450,15 @@ def main():
     d_cfg = cfg.get('data', {})
 
     # Device setup
-    device = opts['device']
-    if device == 'cuda' and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
-        device = 'cpu'
+    device = _normalize_device(opts['device'], cfg.get('gpu_id', 0))
 
-    if device == 'cuda':
+    if _is_cuda_device(device):
         torch.backends.cudnn.benchmark = True
         torch.backends.cudnn.deterministic = False
         torch.set_num_threads(1)  # Limit main-process CPU threads
-        gpu_id = cfg.get('gpu_id', 0)
-        if torch.cuda.device_count() > 1:
+        device_index = torch.device(device).index
+        gpu_id = cfg.get('gpu_id', 0) if device_index is None else device_index
+        if torch.cuda.device_count() > 0:
             torch.cuda.set_device(gpu_id % torch.cuda.device_count())
         print(f"GPU {gpu_id}: cudnn.benchmark=True")
 
@@ -452,13 +466,27 @@ def main():
     model_name = opts['model']
     print(f"Creating model: {model_name}")
     model_kwargs = {
-        'num_kpts': cfg.get('num_kpts', 17),
         'reg_max': cfg.get('reg_max', 16),
     }
-    if model_name == 'unified_head':
-        model_kwargs['num_classes'] = cfg.get('num_classes', 80)
+    if model_name in ('bifpn_detect', 'bifpn_det'):
+        neck_cfg = cfg.get('neck', {}) or {}
+        assigner_cfg = cfg.get('assigner', {}) or {}
+        model_kwargs.update({
+            'num_det_classes': cfg.get('num_det_classes', cfg.get('num_classes', 80)),
+            'input_size': d_cfg.get('input_size', 640),
+            'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+            'neck_downsample': neck_cfg.get('downsample', 'conv'),
+            'neck_out_channels': neck_cfg.get('out_channels', None),
+            'assigner_topk': assigner_cfg.get('topk', 10),
+            'assigner_alpha': assigner_cfg.get('alpha', 0.5),
+            'assigner_beta': assigner_cfg.get('beta', 6.0),
+            'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
+        })
     else:
-        model_kwargs['num_det_classes'] = cfg.get('num_det_classes', 80)
+        model_kwargs.update({
+            'num_kpts': cfg.get('num_kpts', 17),
+            'num_det_classes': cfg.get('num_det_classes', 80),
+        })
 
     model = create_model(model_name, **model_kwargs)
     print(f"Parameters: {model.num_params / 1e6:.2f}M")
@@ -510,9 +538,13 @@ def main():
     )
     print(f"Val: {len(val_loader.dataset)} samples")
 
-    score_cfg = t_cfg.get('score_validation', {})
+    validation_cfg = cfg.get('validation', {})
+    score_cfg = validation_cfg.get('final_eval', {})
+    if not isinstance(score_cfg, dict):
+        score_cfg = {'enabled': bool(score_cfg)}
+    final_eval_enabled = bool(score_cfg.get('enabled', validation_cfg.get('backend') == 'cocoeval'))
     score_loader = None
-    if t_cfg.get('save_best_by', 'loss') != 'loss':
+    if final_eval_enabled:
         score_loader = val_loader
         score_samples = int(score_cfg.get('max_samples', 0) or 0)
         if score_samples > 0 and score_samples < len(val_loader.dataset):
@@ -522,17 +554,23 @@ def main():
                 shuffle=False,
                 num_workers=opts['workers'],
                 collate_fn=collate_fn,
-                pin_memory=(device == 'cuda'),
+                pin_memory=_is_cuda_device(device),
             )
-            print(f"AP validation: first {score_samples} val samples")
+            print(f"Final COCOeval: first {score_samples} val samples")
         else:
-            print("AP validation: full val set")
+            print("Final COCOeval: full val set")
 
     score_eval_kwargs = {
         'score_thresh': cfg.get('eval', {}).get('score_thresh', 0.01),
         'iou_thresh': cfg.get('eval', {}).get('iou_thresh', 0.6),
         'max_det': cfg.get('eval', {}).get('max_det', 300),
         'num_classes': cfg.get('num_classes', 80),
+        'keep_classes': keep_classes,
+        'data_root': data_root,
+        'task': validation_cfg.get('task', 'both'),
+        'instances_json': validation_cfg.get('instances_json', None),
+        'keypoints_json': validation_cfg.get('keypoints_json', None),
+        'coco_max_det': cfg.get('eval', {}).get('coco_max_det', 100),
     }
 
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
@@ -566,14 +604,22 @@ def main():
             final_lr_ratio=t_cfg.get('lrf', 0.01),
             backbone_lr=backbone_lr,
             backbone_lr_mult=backbone_lr_mult,
+            param_groups=t_cfg.get('param_groups', 'basic'),
+            batch_size=opts['batch'],
+            nbs=t_cfg.get('nbs', 64),
+            accumulate=t_cfg.get('accumulate', 'auto'),
+            scale_weight_decay=t_cfg.get('scale_weight_decay', False),
             cos_lr=t_cfg.get('cos_lr', True),
             warmup_epochs=t_cfg.get('warmup_epochs', 3),
+            warmup_momentum=t_cfg.get('warmup_momentum', 0.8),
+            warmup_bias_lr=t_cfg.get('warmup_bias_lr', 0.1),
+            yolo_warmup=t_cfg.get('yolo_warmup', False),
             grad_clip=t_cfg.get('grad_clip', 10.0),
             log_interval=t_cfg.get('log_interval', 20 if not opts['debug'] else 1),
             save_interval=t_cfg.get('save_interval', 50),
             val_interval=t_cfg.get('val_interval', 5),
             save_dir=str(save_path),
-            use_amp=(not opts['no_amp']) and device == 'cuda',
+            use_amp=(not opts['no_amp']) and _is_cuda_device(device),
             ema_decay=t_cfg.get('ema_decay', 0.9999),
             save_best_by=t_cfg.get('save_best_by', 'loss'),
             use_tensorboard=t_cfg.get('tensorboard', True),
@@ -581,11 +627,11 @@ def main():
             early_stop_patience=t_cfg.get('early_stop', {}).get('patience', 0),
             early_stop_min_delta=t_cfg.get('early_stop', {}).get('min_delta', 0.0),
             early_stop_start_epoch=t_cfg.get('early_stop', {}).get('start_epoch', 0),
-            score_interval=score_cfg.get('interval', 1),
+            score_interval=1,
             score_det_baseline=score_cfg.get('det_baseline_mAP50_95', 1.0),
             score_pose_baseline=score_cfg.get('pose_baseline_mAP50_95', 1.0),
-            score_det_metric=score_cfg.get('det_metric', 'mAP@0.5:0.95'),
-            score_pose_metric=score_cfg.get('pose_metric', 'AP_pose@0.5:0.95'),
+            score_det_metric=score_cfg.get('det_metric', 'bbox/AP'),
+            score_pose_metric=score_cfg.get('pose_metric', 'keypoints/AP'),
             gradient_projection_enabled=use_gradient_projection,
             gradient_projection_eps=gradient_projection_cfg.get('eps', 1.0e-12),
         )
@@ -716,7 +762,7 @@ def main():
 
     def _release_cuda_cache():
         gc.collect()
-        if device == 'cuda':
+        if _is_cuda_device(device):
             torch.cuda.empty_cache()
 
     def _run_preflight(train_loader, val_loader_to_check=None, tag='train'):
@@ -731,7 +777,7 @@ def main():
             'kpts': batch['kpts'][i],
         } for i in range(len(images))]
         with torch.no_grad():
-            if (not opts['no_amp']) and device == 'cuda':
+            if (not opts['no_amp']) and _is_cuda_device(device):
                 with torch.amp.autocast('cuda'):
                     losses = model.compute_loss(images, gt_list)
             else:
@@ -761,8 +807,6 @@ def main():
             _release_cuda_cache()
 
     def _set_trainable_stage(stage_cfg):
-        if not is_dual_head:
-            return
         model.unfreeze_all()
         if hasattr(model, 'disable_pose_proposal_training'):
             model.disable_pose_proposal_training()
@@ -825,11 +869,9 @@ def main():
                 _apply_dynamic_weights(epoch)
         return _callback
 
-    # Two-stage training for dual-head models
-    two_stage = t_cfg.get('two_stage', {})
     staged_cfg = t_cfg.get('staged_training', {})
-    is_dual_head = model_name in ('dual_head', 'dual_neck', 'attn_dual', 'bifpn_dual')
-    if staged_cfg.get('enabled') and is_dual_head:
+    is_bifpn_model = model_name in ('bifpn', 'bifpn_dual')
+    if staged_cfg.get('enabled') and is_bifpn_model:
         stages = staged_cfg.get('stages', [])
         if not stages:
             raise ValueError("training.staged_training.enabled=true requires a non-empty stages list")
@@ -897,6 +939,7 @@ def main():
                 on_epoch_end=_record_task_losses,
                 score_loader=score_loader,
                 score_eval_kwargs=score_eval_kwargs,
+                final_score_eval=final_eval_enabled and stage_index == len(stages),
             )
 
             if stage_index < len(stages) and stage_cfg.get('load_best_for_next_stage', True):
@@ -920,92 +963,6 @@ def main():
             _release_cuda_cache()
 
         print(f"\nStaged training complete for {model_name}!")
-    elif two_stage.get('enabled') and is_dual_head:
-        s1 = two_stage['stage1']
-        s2 = two_stage['stage2']
-
-        # ---- Stage 1: pose head only (person-only data) ----
-        model.train_det = False
-        model.freeze_head('det')
-
-        train_loader_s1 = _make_train_loader(person_only=True)
-        print(f"Stage1 train (person-only): {len(train_loader_s1.dataset)} samples")
-
-        # Quick debug: test one batch
-        model.train()
-        dbg_batch = next(iter(train_loader_s1))
-        dbg_images = dbg_batch['image'].to(device, non_blocking=True)
-        dbg_gt = [{'boxes': dbg_batch['boxes'][i], 'classes': dbg_batch['classes'][i],
-                    'kpts': dbg_batch['kpts'][i]} for i in range(len(dbg_images))]
-        dbg_losses = model.compute_loss(dbg_images, dbg_gt)
-        print(f"  [DEBUG] test batch loss: " + " ".join(f"{k}={v:.4f}" for k, v in sorted(dbg_losses.items())))
-
-        s1_epochs = min(3, s1.get('epochs', 80)) if opts['debug'] else s1.get('epochs', 80)
-        s1_lr = s1.get('lr0', opts['lr'])
-        if s1.get('freeze_backbone', False):
-            for p in model.backbone.parameters():
-                p.requires_grad = False
-
-        print(f"\n{'='*60}")
-        print(f"Stage 1: pose head only | Epochs: {s1_epochs} | LR: {s1_lr}")
-        print(f"{'='*60}")
-        _run_preflight(train_loader_s1, val_loader, tag='stage1')
-
-        trainer1 = _make_trainer(s1_lr, save_dir_suffix='_stage1',
-                                 stage_cfg=s1)
-        trainer1.fit(
-            epochs=s1_epochs,
-            train_loader=train_loader_s1,
-            val_loader=val_loader,
-            save_prefix=model_name + '_stage1',
-            close_mosaic_epochs=close_mosaic,
-            on_epoch_start=_apply_dynamic_weights,
-            on_epoch_end=_record_task_losses,
-            score_loader=score_loader,
-            score_eval_kwargs=score_eval_kwargs,
-        )
-
-        # Release stage1 loader workers before creating full loader
-        if hasattr(train_loader_s1, '_iterator') and train_loader_s1._iterator is not None:
-            train_loader_s1._iterator._shutdown_workers()
-        del train_loader_s1
-
-        # ---- Stage 2: both heads (full data) ----
-        task_loss_history.clear()
-        model.train_det = True
-        model.det_weight_warmup_epochs = s2.get('det_weight_warmup_epochs', 5)
-        model.det_weight_mult = 0.0
-        model.unfreeze_all()
-
-        train_loader = _make_train_loader(person_only=False)
-        print(f"Stage2 train (full): {len(train_loader.dataset)} samples")
-
-        def _on_epoch_start(epoch):
-            model.update_det_weight(epoch)
-
-        s2_epochs = min(3, s2.get('epochs', 200)) if opts['debug'] else s2.get('epochs', 200)
-        s2_lr = s2.get('lr0', opts['lr'] * 0.4)
-
-        print(f"\n{'='*60}")
-        print(f"Stage 2: both heads | Epochs: {s2_epochs} | LR: {s2_lr}")
-        print(f"  det_weight warmup over {model.det_weight_warmup_epochs} epochs (0→1)")
-        print(f"{'='*60}")
-
-        _run_preflight(train_loader, val_loader, tag='stage2')
-        trainer2 = _make_trainer(s2_lr, stage_cfg=s2)
-        trainer2.fit(
-            epochs=s2_epochs,
-            train_loader=train_loader,
-            val_loader=val_loader,
-            save_prefix=model_name,
-            close_mosaic_epochs=close_mosaic,
-            on_epoch_start=_compose_epoch_callbacks(_on_epoch_start, _apply_dynamic_weights),
-            on_epoch_end=_record_task_losses,
-            score_loader=score_loader,
-            score_eval_kwargs=score_eval_kwargs,
-        )
-
-        print(f"\nTwo-stage training complete for {model_name}!")
     else:
         # Single-stage training (original flow)
         train_loader = _make_train_loader()
@@ -1028,6 +985,7 @@ def main():
             on_epoch_end=_record_task_losses,
             score_loader=score_loader,
             score_eval_kwargs=score_eval_kwargs,
+            final_score_eval=final_eval_enabled,
         )
 
         print(f"\nTraining complete for {model_name}!")
@@ -1035,3 +993,8 @@ def main():
 
 if __name__ == '__main__':
     main()
+
+
+
+
+

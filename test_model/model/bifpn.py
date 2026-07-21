@@ -1,28 +1,16 @@
-"""Five candidate multi-head YOLOv8m-based models.
-
-M-A: Standard dual-head   (backbone + FPN+PAN + DetectHead + PoseHead)
-M-B: Unified head         (backbone + FPN+PAN + UnifiedHead)
-M-C: Dual-neck dual-head  (backbone + DetNeck + PoseNeck + DetectHead + PoseHead)
-M-D: ECA backbone + dual-head  (backbone+ECA + FPN+PAN + DetectHead + PoseHead)
-M-E: BiFPN neck + dual-head    (backbone + BiFPN + DetectHead + PoseHead)
-
-Each model implements:
-- forward(): raw head outputs
-- compute_loss(images, gt_dict_list): training loss
-- predict_val(images): validation predictions for mAP computation
-"""
+﻿"""BiFPN dual-head model for COCO80 detection and COCO person pose."""
 
 import math
 
 import torch
 import torch.nn as nn
 
-from test_model.backbone import CSPDarkNet
-from test_model.neck import FPNPANNeck, BiFPN, DetNeck, PoseNeck
-from test_model.heads import DetectHead, PoseHead, UnifiedHead
-from test_model.assigner import TaskAlignedAssigner
-from test_model.common import Conv
-from test_model.loss import MultiTaskLoss
+from test_model.model.backbone import CSPDarkNet
+from test_model.model.neck import BiFPN
+from test_model.model.head import DetectHead, PoseHead
+from test_model.model.assigner import TaskAlignedAssigner
+from test_model.model.common import Conv
+from test_model.model.loss import MultiTaskLoss
 
 try:
     from torchvision.ops import batched_nms
@@ -30,7 +18,7 @@ except Exception:  # pragma: no cover - fallback for minimal environments
     batched_nms = None
 
 
-# ── DFL decode helpers ──
+# DFL decode helpers
 
 def _make_grid(nx, ny, device):
     yv, xv = torch.meshgrid(
@@ -109,9 +97,7 @@ def _batched_nms(boxes, scores, classes, iou_thresh=0.6, max_det=300):
     return keep
 
 
-# ═══════════════════════════════════════════════════════════════
 # Base model with shared training logic
-# ═══════════════════════════════════════════════════════════════
 
 class _BaseModel(nn.Module):
     """Common training and inference logic for all candidate models."""
@@ -259,12 +245,10 @@ class _BaseModel(nn.Module):
         return results
 
 
-# ═══════════════════════════════════════════════════════════════
-# Dual-head base (shared by M-A, M-C, M-D, M-E)
-# ═══════════════════════════════════════════════════════════════
+# Shared dual-task behavior for the BiFPN model.
 
 class _DualHeadModel(_BaseModel):
-    """Shared logic for all dual-head models."""
+    """Shared detection and pose behavior for the BiFPN model."""
 
     def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16):
         super().__init__(reg_max=reg_max)
@@ -287,11 +271,11 @@ class _DualHeadModel(_BaseModel):
         self.det_loss = MultiTaskLoss(
             w_box=7.5, w_cls=0.5, w_dfl=1.5,
             w_pose=0.0, w_kobj=0.0, reg_max=reg_max,
-            num_det_classes=num_det_classes, unified_head=False)
+            num_det_classes=num_det_classes)
         self.pose_loss = MultiTaskLoss(
             w_box=0.0, w_cls=0.0, w_dfl=0.0,
             w_pose=12.0, w_kobj=1.0, reg_max=reg_max,
-            num_det_classes=1, unified_head=False)
+            num_det_classes=1)
 
     def enable_uncertainty_weighting(self, enabled=True):
         self.use_uncertainty_weighting = bool(enabled)
@@ -336,7 +320,7 @@ class _DualHeadModel(_BaseModel):
             p.requires_grad = True
 
     def update_det_weight(self, epoch):
-        """Linear warmup: det_weight_mult 0→1 over det_weight_warmup_epochs."""
+        """Linear warmup: det_weight_mult from 0 to 1 over det_weight_warmup_epochs."""
         if self.det_weight_warmup_epochs <= 0:
             self.det_weight_mult = 1.0
         else:
@@ -529,177 +513,9 @@ class _DualHeadModel(_BaseModel):
         return loss_dict
 
 
-# ═══════════════════════════════════════════════════════════════
 # Individual models
-# ═══════════════════════════════════════════════════════════════
-
-class ModelA_DualHead(_DualHeadModel):
-    """M-A: Standard dual-head."""
-
-    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
-                 backbone_depth=0.67, backbone_width=0.75):
-        super().__init__(num_det_classes, num_kpts, reg_max)
-        self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
-        self.neck = FPNPANNeck(self.backbone.out_channels[1:],
-                               depth=backbone_depth, width=backbone_width)
-        ch = self.neck.out_channels
-        self.det_head = DetectHead(ch[0], num_classes=num_det_classes, reg_max=reg_max)
-        self.pose_head = PoseHead(ch[0], num_kpts=num_kpts, reg_max=reg_max)
-        self.disable_pose_proposal_training()
-
-    def _forward_head(self, x):
-        feats = self.backbone(x)
-        neck_feats = self.neck(feats[1:])
-        return self.det_head(neck_feats), self.pose_head(neck_feats)
-
-    def forward(self, x):
-        return self._forward_head(x)
-
-
-class ModelB_UnifiedHead(_BaseModel):
-    """M-B: Unified head."""
-
-    def __init__(self, num_classes=80, num_kpts=17, reg_max=16,
-                 backbone_depth=0.67, backbone_width=0.75):
-        super().__init__(reg_max=reg_max)
-        self.num_classes = num_classes
-        self.num_kpts = num_kpts
-
-        self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
-        self.neck = FPNPANNeck(self.backbone.out_channels[1:],
-                               depth=backbone_depth, width=backbone_width)
-        self.head = UnifiedHead(self.neck.out_channels[0],
-                                num_classes=num_classes, num_kpts=num_kpts, reg_max=reg_max)
-
-        self.loss_fn = MultiTaskLoss(
-            w_box=7.5, w_cls=0.5, w_dfl=1.5,
-            w_pose=12.0, w_kobj=1.0, reg_max=reg_max,
-            num_det_classes=num_classes, unified_head=True)
-
-    def _forward_head(self, x):
-        feats = self.backbone(x)
-        neck_feats = self.neck(feats[1:])
-        return self.head(neck_feats)
-
-    def forward(self, x):
-        return self._forward_head(x)
-
-    def compute_loss(self, images, gt_dict_list):
-        device = next(self.parameters()).device
-        images = images.to(device)
-        B = images.shape[0]
-
-        head_outs = self._forward_head(images)
-        feat_sizes = [(t.shape[2], t.shape[3]) for t in head_outs['cls']]
-
-        pred_scores, pred_boxes = self._get_decoded_preds(head_outs, feat_sizes)
-
-        # Collect all GTs
-        all_boxes, all_classes, all_kpts, all_batch = [], [], [], []
-        for b in range(B):
-            gt = gt_dict_list[b]
-            boxes = gt['boxes']
-            classes = gt['classes']
-            kpts = gt.get('kpts', torch.zeros(0, 17, 3))
-            if len(boxes) == 0:
-                continue
-
-            kpts_full = torch.zeros(len(boxes), 17, 3, dtype=boxes.dtype)
-            person_mask = classes == 0
-            if len(kpts) == len(boxes) and person_mask.any():
-                kpts_full[person_mask] = kpts[person_mask]
-
-            all_boxes.append(boxes.to(device, non_blocking=True))
-            all_classes.append(classes.to(device, non_blocking=True))
-            all_kpts.append(kpts_full.to(device, non_blocking=True))
-            all_batch.append(torch.full((len(boxes),), b, device=device, dtype=torch.long))
-
-        if all_boxes:
-            gt_boxes = torch.cat(all_boxes, dim=0)
-            gt_classes = torch.cat(all_classes, dim=0).long()
-            gt_kpts = torch.cat(all_kpts, dim=0)
-            gt_batch = torch.cat(all_batch, dim=0)
-        else:
-            gt_boxes = torch.empty(0, 4, device=device)
-            gt_classes = torch.empty(0, device=device, dtype=torch.long)
-            gt_kpts = torch.empty(0, 17, 3, device=device)
-            gt_batch = torch.empty(0, device=device, dtype=torch.long)
-
-        targets = self.assigner(
-            pred_scores, pred_boxes, gt_boxes, gt_classes,
-            gt_kpts, feat_sizes, self.strides, gt_batch,
-            num_det_classes=self.num_classes)
-
-        losses = self.loss_fn(head_outs, targets, self.strides, feat_sizes, head_type='unified')
-
-        det_total = losses['cls'] + losses['ciou'] + losses['dfl']
-        pose_total = torch.tensor(0.0, device=device)
-        if 'kpt' in losses:
-            pose_total = losses['kpt'] + losses.get('kobj', 0.0)
-        total = (self.det_task_weight * det_total +
-                 self.pose_task_weight * pose_total)
-
-        result = {
-            'total': total,
-            'det_total': det_total.detach(),
-            'pose_total': pose_total.detach(),
-            'task_w_det': torch.tensor(self.det_task_weight, device=device),
-            'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
-        }
-        result.update({k: v.detach() if isinstance(v, torch.Tensor) else v for k, v in losses.items()})
-        return result
-
-
-class ModelC_DualNeck(_DualHeadModel):
-    """M-C: Dual-neck dual-head."""
-
-    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
-                 backbone_depth=0.67, backbone_width=0.75):
-        super().__init__(num_det_classes, num_kpts, reg_max)
-        self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width)
-        self.det_neck = DetNeck(self.backbone.out_channels[1:], scale=0.6)
-        self.pose_neck = PoseNeck(self.backbone.out_channels, scale=0.4)
-        self.det_head = DetectHead(self.det_neck.out_channels[0],
-                                   num_classes=num_det_classes, reg_max=reg_max)
-        self.pose_head = PoseHead(self.pose_neck.out_channels[0],
-                                   num_kpts=num_kpts, reg_max=reg_max)
-        self.disable_pose_proposal_training()
-
-    def _forward_head(self, x):
-        p2, p3, p4, p5 = self.backbone(x)
-        det_feats = self.det_neck([p3, p4, p5])
-        pose_feats = self.pose_neck([p2, p3, p4, p5])
-        return self.det_head(det_feats), self.pose_head(pose_feats)
-
-    def forward(self, x):
-        return self._forward_head(x)
-
-
-class ModelD_AttentionDual(_DualHeadModel):
-    """M-D: ECA backbone + dual-head."""
-
-    def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
-                 backbone_depth=0.67, backbone_width=0.75):
-        super().__init__(num_det_classes, num_kpts, reg_max)
-        self.backbone = CSPDarkNet(depth=backbone_depth, width=backbone_width, use_eca=True)
-        self.neck = FPNPANNeck(self.backbone.out_channels[1:],
-                               depth=backbone_depth, width=backbone_width)
-        ch = self.neck.out_channels
-        self.det_head = DetectHead(ch[0], num_classes=num_det_classes, reg_max=reg_max)
-        self.pose_head = PoseHead(ch[0], num_kpts=num_kpts, reg_max=reg_max)
-        self.disable_pose_proposal_training()
-
-    def _forward_head(self, x):
-        feats = self.backbone(x)
-        neck_feats = self.neck(feats[1:])
-        return self.det_head(neck_feats), self.pose_head(neck_feats)
-
-    def forward(self, x):
-        return self._forward_head(x)
-
-
 class ModelE_BiFPN(_DualHeadModel):
-    """M-E: BiFPN neck + dual-head."""
+    """BiFPN neck with detection and pose heads."""
 
     def __init__(self, num_det_classes=80, num_kpts=17, reg_max=16,
                  backbone_depth=0.67, backbone_width=0.75):
@@ -727,22 +543,4 @@ class ModelE_BiFPN(_DualHeadModel):
         return self._forward_head(x)
 
 
-# ═══════════════════════════════════════════════════════════════
-# Factory
-# ═══════════════════════════════════════════════════════════════
 
-MODEL_FACTORY = {
-    'dual_head': ModelA_DualHead,
-    'unified_head': ModelB_UnifiedHead,
-    'dual_neck': ModelC_DualNeck,
-    'attn_dual': ModelD_AttentionDual,
-    'bifpn_dual': ModelE_BiFPN,
-}
-
-
-def create_model(name, **kwargs):
-    if name not in MODEL_FACTORY:
-        raise ValueError(f"Unknown model '{name}'. Options: {list(MODEL_FACTORY.keys())}")
-    model = MODEL_FACTORY[name](**kwargs)
-    print(f"  Created {name}: {model.num_params / 1e6:.2f}M params")
-    return model

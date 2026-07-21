@@ -1,4 +1,4 @@
-"""Building blocks: Conv, C2f, SPPF, ECA — exact YOLOv8 architecture."""
+﻿"""Building blocks used by the YOLOv8-style BiFPN model."""
 
 import torch
 import torch.nn as nn
@@ -14,7 +14,7 @@ class Conv(nn.Module):
         super().__init__()
         p = (k - 1) // 2 if p is None else p
         self.conv = nn.Conv2d(in_ch, out_ch, k, s, p, groups=g, bias=False)
-        self.bn = nn.BatchNorm2d(out_ch)
+        self.bn = nn.BatchNorm2d(out_ch, eps=0.001, momentum=0.03)
         self.act = nn.SiLU() if act else nn.Identity()
 
     def forward(self, x):
@@ -82,3 +82,4 @@ class ECA(nn.Module):
         y = self.conv(y)
         y = y.transpose(-1, -2).unsqueeze(-1)
         return x * self.sigmoid(y)
+

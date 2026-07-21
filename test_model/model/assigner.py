@@ -1,8 +1,8 @@
-"""TaskAlignedAssigner — multi-head version.
+﻿"""TaskAlignedAssigner for detection and pose heads.
 
-Adapted from YOLOv8's TaskAlignedAssigner. Supports:
-- Dual-head: separate det cls(19) + pose cls(1) heads
-- Unified-head: single cls(20) head with person at index 0
+Adapted from YOLOv8's TaskAlignedAssigner. It is used for:
+- COCO80 detection anchors
+- person-box anchors that supervise the keypoint branch
 
 Alignment score = cls_score^alpha * IoU^beta
 """
@@ -222,3 +222,4 @@ class TaskAlignedAssigner:
                 'batch_idx': batch_sel[keep_pos].long(),
             })
         return merged
+

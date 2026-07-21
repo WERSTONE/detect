@@ -1,4 +1,4 @@
-#!/usr/bin/env python
+﻿#!/usr/bin/env python
 """Evaluate model checkpoints with official pycocotools COCOeval.
 
 This script exports model predictions to COCO result JSON files in original
@@ -8,6 +8,7 @@ image coordinates, then runs COCOeval for bbox and/or keypoints.
 import argparse
 import json
 import sys
+import tempfile
 from pathlib import Path
 
 import numpy as np
@@ -18,17 +19,15 @@ from torch.utils.data import DataLoader, Subset
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(PROJECT_ROOT))
 
-from test_model.dataset import (  # noqa: E402
-    COCO_CATEGORY_ID_TO_20,
+from test_model.train.dataset import (  # noqa: E402
     COCO_CATEGORY_ID_TO_80,
     collate_fn,
     create_dataloader,
 )
-from test_model.models import create_model  # noqa: E402
+from test_model.model import create_model  # noqa: E402
 
 
 COCO80_TO_CATEGORY_ID = {v: k for k, v in COCO_CATEGORY_ID_TO_80.items()}
-COCO20_TO_CATEGORY_ID = {v: k for k, v in COCO_CATEGORY_ID_TO_20.items()}
 
 
 def parse_args():
@@ -36,24 +35,23 @@ def parse_args():
         description="Run official COCOeval on custom or Ultralytics checkpoints")
     p.add_argument("--provider", type=str, default="test_model",
                    choices=["test_model", "ultralytics_detect", "ultralytics_pose"])
-    p.add_argument("--config", type=str, default=str(PROJECT_ROOT / "test_model/config.yaml"))
+    p.add_argument("--config", type=str, default=str(PROJECT_ROOT / "test_model/config/bifpn_dual.yaml"))
     p.add_argument("--weights", type=str, required=True)
     p.add_argument("--model", type=str, default=None,
-                   choices=["dual_head", "unified_head", "dual_neck", "attn_dual", "bifpn_dual"])
+                   choices=["bifpn", "bifpn_dual", "bifpn_detect", "bifpn_det"])
     p.add_argument("--data", type=str, default=None)
     p.add_argument("--img-dir", type=str, default=None)
     p.add_argument("--label-dir", type=str, default=None)
     p.add_argument("--instances-json", type=str, default=None)
     p.add_argument("--keypoints-json", type=str, default=None)
-    p.add_argument("--task", type=str, default="both", choices=["both", "bbox", "keypoints"])
+    p.add_argument("--task", type=str, default=None, choices=["both", "bbox", "keypoints"],
+                   help="Evaluation task. Defaults to validation.task from config.")
     p.add_argument("--batch", type=int, default=None)
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--device", type=str, default="cuda")
     p.add_argument("--input-size", type=int, default=None)
     p.add_argument("--class-id-format", type=str, default=None,
-                   choices=["yolo80", "internal80", "coco", "coco80",
-                            "coco20", "internal", "internal20",
-                            "coco_category20", "coco20_category", "auto"])
+                   choices=["yolo80", "internal80", "coco", "coco80", "auto"])
     p.add_argument("--max-samples", type=int, default=0)
     p.add_argument("--score-thresh", type=float, default=None)
     p.add_argument("--iou-thresh", type=float, default=None)
@@ -66,6 +64,16 @@ def parse_args():
     return p.parse_args()
 
 
+def normalize_device(device):
+    device = str(device or "cuda").strip()
+    if device.isdigit():
+        device = f"cuda:{device}"
+    if device.startswith("cuda") and not torch.cuda.is_available():
+        print("CUDA not available, falling back to CPU")
+        return "cpu"
+    return device
+
+
 def load_config(path):
     path = Path(path)
     if not path.exists():
@@ -76,14 +84,26 @@ def load_config(path):
 
 def build_model(args, cfg, device):
     model_name = args.model or cfg.get("model", "bifpn_dual")
-    model_kwargs = {
-        "num_kpts": cfg.get("num_kpts", 17),
-        "reg_max": cfg.get("reg_max", 16),
-    }
-    if model_name == "unified_head":
-        model_kwargs["num_classes"] = cfg.get("num_classes", cfg.get("num_det_classes", 80))
+    model_kwargs = {"reg_max": cfg.get("reg_max", 16)}
+    if model_name in ("bifpn_detect", "bifpn_det"):
+        neck_cfg = cfg.get("neck", {}) or {}
+        assigner_cfg = cfg.get("assigner", {}) or {}
+        model_kwargs.update({
+            "num_det_classes": cfg.get("num_det_classes", cfg.get("num_classes", 80)),
+            "input_size": cfg.get("data", {}).get("input_size", 640),
+            "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+            "neck_downsample": neck_cfg.get("downsample", "conv"),
+            "neck_out_channels": neck_cfg.get("out_channels", None),
+            "assigner_topk": assigner_cfg.get("topk", 10),
+            "assigner_alpha": assigner_cfg.get("alpha", 0.5),
+            "assigner_beta": assigner_cfg.get("beta", 6.0),
+            "assigner_eps": assigner_cfg.get("eps", 1.0e-9),
+        })
     else:
-        model_kwargs["num_det_classes"] = cfg.get("num_det_classes", cfg.get("num_classes", 80))
+        model_kwargs.update({
+            "num_kpts": cfg.get("num_kpts", 17),
+            "num_det_classes": cfg.get("num_det_classes", cfg.get("num_classes", 80)),
+        })
 
     model = create_model(model_name, **model_kwargs)
     ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
@@ -128,8 +148,6 @@ def class_to_category_id(cls_id, num_classes, keep_classes):
         return 1 if cls_id == 0 else None
     if num_classes == 80:
         return COCO80_TO_CATEGORY_ID.get(cls_id)
-    if num_classes == 20:
-        return COCO20_TO_CATEGORY_ID.get(cls_id)
     return COCO80_TO_CATEGORY_ID.get(cls_id)
 
 
@@ -366,16 +384,68 @@ def run_cocoeval(annotation_json, results_json, iou_type, image_ids, coco_max_de
     return summarize_cocoeval(coco_eval, iou_type)
 
 
+def evaluate_model(model, loader, device, task="both", data_root=None,
+                   instances_json=None, keypoints_json=None, output_dir=None,
+                   prefix="eval", num_classes=80, keep_classes=None,
+                   score_thresh=0.001, iou_thresh=0.7, max_det=300,
+                   coco_max_det=100):
+    """Run official COCOeval for a custom model and return metric dict."""
+    data_root = Path(data_root or "data/coco2017")
+    tmp_ctx = None
+    if output_dir is None:
+        tmp_ctx = tempfile.TemporaryDirectory()
+        output_dir = Path(tmp_ctx.name)
+    else:
+        output_dir = Path(output_dir)
+        output_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        bbox_results, kpt_results, image_ids = export_predictions(
+            model, loader, device, num_classes, keep_classes,
+            score_thresh, iou_thresh, max_det)
+
+        bbox_json = output_dir / f"{prefix}_bbox_predictions.json"
+        kpt_json = output_dir / f"{prefix}_keypoint_predictions.json"
+        with open(bbox_json, "w", encoding="utf-8") as f:
+            json.dump(bbox_results, f)
+        with open(kpt_json, "w", encoding="utf-8") as f:
+            json.dump(kpt_results, f)
+
+        metrics = {
+            "num_images": len(image_ids),
+            "num_bbox_predictions": len(bbox_results),
+            "num_keypoint_predictions": len(kpt_results),
+        }
+        if task in ("both", "bbox"):
+            instances_path = resolve_annotation_path(
+                data_root, instances_json, "instances_val2017.json")
+            if not instances_path.exists():
+                raise FileNotFoundError(f"bbox annotation not found: {instances_path}")
+            metrics.update(run_cocoeval(
+                instances_path, bbox_json, "bbox", image_ids,
+                coco_max_det=coco_max_det))
+        if task in ("both", "keypoints"):
+            keypoints_path = resolve_annotation_path(
+                data_root, keypoints_json, "person_keypoints_val2017.json")
+            if not keypoints_path.exists():
+                raise FileNotFoundError(f"keypoint annotation not found: {keypoints_path}")
+            metrics.update(run_cocoeval(
+                keypoints_path, kpt_json, "keypoints", image_ids,
+                coco_max_det=coco_max_det))
+        return metrics
+    finally:
+        if tmp_ctx is not None:
+            tmp_ctx.cleanup()
+
+
 def main():
     args = parse_args()
     cfg = load_config(args.config)
     d_cfg = cfg.get("data", {})
     e_cfg = cfg.get("eval", {})
+    validation_cfg = cfg.get("validation", {})
 
-    device = args.device
-    if args.provider == "test_model" and device == "cuda" and not torch.cuda.is_available():
-        print("CUDA not available, falling back to CPU")
-        device = "cpu"
+    device = normalize_device(args.device)
 
     data_root = Path(args.data or d_cfg.get("root", "data/coco2017"))
     img_dir = args.img_dir or d_cfg.get(
@@ -387,6 +457,7 @@ def main():
     batch = args.batch or e_cfg.get("batch_size", 16)
     workers = args.workers if args.workers is not None else cfg.get("training", {}).get("workers", 4)
     class_id_format = args.class_id_format or d_cfg.get("class_id_format", "yolo80")
+    task = args.task or validation_cfg.get("task", "both")
     score_thresh = args.score_thresh if args.score_thresh is not None else e_cfg.get("score_thresh", 0.001)
     iou_thresh = args.iou_thresh if args.iou_thresh is not None else e_cfg.get("iou_thresh", 0.7)
     max_det = args.max_det if args.max_det is not None else e_cfg.get("max_det", 300)
@@ -434,6 +505,7 @@ def main():
     print(
         f"COCOeval export samples={len(loader.dataset)} input_size={input_size} "
         f"provider={args.provider} "
+        f"task={task} "
         f"score={score_thresh} nms_iou={iou_thresh} max_det={max_det} "
         f"coco_max_det={args.coco_max_det} keep_classes={keep_classes}"
     )
@@ -461,32 +533,31 @@ def main():
     metrics = {
         "weights": str(args.weights),
         "config": str(args.config),
+        "task": task,
         "num_images": len(image_ids),
         "num_bbox_predictions": len(bbox_results),
         "num_keypoint_predictions": len(kpt_results),
     }
 
-    if args.task in ("both", "bbox"):
+    if task in ("both", "bbox"):
         instances_json = resolve_annotation_path(
             data_root, args.instances_json, "instances_val2017.json")
         if not instances_json.exists():
-            print(f"Skip bbox COCOeval, annotation not found: {instances_json}")
-        else:
-            metrics.update(run_cocoeval(
-                instances_json, bbox_json, "bbox", image_ids,
-                coco_max_det=args.coco_max_det,
-            ))
+            raise FileNotFoundError(f"bbox annotation not found: {instances_json}")
+        metrics.update(run_cocoeval(
+            instances_json, bbox_json, "bbox", image_ids,
+            coco_max_det=args.coco_max_det,
+        ))
 
-    if args.task in ("both", "keypoints"):
+    if task in ("both", "keypoints"):
         keypoints_json = resolve_annotation_path(
             data_root, args.keypoints_json, "person_keypoints_val2017.json")
         if not keypoints_json.exists():
-            print(f"Skip keypoint COCOeval, annotation not found: {keypoints_json}")
-        else:
-            metrics.update(run_cocoeval(
-                keypoints_json, kpt_json, "keypoints", image_ids,
-                coco_max_det=args.coco_max_det,
-            ))
+            raise FileNotFoundError(f"keypoint annotation not found: {keypoints_json}")
+        metrics.update(run_cocoeval(
+            keypoints_json, kpt_json, "keypoints", image_ids,
+            coco_max_det=args.coco_max_det,
+        ))
 
     metrics_json = output_dir / f"{prefix}_cocoeval_metrics.json"
     with open(metrics_json, "w", encoding="utf-8") as f:
@@ -499,3 +570,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+

@@ -1,4 +1,4 @@
-# BiFPN single-task baseline: person pose only.
+﻿# BiFPN single-task baseline: person pose only.
 # The current BiFPN pose branch predicts keypoints only; person boxes/scores
 # still come from the detection head, so this trains a 1-class person detector
 # together with the keypoint head, matching the usual YOLO-pose setup.
@@ -69,12 +69,6 @@ training:
     min_delta: 0.002
     start_epoch: 170
 
-  score_validation:
-    interval: 1
-    max_samples: 1200
-    det_metric: "AP_person_box@0.5:0.95"
-    pose_metric: "AP_pose@0.5:0.95"
-
   dynamic_weights:
     enabled: false
 
@@ -113,9 +107,6 @@ training:
         use_gradient_projection: false
         close_mosaic_epochs: 20
 
-  two_stage:
-    enabled: false
-
 loss:
   w_box: 7.5
   w_cls: 0.5
@@ -143,10 +134,6 @@ augmentation:
   copy_paste_max_objects: 8
 
 eval:
-  auto_after_train: true
-  checkpoints:
-    - last
-    - best
   score_thresh: 0.01
   iou_thresh: 0.6
   max_det: 300
@@ -155,3 +142,18 @@ eval:
 device: cuda
 gpu_id: 0
 debug: false
+
+
+
+validation:
+  backend: cocoeval
+  task: keypoints
+  final_eval:
+    enabled: true
+    max_samples: 0
+    det_metric: bbox/AP
+    pose_metric: keypoints/AP
+
+
+
+
