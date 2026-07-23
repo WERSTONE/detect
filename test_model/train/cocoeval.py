@@ -38,7 +38,8 @@ def parse_args():
     p.add_argument("--config", type=str, default=str(PROJECT_ROOT / "test_model/config/bifpn_dual.yaml"))
     p.add_argument("--weights", type=str, required=True)
     p.add_argument("--model", type=str, default=None,
-                   choices=["bifpn", "bifpn_dual", "bifpn_detect", "bifpn_det"])
+                   choices=["bifpn", "bifpn_dual", "bifpn_detect", "bifpn_det",
+                            "yolov8n", "yolov8nano"])
     p.add_argument("--data", type=str, default=None)
     p.add_argument("--img-dir", type=str, default=None)
     p.add_argument("--label-dir", type=str, default=None)
@@ -85,20 +86,24 @@ def load_config(path):
 def build_model(args, cfg, device):
     model_name = args.model or cfg.get("model", "bifpn_dual")
     model_kwargs = {"reg_max": cfg.get("reg_max", 16)}
-    if model_name in ("bifpn_detect", "bifpn_det"):
+    if model_name in ("bifpn_detect", "bifpn_det", "yolov8n", "yolov8nano"):
         neck_cfg = cfg.get("neck", {}) or {}
         assigner_cfg = cfg.get("assigner", {}) or {}
-        model_kwargs.update({
+        detect_kwargs = {
             "num_det_classes": cfg.get("num_det_classes", cfg.get("num_classes", 80)),
             "input_size": cfg.get("data", {}).get("input_size", 640),
-            "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
-            "neck_downsample": neck_cfg.get("downsample", "conv"),
-            "neck_out_channels": neck_cfg.get("out_channels", None),
             "assigner_topk": assigner_cfg.get("topk", 10),
             "assigner_alpha": assigner_cfg.get("alpha", 0.5),
             "assigner_beta": assigner_cfg.get("beta", 6.0),
             "assigner_eps": assigner_cfg.get("eps", 1.0e-9),
-        })
+        }
+        if model_name in ("bifpn_detect", "bifpn_det"):
+            detect_kwargs.update({
+                "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+                "neck_downsample": neck_cfg.get("downsample", "conv"),
+                "neck_out_channels": neck_cfg.get("out_channels", None),
+            })
+        model_kwargs.update(detect_kwargs)
     else:
         model_kwargs.update({
             "num_kpts": cfg.get("num_kpts", 17),

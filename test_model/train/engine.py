@@ -67,7 +67,8 @@ def parse_args():
     p.add_argument('--config', type=str, default=None,
                    help='Path to YAML config file')
     p.add_argument('--model', type=str, default=None,
-                   choices=['bifpn', 'bifpn_dual', 'bifpn_detect', 'bifpn_det'],
+                   choices=['bifpn', 'bifpn_dual', 'bifpn_detect', 'bifpn_det',
+                            'yolov8n', 'yolov8nano'],
                    help='Model variant (overrides config)')
     p.add_argument('--data', type=str, default=None,
                    help='Dataset root directory (overrides config)')
@@ -468,20 +469,24 @@ def main():
     model_kwargs = {
         'reg_max': cfg.get('reg_max', 16),
     }
-    if model_name in ('bifpn_detect', 'bifpn_det'):
+    if model_name in ('bifpn_detect', 'bifpn_det', 'yolov8n', 'yolov8nano'):
         neck_cfg = cfg.get('neck', {}) or {}
         assigner_cfg = cfg.get('assigner', {}) or {}
-        model_kwargs.update({
+        detect_kwargs = {
             'num_det_classes': cfg.get('num_det_classes', cfg.get('num_classes', 80)),
             'input_size': d_cfg.get('input_size', 640),
-            'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
-            'neck_downsample': neck_cfg.get('downsample', 'conv'),
-            'neck_out_channels': neck_cfg.get('out_channels', None),
             'assigner_topk': assigner_cfg.get('topk', 10),
             'assigner_alpha': assigner_cfg.get('alpha', 0.5),
             'assigner_beta': assigner_cfg.get('beta', 6.0),
             'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
-        })
+        }
+        if model_name in ('bifpn_detect', 'bifpn_det'):
+            detect_kwargs.update({
+                'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+                'neck_downsample': neck_cfg.get('downsample', 'conv'),
+                'neck_out_channels': neck_cfg.get('out_channels', None),
+            })
+        model_kwargs.update(detect_kwargs)
     else:
         model_kwargs.update({
             'num_kpts': cfg.get('num_kpts', 17),
