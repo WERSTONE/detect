@@ -94,6 +94,7 @@ class Trainer:
         self.backbone_lr = None if backbone_lr is None else float(backbone_lr)
         self.backbone_lr_mult = float(backbone_lr_mult)
         param_groups = self._build_param_groups()
+        self._validate_param_groups(param_groups)
         if self.optimizer_name in ('adamw', 'adam'):
             opt_decay = 0.0 if self.param_group_mode == 'yolo' else self.weight_decay
             self.optimizer = torch.optim.AdamW(param_groups, lr=lr, weight_decay=opt_decay)
@@ -170,7 +171,9 @@ class Trainer:
                 for param_name, param in module.named_parameters(recurse=False):
                     if not param.requires_grad:
                         continue
-                    if 'bias' in param_name:
+                    if module_name == '' and param.ndim <= 1:
+                        kind = 'bias'
+                    elif 'bias' in param_name:
                         kind = 'bias'
                     elif isinstance(module, norm_types):
                         kind = 'bn'
@@ -224,6 +227,48 @@ class Trainer:
         if not groups:
             raise ValueError("No trainable parameters found for optimizer")
         return groups
+
+    def _validate_param_groups(self, param_groups):
+        expected = {
+            id(param): name
+            for name, param in self.model.named_parameters()
+            if param.requires_grad
+        }
+        seen = {}
+        duplicates = []
+        for group in param_groups:
+            for param in group.get('params', []):
+                param_id = id(param)
+                if param_id in seen:
+                    duplicates.append(expected.get(param_id, '<unnamed>'))
+                seen[param_id] = True
+
+        missing = [
+            name for param_id, name in expected.items()
+            if param_id not in seen
+        ]
+        extra = [
+            expected.get(param_id, '<unnamed>')
+            for param_id in seen
+            if param_id not in expected
+        ]
+        if missing or duplicates or extra:
+            details = []
+            if missing:
+                details.append(
+                    "missing=" + ", ".join(missing[:20]) +
+                    ("..." if len(missing) > 20 else ""))
+            if duplicates:
+                details.append(
+                    "duplicates=" + ", ".join(duplicates[:20]) +
+                    ("..." if len(duplicates) > 20 else ""))
+            if extra:
+                details.append(
+                    "extra=" + ", ".join(extra[:20]) +
+                    ("..." if len(extra) > 20 else ""))
+            raise RuntimeError(
+                "Optimizer parameter groups do not exactly cover trainable "
+                "parameters: " + "; ".join(details))
 
     def _configured_backbone_lr_mult(self):
         if self.backbone_lr is not None:

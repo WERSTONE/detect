@@ -32,7 +32,7 @@ pretrained:
     cache_dir: checkpoints/yolo
     strict: false
   modules:
-    enabled: true
+    enabled: false
     weights: checkpoints/single_bifpn_det/bifpn_detect/bifpn_detect_best.pt
     include: [backbone, neck]
     exclude: []
@@ -104,10 +104,9 @@ training:
     eps: 1.0e-12
 
   freeze:
-    enabled: true
-    # Detection-to-pose transfer: keep the pretrained detector backbone/neck
-    # fixed and learn only the pose adapter/head first.
-    trainable_modules: [pose_adapter, pose_head]
+    enabled: false
+    # From-scratch pose training: train backbone, neck, adapter, and pose head.
+    trainable_modules: []
     freeze_modules: []
     freeze_bn: true
 

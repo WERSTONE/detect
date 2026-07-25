@@ -3,21 +3,32 @@
 #
 # Usage:
 #   uv run python -m test_model.main --config test_model/config/bifpn_dual.yaml
-#   uv run python -m test_model.main --config test_model/config/bifpn_dual.yaml --model bifpn_dual --epochs 100
+#   uv run python -m test_model.main --config test_model/config/bifpn_dual.yaml --model bifpn_dual --epochs 500
 
 # ---- Model ----
 model: bifpn_dual
 num_classes: 80         # total COCO classes (including person)
-num_det_classes: 80     # detection head predicts all COCO classes, including person
+num_det_classes: 79     # detection head predicts COCO80 classes 1..79; pose head owns person class 0
 num_kpts: 17            # COCO keypoints
 reg_max: 16             # DFL max bin
+
+neck:
+  out_channels: 256
+  use_p2_context: false
+  downsample: conv
+
+assigner:
+  topk: 10
+  alpha: 0.5
+  beta: 6.0
+  eps: 1.0e-9
 
 # ---- Pretrained ----
 pretrained:
   backbone:
-    enabled: true
+    enabled: false
     weights: auto        # explicit path, filename, or auto to infer yolov8m* weights
-    auto_download: true  # auto-download official YOLOv8 weights if not found locally
+    auto_download: false # from-scratch dual-head run: do not download/load weights
     prefer_pose: false    # prefer yolov8m-pose.pt before yolov8m.pt for backbone init
     cache_dir: checkpoints/yolo
     strict: false        # if true, require a near-complete backbone match
@@ -42,27 +53,34 @@ data:
 
 # ---- Training ----
 training:
-  epochs: 100
+  epochs: 500
   batch_size: 32            # 24GB GPU: start with 24; reduce to 16/12 if OOM
   workers: 14
 
   # Optimizer (SGD matches YOLOv8 official recipe)
-  optimizer: adamw           # sgd | adamw
-  lr0: 0.005               # stable initial LR for dual-head training at batch 24
+  optimizer: sgd           # sgd | adamw
+  lr0: 0.01                # YOLO-style base LR with nbs scaling/accumulation
   lrf: 0.01                # final LR = lr0 * lrf
   momentum: 0.937
   weight_decay: 0.0005     # 5e-4
   nesterov: true
+  param_groups: yolo
+  nbs: 64
+  accumulate: auto
+  scale_weight_decay: true
 
   # Optional per-module LR groups. By default, non-backbone parameters use
   # lr0, while backbone parameters use lr0 * backbone_lr_mult. Set
   # backbone_lr to an absolute LR if you want it to override the multiplier.
   lr_groups:
-    backbone_lr_mult: 0.1
+    backbone_lr_mult: 1.0
     backbone_lr:
 
   # LR schedule
-  warmup_epochs: 5
+  warmup_epochs: 3
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  yolo_warmup: true
   cos_lr: true             # cosine annealing
 
   # Regularization
@@ -77,7 +95,7 @@ training:
   save_interval: 20        # save intermediate checkpoint every N epochs
   save_best_by: loss
   # Saved as checkpoints/<model_name>/ inside the project directory.
-  save_dir: checkpoints/re
+  save_dir: checkpoints/dual_scratch_dynamic
 
   # Logging
   tensorboard: true         # write TensorBoard logs to save_dir/tensorboard/
@@ -90,15 +108,15 @@ training:
   # Early stopping follows validation loss. COCOeval is run only after the
   # final training stage finishes.
   early_stop:
-    enabled: true
-    patience: 10
+    enabled: false
+    patience: 50
     min_delta: 0.002
-    start_epoch: 80
+    start_epoch: 100
 
   # Dynamic task weights at the task level.
   # Sub-loss weights stay in the loss section below.
   dynamic_weights:
-    enabled: false
+    enabled: true
     method: uncertainty    # uncertainty | dwa
     temperature: 2.0
     det_min: 0.2
@@ -127,53 +145,12 @@ training:
     freeze_bn: true
 
   # Staged recipe when only the pretrained YOLOv8 backbone is reused.
-  # 1) Freeze backbone and learn the new BiFPN/adapters/detection head.
-  # 2) Keep backbone frozen and add pose supervision with person-heavy batches.
-  # 3) Unfreeze backbone and jointly fine-tune at a lower LR.
+  # 1) Freeze backbone and learn BiFPN/adapters/non-person detection head.
+  # 2) Keep backbone frozen and learn the pose head on person+keypoint samples.
+  # 3) Unfreeze backbone and jointly fine-tune non-person detection + person pose.
   staged_training:
-    enabled: true
-    stages:
-      - name: frozen_det_warmup
-        epochs: 30
-        lr0: 0.003
-        person_only: false
-        train_det: true
-        train_pose: false
-        freeze_backbone: true
-        det_weight: 1.0
-        pose_weight: 0.0
-        use_dynamic_weights: false
-        use_gradient_projection: false
-        load_best_for_next_stage: true
-        close_mosaic_epochs: 0
-
-      - name: frozen_pose_warmup
-        epochs: 40
-        lr0: 0.002
-        person_only: true
-        train_det: true
-        train_pose: true
-        freeze_backbone: true
-        det_weight: 0.5
-        pose_weight: 1.5
-        use_dynamic_weights: false
-        use_gradient_projection: false
-        load_best_for_next_stage: true
-        close_mosaic_epochs: 10
-
-      - name: unfrozen_joint_tune
-        epochs: 80
-        lr0: 0.0005          # neck/head LR
-        backbone_lr: 0.00005 # 0.1x lr0 for pretrained backbone fine-tuning
-        person_only: false
-        train_det: true
-        train_pose: true
-        freeze_backbone: false
-        det_weight: 1.0
-        pose_weight: 1.2
-        use_dynamic_weights: false
-        use_gradient_projection: false
-        close_mosaic_epochs: 20
+    enabled: false
+    stages: []
 
 # ---- Loss Weights ----
 loss:
@@ -196,10 +173,10 @@ augmentation:
   flip_lr: 0.5             # horizontal flip probability
   flip_ud: 0.0
   bgr: 0.0
-  mosaic_prob: 0.3         # mosaic probability (0=never, 1=always)
-  mixup_prob: 0.05
-  cutmix_prob: 0.03
-  copy_paste_prob: 0.03    # box crop copy-paste; keep low without masks
+  mosaic_prob: 1.0         # mosaic probability (0=never, 1=always)
+  mixup_prob: 0.10
+  cutmix_prob: 0.0
+  copy_paste_prob: 0.0     # keep off for box/keypoint dual training
   copy_paste_ioa: 0.3
   copy_paste_max_objects: 8
 

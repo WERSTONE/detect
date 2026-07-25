@@ -701,9 +701,19 @@ def main():
             })
         model_kwargs.update(pose_kwargs)
     else:
+        neck_cfg = cfg.get('neck', {}) or {}
+        assigner_cfg = cfg.get('assigner', {}) or {}
         model_kwargs.update({
             'num_kpts': cfg.get('num_kpts', 17),
             'num_det_classes': cfg.get('num_det_classes', 80),
+            'input_size': d_cfg.get('input_size', 640),
+            'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+            'neck_downsample': neck_cfg.get('downsample', 'conv'),
+            'neck_out_channels': neck_cfg.get('out_channels', None),
+            'assigner_topk': assigner_cfg.get('topk', 10),
+            'assigner_alpha': assigner_cfg.get('alpha', 0.5),
+            'assigner_beta': assigner_cfg.get('beta', 6.0),
+            'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
         })
 
     model = create_model(model_name, **model_kwargs)
@@ -717,7 +727,9 @@ def main():
         model.det_loss.w_cls = l_cfg.get('w_cls', 0.5)
         model.det_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
     if hasattr(model, 'pose_loss'):
-        if model_name in ('bifpn_pose', 'bifpn_pose_only', 'yolov8m_pose', 'yolov8m-pose'):
+        if model_name in ('bifpn', 'bifpn_dual',
+                          'bifpn_pose', 'bifpn_pose_only',
+                          'yolov8m_pose', 'yolov8m-pose'):
             model.pose_loss.w_box = l_cfg.get('w_box', 7.5)
             model.pose_loss.w_cls = l_cfg.get('w_cls', 0.5)
             model.pose_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
