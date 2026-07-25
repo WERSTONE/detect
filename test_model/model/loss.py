@@ -395,6 +395,169 @@ class YOLODetectionLoss(nn.Module):
         }
 
 
+class YOLOPoseLoss(YOLODetectionLoss):
+    """YOLOv8-style person box + keypoint loss for pose-only training."""
+
+    def __init__(self, num_kpts=17, reg_max=16, strides=(8, 16, 32),
+                 w_box=7.5, w_cls=0.5, w_dfl=1.5, w_pose=12.0, w_kobj=1.0,
+                 assigner_topk=10, assigner_alpha=0.5, assigner_beta=6.0,
+                 assigner_eps=1e-9):
+        super().__init__(
+            num_classes=1,
+            reg_max=reg_max,
+            strides=strides,
+            w_box=w_box,
+            w_cls=w_cls,
+            w_dfl=w_dfl,
+            assigner_topk=assigner_topk,
+            assigner_alpha=assigner_alpha,
+            assigner_beta=assigner_beta,
+            assigner_eps=assigner_eps,
+        )
+        self.num_kpts = int(num_kpts)
+        self.w_pose = float(w_pose)
+        self.w_kobj = float(w_kobj)
+        self.register_buffer('sigmas', KPT_SIGMAS.clone())
+
+    def _preprocess_targets(self, gt_dict_list, batch_size, device):
+        max_gt = max((int((gt.get('classes', torch.zeros(0)) == 0).sum().item())
+                      for gt in gt_dict_list), default=0)
+        gt_labels = torch.zeros(batch_size, max_gt, 1, device=device)
+        gt_bboxes = torch.zeros(batch_size, max_gt, 4, device=device)
+        gt_kpts = torch.zeros(batch_size, max_gt, self.num_kpts, 3, device=device)
+        mask_gt = torch.zeros(batch_size, max_gt, 1, device=device)
+        for b, gt in enumerate(gt_dict_list):
+            boxes = gt['boxes'].to(device, non_blocking=True).float()
+            classes = gt['classes'].to(device, non_blocking=True).long()
+            kpts = gt.get(
+                'kpts',
+                torch.zeros(len(boxes), self.num_kpts, 3, device=boxes.device),
+            ).to(device, non_blocking=True).float()
+            person = classes == 0
+            boxes = boxes[person]
+            kpts = kpts[person] if len(kpts) == len(classes) else torch.zeros(
+                len(boxes), self.num_kpts, 3, device=device)
+            n = min(len(boxes), max_gt)
+            if n:
+                gt_bboxes[b, :n] = boxes[:n]
+                gt_kpts[b, :n] = kpts[:n]
+                mask_gt[b, :n] = 1.0
+        return gt_labels, gt_bboxes, gt_kpts, mask_gt
+
+    @staticmethod
+    def _decode_keypoints(pred_kpts, anchor_points, stride_tensor):
+        kpts = pred_kpts.view(pred_kpts.shape[0], pred_kpts.shape[1], -1, 3).clone()
+        ax = anchor_points[:, 0].view(1, -1, 1)
+        ay = anchor_points[:, 1].view(1, -1, 1)
+        stride = stride_tensor.squeeze(-1).view(1, -1, 1)
+        kpts[..., 0] = (kpts[..., 0] * 2.0 + ax - 0.5) * stride
+        kpts[..., 1] = (kpts[..., 1] * 2.0 + ay - 0.5) * stride
+        return kpts
+
+    def forward(self, head_outs, gt_dict_list):
+        cls_feats = head_outs['cls']
+        reg_feats = head_outs['reg']
+        kpt_feats = head_outs['kpt']
+        device = cls_feats[0].device
+        dtype = cls_feats[0].dtype
+        batch_size = cls_feats[0].shape[0]
+
+        pred_scores = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1, 1)
+             for x in cls_feats],
+            dim=1,
+        )
+        pred_distri = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1, 4 * self.reg_max)
+             for x in reg_feats],
+            dim=1,
+        )
+        pred_kpts = torch.cat(
+            [x.permute(0, 2, 3, 1).reshape(batch_size, -1, self.num_kpts * 3)
+             for x in kpt_feats],
+            dim=1,
+        )
+
+        anchor_points, stride_tensor = self._make_anchors(cls_feats, device, dtype)
+        pred_bboxes = self._bbox_decode(anchor_points, pred_distri)
+        gt_labels, gt_bboxes, gt_kpts, mask_gt = self._preprocess_targets(
+            gt_dict_list, batch_size, device)
+
+        _, target_bboxes, target_scores, fg_mask, target_gt_idx = self.assigner(
+            pred_scores.detach().sigmoid(),
+            (pred_bboxes.detach() * stride_tensor).type(gt_bboxes.dtype),
+            anchor_points * stride_tensor,
+            gt_labels,
+            gt_bboxes,
+            mask_gt,
+        )
+        target_scores_sum = torch.clamp(target_scores.sum(), min=1.0)
+
+        loss_cls = self.bce(pred_scores.float(), target_scores.to(dtype).float()).sum() / target_scores_sum
+        loss_box = torch.zeros((), device=device)
+        loss_dfl = torch.zeros((), device=device)
+        loss_kpt = torch.zeros((), device=device)
+        loss_kobj = torch.zeros((), device=device)
+
+        if fg_mask.sum():
+            weight = target_scores.sum(-1)[fg_mask].unsqueeze(-1)
+            pred_boxes_pix = pred_bboxes * stride_tensor
+            ciou = _bbox_ciou(pred_boxes_pix[fg_mask], target_bboxes[fg_mask])
+            loss_box = ((1.0 - ciou).unsqueeze(-1) * weight).sum() / target_scores_sum
+
+            target_ltrb = _bbox2dist(anchor_points, target_bboxes / stride_tensor, self.reg_max - 1)
+            dfl_raw = _dfl_loss_per_anchor(
+                pred_distri[fg_mask].reshape(-1, self.reg_max),
+                target_ltrb[fg_mask],
+                self.reg_max,
+            )
+            loss_dfl = (dfl_raw * weight).sum() / target_scores_sum
+
+            decoded_kpts = self._decode_keypoints(pred_kpts, anchor_points, stride_tensor)
+            batch_idx = torch.arange(batch_size, device=device)[:, None].expand_as(target_gt_idx)
+            target_kpts = gt_kpts[batch_idx, target_gt_idx.clamp(min=0)]
+            pred_pos_kpts = decoded_kpts[fg_mask]
+            target_pos_kpts = target_kpts[fg_mask]
+            target_pos_boxes = target_bboxes[fg_mask]
+            kpt_mask = target_pos_kpts[..., 2] > 0
+
+            if kpt_mask.any():
+                area = ((target_pos_boxes[:, 2] - target_pos_boxes[:, 0]) *
+                        (target_pos_boxes[:, 3] - target_pos_boxes[:, 1])).clamp(min=1.0)
+                sigmas = self.sigmas[:self.num_kpts].to(device).view(1, -1)
+                d = (pred_pos_kpts[..., :2] - target_pos_kpts[..., :2]).pow(2).sum(-1)
+                e = d / (((2 * sigmas).pow(2) * area[:, None] * 2.0) + 1e-9)
+                loss_factor = self.num_kpts / kpt_mask.sum(1).clamp(min=1)
+                loss_kpt = (loss_factor[:, None] * (1.0 - torch.exp(-e)) * kpt_mask).sum() / kpt_mask.sum().clamp(min=1)
+
+            loss_kobj = F.binary_cross_entropy_with_logits(
+                pred_kpts.view(batch_size, -1, self.num_kpts, 3)[fg_mask][..., 2],
+                kpt_mask.float(),
+                reduction='mean',
+            )
+
+        box = self.w_box * loss_box
+        cls = self.w_cls * loss_cls
+        dfl = self.w_dfl * loss_dfl
+        kpt = self.w_pose * loss_kpt
+        kobj = self.w_kobj * loss_kobj
+        det_total = box + cls + dfl
+        pose_total = kpt + kobj
+        total = (det_total + pose_total) * batch_size
+        return {
+            'total': total,
+            'det_total': det_total.detach(),
+            'det_ciou': box.detach(),
+            'det_cls': cls.detach(),
+            'det_dfl': dfl.detach(),
+            'pose_total': pose_total.detach(),
+            'pose_kpt': kpt.detach(),
+            'pose_kobj': kobj.detach(),
+            'num_pos': fg_mask.sum().detach().float(),
+            'target_scores_sum': target_scores_sum.detach(),
+        }
+
+
 def _dfl_loss_per_anchor(pred_dist, target_ltrb, reg_max):
     target = target_ltrb.clamp(0, reg_max - 1 - 0.01)
     tl = target.long()

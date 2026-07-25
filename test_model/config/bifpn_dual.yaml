@@ -21,6 +21,12 @@ pretrained:
     prefer_pose: false    # prefer yolov8m-pose.pt before yolov8m.pt for backbone init
     cache_dir: checkpoints/yolo
     strict: false        # if true, require a near-complete backbone match
+  modules:
+    enabled: false
+    weights: checkpoints/single_bifpn_det/bifpn_detect/bifpn_detect_best.pt
+    include: [backbone, neck]
+    exclude: []
+    strict: false
 
 # ---- Data ----
 data:
@@ -109,6 +115,16 @@ training:
     enabled: false
     method: pcgrad
     eps: 1.0e-12
+
+  freeze:
+    enabled: false
+    # Examples:
+    #   trainable_modules: [det_adapter, det_head]
+    #   trainable_modules: [pose_adapter, pose_head]
+    #   freeze_modules: [backbone, neck]
+    trainable_modules: []
+    freeze_modules: []
+    freeze_bn: true
 
   # Staged recipe when only the pretrained YOLOv8 backbone is reused.
   # 1) Freeze backbone and learn the new BiFPN/adapters/detection head.

@@ -68,7 +68,9 @@ def parse_args():
                    help='Path to YAML config file')
     p.add_argument('--model', type=str, default=None,
                    choices=['bifpn', 'bifpn_dual', 'bifpn_detect', 'bifpn_det',
-                            'yolov8n', 'yolov8nano'],
+                            'bifpn_pose', 'bifpn_pose_only',
+                            'yolov8n', 'yolov8nano',
+                            'yolov8m_pose', 'yolov8m-pose'],
                    help='Model variant (overrides config)')
     p.add_argument('--data', type=str, default=None,
                    help='Dataset root directory (overrides config)')
@@ -430,6 +432,199 @@ def _load_pretrained_backbone(model, cfg, resume_path=None):
     }
 
 
+def _as_name_list(value):
+    if value is None:
+        return []
+    if isinstance(value, str):
+        return [x.strip() for x in value.split(',') if x.strip()]
+    return [str(x).strip() for x in value if str(x).strip()]
+
+
+def _candidate_path(path_value):
+    path = Path(str(path_value))
+    candidates = [path] if path.is_absolute() else [
+        Path.cwd() / path,
+        PROJECT_ROOT / path,
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate.resolve()
+    return candidates[0].resolve()
+
+
+def _matches_roots(name, roots):
+    return any(name == root or name.startswith(root + '.') for root in roots)
+
+
+def _load_pretrained_modules(model, cfg, resume_path=None):
+    """Load exact-name compatible module tensors from a checkpoint."""
+    modules_cfg = cfg.get('pretrained', {}).get('modules', {})
+    if not modules_cfg or not modules_cfg.get('enabled', False):
+        return None
+    if resume_path:
+        print(f"[Module preload] Resume is set ({resume_path}); skipping module preload.")
+        return None
+
+    weights_value = modules_cfg.get('weights', None)
+    if not weights_value:
+        raise ValueError("pretrained.modules.enabled=true requires pretrained.modules.weights")
+    weights_path = _candidate_path(weights_value)
+    if not weights_path.exists():
+        raise FileNotFoundError(f"Module preload checkpoint not found: {weights_path}")
+
+    include = _as_name_list(modules_cfg.get('include', modules_cfg.get('modules', [])))
+    exclude = _as_name_list(modules_cfg.get('exclude', []))
+    if not include:
+        raise ValueError("pretrained.modules.include must list modules such as ['backbone', 'neck']")
+
+    print(f"[Module preload] Loading checkpoint: {weights_path}")
+    checkpoint = torch.load(str(weights_path), map_location='cpu', weights_only=False)
+    source_state = _extract_checkpoint_state_dict(checkpoint)
+    target_state = {
+        key: value for key, value in model.state_dict().items()
+        if not key.endswith('num_batches_tracked')
+    }
+
+    matched_state = {}
+    mismatched = []
+    skipped = 0
+    candidate_keys = 0
+    for source_key, tensor in source_state.items():
+        if source_key.endswith('num_batches_tracked'):
+            continue
+        if not _matches_roots(source_key, include):
+            continue
+        if exclude and _matches_roots(source_key, exclude):
+            skipped += 1
+            continue
+        candidate_keys += 1
+        if source_key not in target_state:
+            skipped += 1
+            continue
+        if tuple(target_state[source_key].shape) != tuple(tensor.shape):
+            mismatched.append({
+                'key': source_key,
+                'source_shape': tuple(tensor.shape),
+                'target_shape': tuple(target_state[source_key].shape),
+            })
+            continue
+        matched_state[source_key] = tensor
+
+    strict = bool(modules_cfg.get('strict', False))
+    expected_keys = [
+        key for key in target_state
+        if _matches_roots(key, include) and not (exclude and _matches_roots(key, exclude))
+    ]
+    missing = [key for key in expected_keys if key not in matched_state]
+    if strict and (missing or mismatched):
+        msg = ""
+        if mismatched:
+            first = mismatched[0]
+            msg = f"; first mismatch {first['key']} {first['source_shape']} != {first['target_shape']}"
+        raise RuntimeError(
+            f"Module strict preload failed: loaded {len(matched_state)}/{len(expected_keys)} "
+            f"expected tensors, missing={len(missing)}, mismatched={len(mismatched)}{msg}")
+
+    if not matched_state:
+        raise RuntimeError(
+            f"Module preload found no compatible tensors in {weights_path} for include={include}")
+
+    model.load_state_dict(matched_state, strict=False)
+    print(
+        f"[Module preload] Loaded {len(matched_state)}/{len(expected_keys)} tensors "
+        f"for include={include}; candidates={candidate_keys}, skipped={skipped}, "
+        f"missing={len(missing)}, mismatched={len(mismatched)}")
+    if matched_state:
+        print("  Sample module keys: " + ", ".join(list(matched_state.keys())[:5]))
+    if mismatched:
+        first = mismatched[0]
+        print(
+            f"  First shape mismatch: {first['key']} "
+            f"{first['source_shape']} != {first['target_shape']}")
+    return {
+        'loaded': len(matched_state),
+        'expected': len(expected_keys),
+        'missing': len(missing),
+        'mismatched': len(mismatched),
+        'weights_path': str(weights_path),
+    }
+
+
+def _module_roots_from_flags(cfg):
+    roots = []
+    if cfg.get('freeze_backbone', False):
+        roots.append('backbone')
+    if cfg.get('freeze_neck', False):
+        roots.append('neck')
+    if cfg.get('freeze_det_head', False):
+        roots.extend(['det_adapter', 'det_head'])
+    if cfg.get('freeze_pose_head', False):
+        roots.extend(['pose_adapter', 'pose_head'])
+    roots.extend(_as_name_list(cfg.get('freeze_modules', [])))
+    roots.extend(_as_name_list(cfg.get('modules', [])))
+    return list(dict.fromkeys(roots))
+
+
+def _apply_module_freeze(model, freeze_cfg=None, reset=False, label=''):
+    """Apply generic module freeze/trainable rules and remember frozen BN modules."""
+    freeze_cfg = freeze_cfg or {}
+    if reset:
+        for p in model.parameters():
+            p.requires_grad = True
+        setattr(model, '_frozen_module_roots', [])
+
+    trainable_roots = _as_name_list(freeze_cfg.get('trainable_modules', []))
+    if trainable_roots:
+        for p in model.parameters():
+            p.requires_grad = False
+        for name, param in model.named_parameters():
+            if _matches_roots(name, trainable_roots):
+                param.requires_grad = True
+
+    freeze_roots = _module_roots_from_flags(freeze_cfg)
+    for name, param in model.named_parameters():
+        if _matches_roots(name, freeze_roots):
+            param.requires_grad = False
+
+    freeze_bn = bool(freeze_cfg.get('freeze_bn', True))
+    frozen_for_eval = freeze_roots if freeze_bn else []
+    if trainable_roots and freeze_bn:
+        frozen_for_eval = [
+            name for name, _module in model.named_children()
+            if not _matches_roots(name, trainable_roots)
+        ]
+    setattr(model, '_frozen_module_roots', list(dict.fromkeys(frozen_for_eval)))
+
+    if trainable_roots or freeze_roots:
+        trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+        total = sum(p.numel() for p in model.parameters())
+        prefix = f"[Freeze:{label}]" if label else "[Freeze]"
+        print(
+            f"{prefix} trainable_modules={trainable_roots or 'all except frozen'} "
+            f"freeze_modules={freeze_roots or 'none'} freeze_bn={freeze_bn} "
+            f"trainable={trainable / 1e6:.2f}M / {total / 1e6:.2f}M")
+
+
+def _freeze_cfg_active(freeze_cfg):
+    if not freeze_cfg:
+        return False
+    if 'enabled' in freeze_cfg and not bool(freeze_cfg.get('enabled')):
+        return False
+    return bool(
+        _as_name_list(freeze_cfg.get('trainable_modules', [])) or
+        _module_roots_from_flags(freeze_cfg)
+    )
+
+
+def _apply_frozen_module_eval(model):
+    roots = getattr(model, '_frozen_module_roots', None) or []
+    if not roots:
+        return
+    for module_name, module in model.named_modules():
+        if module_name and _matches_roots(module_name, roots):
+            module.eval()
+
+
 def _load_model_weights_for_staged_resume(model, path, device):
     """Load model weights only; staged training creates a fresh optimizer per stage."""
     ckpt = torch.load(path, map_location=device, weights_only=False)
@@ -487,6 +682,24 @@ def main():
                 'neck_out_channels': neck_cfg.get('out_channels', None),
             })
         model_kwargs.update(detect_kwargs)
+    elif model_name in ('bifpn_pose', 'bifpn_pose_only', 'yolov8m_pose', 'yolov8m-pose'):
+        neck_cfg = cfg.get('neck', {}) or {}
+        assigner_cfg = cfg.get('assigner', {}) or {}
+        pose_kwargs = {
+            'num_kpts': cfg.get('num_kpts', 17),
+            'input_size': d_cfg.get('input_size', 640),
+            'assigner_topk': assigner_cfg.get('topk', 10),
+            'assigner_alpha': assigner_cfg.get('alpha', 0.5),
+            'assigner_beta': assigner_cfg.get('beta', 6.0),
+            'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
+        }
+        if model_name in ('bifpn_pose', 'bifpn_pose_only'):
+            pose_kwargs.update({
+                'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+                'neck_downsample': neck_cfg.get('downsample', 'conv'),
+                'neck_out_channels': neck_cfg.get('out_channels', None),
+            })
+        model_kwargs.update(pose_kwargs)
     else:
         model_kwargs.update({
             'num_kpts': cfg.get('num_kpts', 17),
@@ -496,6 +709,7 @@ def main():
     model = create_model(model_name, **model_kwargs)
     print(f"Parameters: {model.num_params / 1e6:.2f}M")
     _load_pretrained_backbone(model, cfg, resume_path=resume)
+    _load_pretrained_modules(model, cfg, resume_path=resume)
 
     # Set loss weights (override defaults)
     if hasattr(model, 'det_loss'):
@@ -503,9 +717,14 @@ def main():
         model.det_loss.w_cls = l_cfg.get('w_cls', 0.5)
         model.det_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
     if hasattr(model, 'pose_loss'):
-        model.pose_loss.w_box = 0.0
-        model.pose_loss.w_cls = 0.0
-        model.pose_loss.w_dfl = 0.0
+        if model_name in ('bifpn_pose', 'bifpn_pose_only', 'yolov8m_pose', 'yolov8m-pose'):
+            model.pose_loss.w_box = l_cfg.get('w_box', 7.5)
+            model.pose_loss.w_cls = l_cfg.get('w_cls', 0.5)
+            model.pose_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
+        else:
+            model.pose_loss.w_box = 0.0
+            model.pose_loss.w_cls = 0.0
+            model.pose_loss.w_dfl = 0.0
         model.pose_loss.w_pose = l_cfg.get('w_pose', 12.0)
         model.pose_loss.w_kobj = l_cfg.get('w_kobj', 1.0)
     if hasattr(model, 'disable_pose_proposal_training'):
@@ -527,6 +746,18 @@ def main():
     if keep_classes is not None:
         keep_classes = [int(c) for c in keep_classes]
         print(f"Target class filter: keep_classes={keep_classes}")
+    data_person_only = bool(d_cfg.get('person_only', False))
+    data_require_keypoints = bool(d_cfg.get('require_keypoints', False))
+    val_person_only = bool(d_cfg.get('val_person_only', data_person_only))
+    val_require_keypoints = bool(d_cfg.get('val_require_keypoints', data_require_keypoints))
+    if data_person_only or data_require_keypoints or val_person_only or val_require_keypoints:
+        print(
+            "Sample filters: "
+            f"train_person_only={data_person_only} "
+            f"train_require_keypoints={data_require_keypoints} "
+            f"val_person_only={val_person_only} "
+            f"val_require_keypoints={val_require_keypoints}"
+        )
     val_loader = create_dataloader(
         data_dir=data_root,
         img_dir=d_cfg.get('val_img', 'images/val2017'),
@@ -540,6 +771,8 @@ def main():
         drop_last=False,
         class_id_format=class_id_format,
         keep_classes=keep_classes,
+        person_only=val_person_only,
+        require_keypoints=val_require_keypoints,
     )
     print(f"Val: {len(val_loader.dataset)} samples")
 
@@ -641,7 +874,9 @@ def main():
             gradient_projection_eps=gradient_projection_cfg.get('eps', 1.0e-12),
         )
 
-    def _make_train_loader(person_only=False):
+    def _make_train_loader(person_only=None, require_keypoints=None):
+        effective_person_only = data_person_only or bool(person_only)
+        effective_require_keypoints = data_require_keypoints or bool(require_keypoints)
         return create_dataloader(
             data_dir=data_root,
             img_dir=d_cfg.get('train_img', 'images/train2017'),
@@ -672,7 +907,8 @@ def main():
             copy_paste_ioa=a_cfg.get('copy_paste_ioa', 0.3),
             copy_paste_max_objects=a_cfg.get('copy_paste_max_objects', 8),
             keep_classes=keep_classes,
-            person_only=person_only,
+            person_only=effective_person_only,
+            require_keypoints=effective_require_keypoints,
         )
 
     dynamic_cfg = t_cfg.get('dynamic_weights', {})
@@ -774,6 +1010,7 @@ def main():
         print(f"\n[Preflight] Checking one {tag} batch...")
         model.to(device)
         model.train()
+        _apply_frozen_module_eval(model)
         batch = next(iter(train_loader))
         images = batch['image'].to(device, non_blocking=True)
         gt_list = [{
@@ -812,9 +1049,9 @@ def main():
             _release_cuda_cache()
 
     def _set_trainable_stage(stage_cfg):
-        model.unfreeze_all()
-        if hasattr(model, 'disable_pose_proposal_training'):
-            model.disable_pose_proposal_training()
+        for p in model.parameters():
+            p.requires_grad = True
+        setattr(model, '_frozen_module_roots', [])
 
         model.train_det = bool(stage_cfg.get('train_det', True))
         model.train_pose = bool(stage_cfg.get('train_pose', True))
@@ -855,6 +1092,15 @@ def main():
             model.freeze_head('det')
         if stage_cfg.get('freeze_pose_head', False):
             model.freeze_head('pose')
+        stage_freeze_cfg = stage_cfg.get('freeze', stage_cfg)
+        if _freeze_cfg_active(stage_freeze_cfg):
+            _apply_module_freeze(
+                model,
+                stage_freeze_cfg,
+                reset=False,
+                label=stage_cfg.get('name', 'stage'))
+        if hasattr(model, 'disable_pose_proposal_training'):
+            model.disable_pose_proposal_training()
 
         use_stage_uncertainty = (
             dynamic_cfg.get('enabled', False) and
@@ -904,10 +1150,16 @@ def main():
             stage_name = stage_cfg.get('name', f'stage{stage_index}')
             stage_epochs = min(3, stage_cfg.get('epochs', 1)) if opts['debug'] else int(stage_cfg.get('epochs', 1))
             stage_lr = float(stage_cfg.get('lr0', opts['lr']))
-            person_only = bool(stage_cfg.get('person_only', False))
+            stage_person_only = stage_cfg.get('person_only', None)
+            stage_require_keypoints = stage_cfg.get('require_keypoints', None)
+            effective_person_only = data_person_only or bool(stage_person_only)
+            effective_require_keypoints = data_require_keypoints or bool(stage_require_keypoints)
 
             _set_trainable_stage(stage_cfg)
-            train_loader_stage = _make_train_loader(person_only=person_only)
+            train_loader_stage = _make_train_loader(
+                person_only=stage_person_only,
+                require_keypoints=stage_require_keypoints,
+            )
             print(f"\n{'='*60}")
             print(f"Stage {stage_index}: {stage_name} | Epochs: {stage_epochs} | LR: {stage_lr}")
             print(
@@ -915,7 +1167,8 @@ def main():
                 f"train_pose={getattr(model, 'train_pose', True)} "
                 f"freeze_backbone={stage_cfg.get('freeze_backbone', False)} "
                 f"trainable_backbone_layers={stage_cfg.get('trainable_backbone_layers', 'all')} "
-                f"person_only={person_only} "
+                f"person_only={effective_person_only} "
+                f"require_keypoints={effective_require_keypoints} "
                 f"dynamic={stage_cfg.get('use_dynamic_weights', False)} "
                 f"grad_proj={stage_cfg.get('use_gradient_projection', gradient_projection_cfg.get('enabled', False))}"
             )
@@ -970,6 +1223,11 @@ def main():
         print(f"\nStaged training complete for {model_name}!")
     else:
         # Single-stage training (original flow)
+        single_freeze_cfg = t_cfg.get('freeze', {}) or {}
+        if _freeze_cfg_active(single_freeze_cfg):
+            _apply_module_freeze(model, single_freeze_cfg, reset=True, label='single-stage')
+            if hasattr(model, 'disable_pose_proposal_training'):
+                model.disable_pose_proposal_training()
         train_loader = _make_train_loader()
         print(f"Train: {len(train_loader.dataset)} samples")
         _run_preflight(train_loader, val_loader, tag='single-stage')

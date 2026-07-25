@@ -39,7 +39,9 @@ def parse_args():
     p.add_argument("--weights", type=str, required=True)
     p.add_argument("--model", type=str, default=None,
                    choices=["bifpn", "bifpn_dual", "bifpn_detect", "bifpn_det",
-                            "yolov8n", "yolov8nano"])
+                            "bifpn_pose", "bifpn_pose_only",
+                            "yolov8n", "yolov8nano",
+                            "yolov8m_pose", "yolov8m-pose"])
     p.add_argument("--data", type=str, default=None)
     p.add_argument("--img-dir", type=str, default=None)
     p.add_argument("--label-dir", type=str, default=None)
@@ -104,6 +106,24 @@ def build_model(args, cfg, device):
                 "neck_out_channels": neck_cfg.get("out_channels", None),
             })
         model_kwargs.update(detect_kwargs)
+    elif model_name in ("bifpn_pose", "bifpn_pose_only", "yolov8m_pose", "yolov8m-pose"):
+        neck_cfg = cfg.get("neck", {}) or {}
+        assigner_cfg = cfg.get("assigner", {}) or {}
+        pose_kwargs = {
+            "num_kpts": cfg.get("num_kpts", 17),
+            "input_size": cfg.get("data", {}).get("input_size", 640),
+            "assigner_topk": assigner_cfg.get("topk", 10),
+            "assigner_alpha": assigner_cfg.get("alpha", 0.5),
+            "assigner_beta": assigner_cfg.get("beta", 6.0),
+            "assigner_eps": assigner_cfg.get("eps", 1.0e-9),
+        }
+        if model_name in ("bifpn_pose", "bifpn_pose_only"):
+            pose_kwargs.update({
+                "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+                "neck_downsample": neck_cfg.get("downsample", "conv"),
+                "neck_out_channels": neck_cfg.get("out_channels", None),
+            })
+        model_kwargs.update(pose_kwargs)
     else:
         model_kwargs.update({
             "num_kpts": cfg.get("num_kpts", 17),
@@ -476,6 +496,10 @@ def main():
         keep_classes = [0] if args.provider == "ultralytics_pose" else None
     if keep_classes is not None:
         keep_classes = [int(c) for c in keep_classes]
+    person_only = bool(d_cfg.get("person_only", False))
+    require_keypoints = bool(d_cfg.get("require_keypoints", False))
+    val_person_only = bool(d_cfg.get("val_person_only", person_only))
+    val_require_keypoints = bool(d_cfg.get("val_require_keypoints", require_keypoints))
 
     output_dir = Path(args.output_dir) if args.output_dir else Path(args.weights).resolve().parent / "cocoeval"
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -496,6 +520,8 @@ def main():
         drop_last=False,
         class_id_format=class_id_format,
         keep_classes=keep_classes,
+        person_only=val_person_only,
+        require_keypoints=val_require_keypoints,
     )
     if args.max_samples and 0 < args.max_samples < len(loader.dataset):
         loader = DataLoader(
@@ -512,7 +538,8 @@ def main():
         f"provider={args.provider} "
         f"task={task} "
         f"score={score_thresh} nms_iou={iou_thresh} max_det={max_det} "
-        f"coco_max_det={args.coco_max_det} keep_classes={keep_classes}"
+        f"coco_max_det={args.coco_max_det} keep_classes={keep_classes} "
+        f"person_only={val_person_only} require_keypoints={val_require_keypoints}"
     )
     if args.provider == "test_model":
         bbox_results, kpt_results, image_ids = export_predictions(

@@ -73,7 +73,7 @@ class COCOMultiTaskDataset(Dataset):
                  mosaic_prob=0.5, mixup_prob=0.0, cutmix_prob=0.0,
                  copy_paste_prob=0.0, copy_paste_ioa=0.3,
                  copy_paste_max_objects=8, keep_classes=None,
-                 person_only=False):
+                 person_only=False, require_keypoints=False):
         self.data_dir = Path(data_dir)
         self.img_dir = self.data_dir / img_dir
         self.label_dir = self.data_dir / label_dir if label_dir else None
@@ -101,6 +101,8 @@ class COCOMultiTaskDataset(Dataset):
         self.keep_classes = (
             None if keep_classes is None else {int(c) for c in keep_classes}
         )
+        self.person_only = bool(person_only)
+        self.require_keypoints = bool(require_keypoints)
         self._base_use_mosaic = self.use_mosaic
         self._base_mixup_prob = self.mixup_prob
         self._base_cutmix_prob = self.cutmix_prob
@@ -110,27 +112,18 @@ class COCOMultiTaskDataset(Dataset):
         self.samples = []
         n_labels = 0
         n_no_person = 0
+        n_no_keypoints = 0
         n_no_image = 0
         if self.label_dir and self.label_dir.exists():
             for lb in self.label_dir.glob('*.txt'):
                 n_labels += 1
-                # person_only filter: check raw class 0 in label file
-                if person_only:
-                    has_person = False
-                    try:
-                        with open(lb, 'r') as f:
-                            for line in f:
-                                parts = line.strip().split()
-                                if parts:
-                                    raw_cls = int(float(parts[0]))
-                                    mapped_cls = self._map_class_id(raw_cls, len(parts) > 5)
-                                    if mapped_cls is not None and mapped_cls == 0:
-                                        has_person = True
-                                        break
-                    except Exception:
-                        pass
-                    if not has_person:
+                if self.person_only or self.require_keypoints:
+                    has_person, has_keypoints = self._label_has_person_keypoints(lb)
+                    if self.person_only and not has_person:
                         n_no_person += 1
+                        continue
+                    if self.require_keypoints and not has_keypoints:
+                        n_no_keypoints += 1
                         continue
 
                 img_name = lb.stem + '.jpg'
@@ -142,9 +135,10 @@ class COCOMultiTaskDataset(Dataset):
                 else:
                     n_no_image += 1
 
-            if person_only:
+            if self.person_only or self.require_keypoints:
                 print(f"  Dataset({img_dir}): {n_labels} labels, "
                       f"{n_no_person} filtered (no person), "
+                      f"{n_no_keypoints} filtered (no visible keypoints), "
                       f"{n_no_image} no image, {len(self.samples)} kept", flush=True)
         else:
             # Only images (no labels) for prediction
@@ -160,6 +154,37 @@ class COCOMultiTaskDataset(Dataset):
 
     def __len__(self):
         return len(self.samples)
+
+    def _label_has_person_keypoints(self, label_path):
+        has_person = False
+        has_keypoints = False
+        try:
+            with open(label_path, 'r') as f:
+                for line in f:
+                    parts = line.strip().split()
+                    if len(parts) < 5:
+                        continue
+                    try:
+                        raw_cls = int(float(parts[0]))
+                    except ValueError:
+                        continue
+                    mapped_cls = self._map_class_id(raw_cls, len(parts) > 5)
+                    if mapped_cls != 0:
+                        continue
+                    has_person = True
+                    kpt_data = parts[5:]
+                    for vis_idx in range(2, len(kpt_data), 3):
+                        try:
+                            if float(kpt_data[vis_idx]) > 0:
+                                has_keypoints = True
+                                break
+                        except ValueError:
+                            continue
+                    if has_keypoints:
+                        break
+        except OSError:
+            pass
+        return has_person, has_keypoints
 
     def set_close_mosaic(self, close=False):
         """Disable strong composite augmentations during final fine-tuning."""
@@ -800,7 +825,8 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
                       mosaic_prob=0.5, mixup_prob=0.0, cutmix_prob=0.0,
                       copy_paste_prob=0.0, copy_paste_ioa=0.3,
                       copy_paste_max_objects=8, keep_classes=None,
-                      person_only=False, persistent_workers=False):
+                      person_only=False, require_keypoints=False,
+                      persistent_workers=False):
     """Create DataLoader for COCO dataset."""
     dataset = COCOMultiTaskDataset(
         data_dir=data_dir,
@@ -829,6 +855,7 @@ def create_dataloader(data_dir, img_dir, label_dir=None,
         copy_paste_max_objects=copy_paste_max_objects,
         keep_classes=keep_classes,
         person_only=person_only,
+        require_keypoints=require_keypoints,
     )
 
     sampler = None

@@ -1,21 +1,17 @@
-# BiFPN pose-only experiment with a YOLOv8-style single pose head.
-# Reference yolov8m-pose.pt train_args inspected locally:
+# YOLOv8m-pose replica using the local training/eval pipeline.
+# Official yolov8m-pose.pt train_args inspected locally:
 # task=pose, epochs=1000, batch=128, imgsz=640, optimizer=SGD,
 # pretrained=False, lr0=0.01, lrf=0.01, momentum=0.937,
-# weight_decay=0.0005, warmup_epochs=3.0, close_mosaic=20,
-# box=7.5, cls=0.5, dfl=1.5, pose=12.0, kobj=1.0,
-# mosaic=0.0, mixup=0.0, copy_paste=0.0, scale=0.9.
+# weight_decay=0.0005, warmup_epochs=3.0, warmup_momentum=0.8,
+# warmup_bias_lr=0.1, close_mosaic=20, box=7.5, cls=0.5,
+# dfl=1.5, pose=12.0, kobj=1.0, nbs=64, scale=0.9,
+# mosaic=0.0, mixup=0.0, copy_paste=0.0.
 
-model: bifpn_pose
+model: yolov8m_pose
 num_classes: 1
 num_det_classes: 1
 num_kpts: 17
 reg_max: 16
-
-neck:
-  out_channels: 256
-  use_p2_context: false
-  downsample: conv
 
 assigner:
   topk: 10
@@ -30,12 +26,6 @@ pretrained:
     auto_download: true
     prefer_pose: true
     cache_dir: checkpoints/yolo
-    strict: false
-  modules:
-    enabled: true
-    weights: checkpoints/single_bifpn_det/bifpn_detect/bifpn_detect_best.pt
-    include: [backbone, neck]
-    exclude: []
     strict: false
 
 data:
@@ -54,8 +44,8 @@ data:
 
 training:
   epochs: 1000
-  batch_size: 32
-  workers: 14
+  batch_size: 128
+  workers: 12
 
   optimizer: sgd
   lr0: 0.01
@@ -82,7 +72,7 @@ training:
   val_interval: 1
   save_interval: 50
   save_best_by: loss
-  save_dir: checkpoints/single_bifpn_pose
+  save_dir: checkpoints/yolov8m_pose_replica
   tensorboard: true
   log_interval: 50
 
@@ -102,14 +92,6 @@ training:
     enabled: false
     method: pcgrad
     eps: 1.0e-12
-
-  freeze:
-    enabled: true
-    # Detection-to-pose transfer: keep the pretrained detector backbone/neck
-    # fixed and learn only the pose adapter/head first.
-    trainable_modules: [pose_adapter, pose_head]
-    freeze_modules: []
-    freeze_bn: true
 
   staged_training:
     enabled: false

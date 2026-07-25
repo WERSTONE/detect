@@ -143,6 +143,16 @@ class Trainer:
         self.use_amp = use_amp and self.device.type == 'cuda'
         self.scaler = torch.amp.GradScaler('cuda') if self.use_amp else None
 
+    def _apply_frozen_module_eval(self):
+        roots = getattr(self.model, '_frozen_module_roots', None) or []
+        if not roots:
+            return
+        for module_name, module in self.model.named_modules():
+            if module_name and any(
+                    module_name == root or module_name.startswith(root + '.')
+                    for root in roots):
+                module.eval()
+
     def _build_param_groups(self):
         if self.param_group_mode == 'yolo':
             norm_types = tuple(v for k, v in nn.__dict__.items() if 'Norm' in k)
@@ -439,6 +449,7 @@ class Trainer:
             close_mosaic: If True, disable mosaic for this epoch
         """
         self.model.train()
+        self._apply_frozen_module_eval()
 
         # Set mosaic mode
         if close_mosaic is not None:
