@@ -352,15 +352,12 @@ class Trainer:
                 ('target_scores_sum_pose', 'score_sum'),
             ]),
             ('dyn', [
-                ('task_w_det', 'task_det'),
-                ('task_w_pose', 'task_pose'),
-                ('log_var_det', 'logvar_det'),
-                ('log_var_pose', 'logvar_pose'),
-                ('uncertainty_w_det', 'unc_det'),
-                ('uncertainty_w_pose', 'unc_pose'),
+                ('dyn_w_det', 'w_det'),
+                ('dyn_w_pose', 'w_pose'),
             ]),
             ('misc', [
-                ('total', 'total'),
+                ('loss_total', 'loss'),
+                ('total', 'obj'),
                 ('num_pos', 'num_pos'),
                 ('target_scores_sum', 'score_sum'),
                 ('skipped', 'skipped'),
@@ -875,7 +872,10 @@ class Trainer:
                 val_m = self.validate(val_loader)
 
                 metric_payload = dict(val_m)
-                current = metric_payload.get('val_total', float('inf'))
+                current = metric_payload.get(
+                    'val_loss_total',
+                    metric_payload.get('val_total', float('inf')),
+                )
                 improved = self._is_improved(current)
                 if improved:
                     self.best_metric = current

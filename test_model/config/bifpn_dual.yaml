@@ -117,7 +117,7 @@ training:
   # Sub-loss weights stay in the loss section below.
   dynamic_weights:
     enabled: true
-    method: uncertainty    # fixed | uncertainty | dwa
+    method: dwa            # fixed | uncertainty | dwa
 
     # DWA (Dynamic Weight Average) uses the ratio of recent task losses:
     # r_i(t-1)=L_i(t-1)/L_i(t-2), w_i=2*softmax(r_i/temperature).

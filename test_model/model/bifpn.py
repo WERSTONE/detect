@@ -386,10 +386,18 @@ class ModelE_BiFPN(nn.Module):
         det_obj, pose_obj, det_log_var, pose_log_var = self._weighted_total(
             det_losses['total'], pose_losses['total'], device, images.shape[0])
         total = det_obj + pose_obj
+        raw_total = det_losses['total'] + pose_losses['total']
 
         det_scale = self.det_weight_mult if self.training else 1.0
+        if self.use_uncertainty_weighting and self.training:
+            dyn_w_det = torch.exp(-det_log_var.detach()) if self.train_det else torch.zeros((), device=device)
+            dyn_w_pose = torch.exp(-pose_log_var.detach()) if self.train_pose else torch.zeros((), device=device)
+        else:
+            dyn_w_det = torch.tensor(self.det_task_weight if self.train_det else 0.0, device=device)
+            dyn_w_pose = torch.tensor(self.pose_task_weight if self.train_pose else 0.0, device=device)
         loss_dict = {
             'total': total,
+            'loss_total': raw_total.detach(),
             '_gp_det_loss': det_obj,
             '_gp_pose_loss': pose_obj,
             'det_total': (det_losses['det_total'] * det_scale).detach(),
@@ -421,6 +429,8 @@ class ModelE_BiFPN(nn.Module):
             ),
             'task_w_det': torch.tensor(self.det_task_weight, device=device),
             'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
+            'dyn_w_det': dyn_w_det,
+            'dyn_w_pose': dyn_w_pose,
             'log_var_det': self.log_var_det.detach(),
             'log_var_pose': self.log_var_pose.detach(),
             'uncertainty_w_det': torch.exp(-det_log_var.detach()),
