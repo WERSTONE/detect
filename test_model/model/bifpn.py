@@ -230,9 +230,41 @@ class ModelE_BiFPN(nn.Module):
         self.pose_uncertainty_weight_max = pose_max
 
     @staticmethod
-    def _bounded_log_var(log_var, weight_min=None, weight_max=None):
+    def _log_var_bounds(weight_min=None, weight_max=None):
         min_log_var = None if weight_max is None else -math.log(float(weight_max))
         max_log_var = None if weight_min is None else -math.log(float(weight_min))
+        return min_log_var, max_log_var
+
+    def uncertainty_log_var_bounds(self):
+        return {
+            'log_var_det': self._log_var_bounds(
+                self.det_uncertainty_weight_min,
+                self.det_uncertainty_weight_max,
+            ),
+            'log_var_pose': self._log_var_bounds(
+                self.pose_uncertainty_weight_min,
+                self.pose_uncertainty_weight_max,
+            ),
+        }
+
+    def clamp_uncertainty_parameters(self):
+        if not self.use_uncertainty_weighting:
+            return
+        bounds = self.uncertainty_log_var_bounds()
+        with torch.no_grad():
+            for name, param in (
+                    ('log_var_det', self.log_var_det),
+                    ('log_var_pose', self.log_var_pose)):
+                min_log_var, max_log_var = bounds[name]
+                if min_log_var is not None or max_log_var is not None:
+                    param.clamp_(
+                        min=-float('inf') if min_log_var is None else min_log_var,
+                        max=float('inf') if max_log_var is None else max_log_var,
+                    )
+
+    @staticmethod
+    def _bounded_log_var(log_var, weight_min=None, weight_max=None):
+        min_log_var, max_log_var = ModelE_BiFPN._log_var_bounds(weight_min, weight_max)
         if min_log_var is None and max_log_var is None:
             return log_var
         if min_log_var is None:

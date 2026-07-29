@@ -117,8 +117,19 @@ training:
   # Sub-loss weights stay in the loss section below.
   dynamic_weights:
     enabled: true
-    method: uncertainty    # uncertainty | dwa
+    method: uncertainty    # fixed | uncertainty | dwa
+
+    # DWA (Dynamic Weight Average) uses the ratio of recent task losses:
+    # r_i(t-1)=L_i(t-1)/L_i(t-2), w_i=2*softmax(r_i/temperature).
+    # Larger temperature makes weights closer to 1:1. Use source=train unless
+    # val_interval is 1 and you explicitly want validation-loss-driven weights.
     temperature: 2.0
+    warmup_epochs: 2
+    source: train          # train | val
+    ratio_min: 0.0         # DWA ratio clamp for abnormal loss spikes
+    ratio_max: 5.0
+
+    # Bounds apply to DWA task weights and uncertainty effective weights.
     det_min: 0.2
     det_max: 5.0
     pose_min: 0.2

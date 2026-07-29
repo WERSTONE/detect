@@ -925,8 +925,17 @@ def main():
 
     dynamic_cfg = t_cfg.get('dynamic_weights', {})
     task_loss_history = []
+    dynamic_enabled = bool(dynamic_cfg.get('enabled', False))
     dynamic_method = str(dynamic_cfg.get('method', 'dwa')).lower()
-    if dynamic_cfg.get('enabled', False) and dynamic_method == 'uncertainty':
+    if dynamic_method in ('none', 'fixed', 'off'):
+        dynamic_method = 'fixed'
+        dynamic_enabled = False
+    if dynamic_method not in ('fixed', 'uncertainty', 'dwa'):
+        raise ValueError(
+            f"Unsupported dynamic weight method: {dynamic_method}. "
+            "Use one of: fixed, uncertainty, dwa.")
+
+    if dynamic_enabled and dynamic_method == 'uncertainty':
         if not hasattr(model, 'enable_uncertainty_weighting'):
             raise ValueError("uncertainty dynamic weighting is only supported by dual-head models")
         if hasattr(model, 'set_uncertainty_weight_bounds'):
@@ -938,6 +947,14 @@ def main():
             )
         model.enable_uncertainty_weighting(True)
         print("Dynamic weights: uncertainty weighting enabled")
+    elif dynamic_enabled and dynamic_method == 'dwa':
+        print(
+            "Dynamic weights: DWA enabled "
+            f"(temperature={dynamic_cfg.get('temperature', 2.0)}, "
+            f"warmup_epochs={dynamic_cfg.get('warmup_epochs', 2)}, "
+            f"source={dynamic_cfg.get('source', 'train')})")
+    elif hasattr(model, 'enable_uncertainty_weighting'):
+        model.enable_uncertainty_weighting(False)
 
     def _apply_dynamic_weights(epoch):
         if hasattr(model, 'disable_pose_proposal_training'):
@@ -948,9 +965,9 @@ def main():
                     model.set_task_weights(1.0 if model.train_det else 0.0,
                                            1.0 if model.train_pose else 0.0)
                 return
-        if dynamic_method == 'uncertainty':
+        if dynamic_enabled and dynamic_method == 'uncertainty':
             return
-        if not dynamic_cfg.get('enabled', False):
+        if not dynamic_enabled:
             if hasattr(model, 'set_task_weights'):
                 model.set_task_weights(1.0, 1.0)
             return
@@ -960,9 +977,14 @@ def main():
 
         num_tasks = 2.0
         temperature = float(dynamic_cfg.get('temperature', 2.0))
+        if temperature <= 0:
+            raise ValueError("training.dynamic_weights.temperature must be > 0 for DWA")
+        warmup_epochs = int(dynamic_cfg.get('warmup_epochs', 2))
         eps = float(dynamic_cfg.get('eps', 1e-8))
+        ratio_min = float(dynamic_cfg.get('ratio_min', 0.0))
+        ratio_max = float(dynamic_cfg.get('ratio_max', 5.0))
 
-        if epoch < 2 or len(task_loss_history) < 2:
+        if epoch < warmup_epochs or len(task_loss_history) < 2:
             det_weight = 1.0
             pose_weight = 1.0
         else:
@@ -970,6 +992,8 @@ def main():
             prev1 = task_loss_history[-1]
             det_ratio = prev1['det_total'] / max(prev2['det_total'], eps)
             pose_ratio = prev1['pose_total'] / max(prev2['pose_total'], eps)
+            det_ratio = float(min(max(det_ratio, ratio_min), ratio_max))
+            pose_ratio = float(min(max(pose_ratio, ratio_min), ratio_max))
             det_score = torch.exp(torch.tensor(det_ratio / temperature, dtype=torch.float32)).item()
             pose_score = torch.exp(torch.tensor(pose_ratio / temperature, dtype=torch.float32)).item()
             norm = max(det_score + pose_score, eps)
@@ -982,8 +1006,17 @@ def main():
             model.set_task_weights(det_weight, pose_weight)
 
     def _record_task_losses(epoch, train_metrics, _val_metrics=None):
-        det_total = float(train_metrics.get('det_total', 0.0))
-        pose_total = float(train_metrics.get('pose_total', 0.0))
+        source = str(dynamic_cfg.get('source', 'train')).lower()
+        if source == 'val':
+            if not _val_metrics:
+                return
+            det_total = float(_val_metrics.get('val_det_total', 0.0))
+            pose_total = float(_val_metrics.get('val_pose_total', 0.0))
+        elif source == 'train':
+            det_total = float(train_metrics.get('det_total', 0.0))
+            pose_total = float(train_metrics.get('pose_total', 0.0))
+        else:
+            raise ValueError("training.dynamic_weights.source must be 'train' or 'val'")
         task_loss_history.append({
             'epoch': int(epoch),
             'det_total': max(det_total, 1e-8),
@@ -1036,9 +1069,16 @@ def main():
                     losses = model.compute_loss(images, gt_list)
             else:
                 losses = model.compute_loss(images, gt_list)
-        print("  loss ok: " + " ".join(
-            f"{k}={v:.4f}" for k, v in sorted(losses.items())
-            if isinstance(v, torch.Tensor) and not str(k).startswith('_')))
+        print("  loss ok:")
+        visible_losses = {
+            key: value for key, value in losses.items()
+            if isinstance(value, torch.Tensor) and not str(key).startswith('_')
+        }
+        for line in Trainer.format_metric_lines(
+                visible_losses,
+                label='preflight',
+                indent='    '):
+            print(line)
         del losses, images, gt_list, batch
         _release_cuda_cache()
 
@@ -1115,7 +1155,7 @@ def main():
             model.disable_pose_proposal_training()
 
         use_stage_uncertainty = (
-            dynamic_cfg.get('enabled', False) and
+            dynamic_enabled and
             dynamic_method == 'uncertainty' and
             stage_cfg.get('use_dynamic_weights', False)
         )

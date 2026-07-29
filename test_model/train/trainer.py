@@ -286,9 +286,96 @@ class Trainer:
             elif name == 'other' or name in ('weight', 'bn', 'bias'):
                 group['lr_mult'] = 1.0
 
+    def _clamp_dynamic_model_state(self):
+        if hasattr(self.model, 'clamp_uncertainty_parameters'):
+            self.model.clamp_uncertainty_parameters()
+        if not (self.ema_enabled and self._ema_state):
+            return
+        if not hasattr(self.model, 'uncertainty_log_var_bounds'):
+            return
+        for name, (min_log_var, max_log_var) in self.model.uncertainty_log_var_bounds().items():
+            tensor = self._ema_state.get(name)
+            if tensor is None:
+                continue
+            if min_log_var is None and max_log_var is None:
+                continue
+            tensor.clamp_(
+                min=-float('inf') if min_log_var is None else min_log_var,
+                max=float('inf') if max_log_var is None else max_log_var,
+            )
+
     @staticmethod
     def _should_log_loss_key(key):
         return not str(key).startswith('_')
+
+    @staticmethod
+    def _format_metric_value(value):
+        if isinstance(value, torch.Tensor):
+            value = value.detach().item()
+        if isinstance(value, (int, float, np.floating)):
+            return f"{float(value):.4f}"
+        return str(value)
+
+    @classmethod
+    def _format_metric_pairs(cls, metrics, keys, prefix=''):
+        parts = []
+        for key, label in keys:
+            full_key = prefix + key
+            if full_key in metrics:
+                parts.append(f"{label}={cls._format_metric_value(metrics[full_key])}")
+        return parts
+
+    @classmethod
+    def format_metric_lines(cls, metrics, label='train', indent='  ', prefix='',
+                            extra=None):
+        """Return compact grouped console lines for train/val loss metrics."""
+        extra = extra or {}
+        groups = [
+            ('det', [
+                ('det_ciou', 'ciou'),
+                ('det_cls', 'cls'),
+                ('det_dfl', 'dfl'),
+                ('det_total', 'total'),
+                ('det_num_pos', 'pos'),
+                ('target_scores_sum_det', 'score_sum'),
+            ]),
+            ('pose', [
+                ('pose_det_ciou', 'det_ciou'),
+                ('pose_det_cls', 'det_cls'),
+                ('pose_det_dfl', 'det_dfl'),
+                ('pose_det_total', 'det_total'),
+                ('pose_kobj', 'kobj'),
+                ('pose_kpt', 'kpt'),
+                ('pose_kpt_total', 'kpt_total'),
+                ('pose_total', 'total'),
+                ('pose_num_pos', 'pos'),
+                ('target_scores_sum_pose', 'score_sum'),
+            ]),
+            ('dyn', [
+                ('task_w_det', 'task_det'),
+                ('task_w_pose', 'task_pose'),
+                ('log_var_det', 'logvar_det'),
+                ('log_var_pose', 'logvar_pose'),
+                ('uncertainty_w_det', 'unc_det'),
+                ('uncertainty_w_pose', 'unc_pose'),
+            ]),
+            ('misc', [
+                ('total', 'total'),
+                ('num_pos', 'num_pos'),
+                ('target_scores_sum', 'score_sum'),
+                ('skipped', 'skipped'),
+            ]),
+        ]
+
+        lines = []
+        for group_name, keys in groups:
+            parts = cls._format_metric_pairs(metrics, keys, prefix=prefix)
+            if group_name == 'misc':
+                for key, value in extra.items():
+                    parts.append(f"{key}={cls._format_metric_value(value)}")
+            if parts:
+                lines.append(f"{indent}{label}/{group_name}: " + " ".join(parts))
+        return lines
 
     def _collect_task_grads(self, task_loss, params, retain_graph):
         self.optimizer.zero_grad(set_to_none=True)
@@ -588,6 +675,7 @@ class Trainer:
                     optimizer_stepped = True
 
             if optimizer_stepped:
+                self._clamp_dynamic_model_state()
                 self.global_step += 1
                 if self.ema_enabled:
                     self._update_ema()
@@ -601,9 +689,17 @@ class Trainer:
 
             if step % self.log_interval == 0:
                 pct = step / n_batches * 100
-                parts = [f"{k}={(running[k] / self.log_interval).item():.4f}" for k in sorted(running)]
-                parts.append(f"lr={last_lr:.2e}")
-                print(f"  [{step}/{n_batches} {pct:.0f}%] " + " ".join(parts))
+                avg_running = {
+                    k: (running[k] / self.log_interval).item()
+                    for k in running
+                }
+                print(f"  [{step}/{n_batches} {pct:.0f}%]")
+                for line in self.format_metric_lines(
+                        avg_running,
+                        label='train',
+                        indent='    ',
+                        extra={'lr': f"{last_lr:.2e}"}):
+                    print(line)
                 if self.writer:
                     for k in running:
                         self.writer.add_scalar(f'train/{k}', (running[k] / self.log_interval).item(), self.global_step)
@@ -695,6 +791,7 @@ class Trainer:
         if self.ema_enabled and 'ema_state' in ckpt:
             self._ema_state = {name: t.to(self.device)
                                for name, t in ckpt['ema_state'].items()}
+        self._clamp_dynamic_model_state()
         self.current_epoch = ckpt.get('epoch', 0)
         self.global_step = ckpt.get('global_step', 0)
         print(f"  Loaded: {path} (epoch {self.current_epoch})")
@@ -709,6 +806,7 @@ class Trainer:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         state = ckpt.get('model_state_dict', ckpt)
         self.model.load_state_dict(state)
+        self._clamp_dynamic_model_state()
         if self.ema_enabled:
             self._ema_state = {
                 name: tensor.detach().clone()
@@ -770,13 +868,11 @@ class Trainer:
                                        close_mosaic=close_mosaic)
             elapsed = time.time() - t0
 
-            log = f"Epoch {epoch + 1:3d}/{epochs} | {elapsed:.0f}s | "
-            log += " ".join(f"{k}={v:.4f}" for k, v in sorted(train_m.items()))
-
             do_val = val_loader and (epoch + 1) % self.val_interval == 0
+            val_m = None
+            status = ''
             if do_val:
                 val_m = self.validate(val_loader)
-                log += " | " + " ".join(f"{k}={v:.4f}" for k, v in sorted(val_m.items()))
 
                 metric_payload = dict(val_m)
                 current = metric_payload.get('val_total', float('inf'))
@@ -785,13 +881,22 @@ class Trainer:
                     self.best_metric = current
                     self.early_stop_bad_epochs = 0
                     self.save(self.save_dir / f"{save_prefix}_best.pt", metric_payload)
-                    log += " [BEST]"
+                    status = ' [BEST]'
                 elif (self.early_stop_enabled and
                       epoch + 1 >= self.early_stop_start_epoch):
                     self.early_stop_bad_epochs += 1
-                    log += f" [NO_IMPROVE {self.early_stop_bad_epochs}/{self.early_stop_patience}]"
+                    status = f" [NO_IMPROVE {self.early_stop_bad_epochs}/{self.early_stop_patience}]"
 
-            print(log)
+            print(f"Epoch {epoch + 1:3d}/{epochs} | {elapsed:.0f}s{status}")
+            for line in self.format_metric_lines(train_m, label='train', indent='  '):
+                print(line)
+            if do_val:
+                for line in self.format_metric_lines(
+                        val_m,
+                        label='val',
+                        indent='  ',
+                        prefix='val_'):
+                    print(line)
 
             if self.writer:
                 for k, v in train_m.items():
