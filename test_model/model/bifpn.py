@@ -236,10 +236,13 @@ class ModelE_BiFPN(nn.Module):
         if min_log_var is None and max_log_var is None:
             return log_var
         if min_log_var is None:
-            return torch.clamp(log_var, max=max_log_var)
+            bounded = torch.clamp(log_var, max=max_log_var)
+            return log_var + (bounded - log_var).detach()
         if max_log_var is None:
-            return torch.clamp(log_var, min=min_log_var)
-        return torch.clamp(log_var, min=min_log_var, max=max_log_var)
+            bounded = torch.clamp(log_var, min=min_log_var)
+            return log_var + (bounded - log_var).detach()
+        bounded = torch.clamp(log_var, min=min_log_var, max=max_log_var)
+        return log_var + (bounded - log_var).detach()
 
     def update_det_weight(self, epoch):
         if self.det_weight_warmup_epochs <= 0:
@@ -291,9 +294,16 @@ class ModelE_BiFPN(nn.Module):
             'target_scores_sum': zero.detach(),
         }
 
-    def _weighted_total(self, det_raw_total, pose_raw_total, device):
+    def _weighted_total(self, det_raw_total, pose_raw_total, device, batch_size=1):
+        batch_size = max(int(batch_size), 1)
         det_raw_total = det_raw_total * (self.det_weight_mult if self.training else 1.0)
         if self.use_uncertainty_weighting and self.training:
+            # YOLO losses are multiplied by batch size for optimizer scaling.
+            # Learn task uncertainty from the unscaled task loss so the learned
+            # weights are not driven down simply because the batch is large,
+            # then multiply the objective back to keep model-gradient scale.
+            det_loss_scale = det_raw_total / batch_size
+            pose_loss_scale = pose_raw_total / batch_size
             det_log_var = self._bounded_log_var(
                 self.log_var_det,
                 self.det_uncertainty_weight_min,
@@ -304,8 +314,14 @@ class ModelE_BiFPN(nn.Module):
                 self.pose_uncertainty_weight_min,
                 self.pose_uncertainty_weight_max,
             )
-            det_obj = torch.exp(-det_log_var) * det_raw_total + det_log_var if self.train_det else torch.zeros((), device=device)
-            pose_obj = torch.exp(-pose_log_var) * pose_raw_total + pose_log_var if self.train_pose else torch.zeros((), device=device)
+            det_obj = (
+                (torch.exp(-det_log_var) * det_loss_scale + det_log_var) *
+                batch_size
+                if self.train_det else torch.zeros((), device=device))
+            pose_obj = (
+                (torch.exp(-pose_log_var) * pose_loss_scale + pose_log_var) *
+                batch_size
+                if self.train_pose else torch.zeros((), device=device))
         else:
             det_log_var = self.log_var_det
             pose_log_var = self.log_var_pose
@@ -336,7 +352,7 @@ class ModelE_BiFPN(nn.Module):
             pose_losses['pose_kobj'] = torch.zeros((), device=device)
 
         det_obj, pose_obj, det_log_var, pose_log_var = self._weighted_total(
-            det_losses['total'], pose_losses['total'], device)
+            det_losses['total'], pose_losses['total'], device, images.shape[0])
         total = det_obj + pose_obj
 
         det_scale = self.det_weight_mult if self.training else 1.0
