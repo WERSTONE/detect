@@ -93,6 +93,7 @@ training:
     keep_current_lr: true
     lr_scale: 1.0
     init_best_from_resume: true
+    reset_ema_from_model: true
     keep_mosaic_closed: true
 
   early_stop:

@@ -1357,7 +1357,13 @@ def main():
 
         trainer = _make_trainer(opts['lr'])
         if resume:
-            trainer.load(resume)
+            reset_ema_from_model = _config_bool(
+                resume_cfg.get(
+                    'reset_ema_from_model',
+                    resume_cfg.get('init_best_from_resume', False),
+                )
+            )
+            trainer.load(resume, reset_ema_from_model=reset_ema_from_model)
 
         epochs = 3 if opts['debug'] else opts['epochs']
         _preserve_resume_lr(trainer, epochs)

@@ -462,6 +462,11 @@ class Trainer:
             if torch.is_floating_point(tensor)
         }
 
+    def reset_ema_from_model(self):
+        """Reset EMA shadow to the currently loaded model weights."""
+        if self.ema_enabled:
+            self._build_ema()
+
     def _update_ema(self):
         d = self.ema_decay
         current_state = self.model.state_dict()
@@ -771,7 +776,7 @@ class Trainer:
             self._swap_ema(to_ema=True)
         print(f"  Saved: {path}")
 
-    def load(self, path):
+    def load(self, path, reset_ema_from_model=False):
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.model.load_state_dict(ckpt['model_state_dict'])
         if 'optimizer_state_dict' in ckpt:
@@ -785,7 +790,10 @@ class Trainer:
                 )
         if self.scaler and 'scaler_state_dict' in ckpt:
             self.scaler.load_state_dict(ckpt['scaler_state_dict'])
-        if self.ema_enabled and 'ema_state' in ckpt:
+        if self.ema_enabled and reset_ema_from_model:
+            self.reset_ema_from_model()
+            print("  EMA reset from loaded model weights")
+        elif self.ema_enabled and 'ema_state' in ckpt:
             self._ema_state = {name: t.to(self.device)
                                for name, t in ckpt['ema_state'].items()}
         self._clamp_dynamic_model_state()
