@@ -62,6 +62,14 @@ def _is_cuda_device(device):
     return torch.device(device).type == 'cuda'
 
 
+def _config_bool(value, default=False):
+    if value is None:
+        return bool(default)
+    if isinstance(value, str):
+        return value.strip().lower() in ('1', 'true', 'yes', 'y', 'on')
+    return bool(value)
+
+
 def parse_args():
     p = argparse.ArgumentParser(description='Train multi-head verification model')
     p.add_argument('--config', type=str, default=None,
@@ -823,6 +831,10 @@ def main():
         'coco_max_det': cfg.get('eval', {}).get('coco_max_det', 100),
     }
 
+    resume_cfg = t_cfg.get('resume', {}) or {}
+    if resume and _config_bool(resume_cfg.get('keep_mosaic_closed', False)):
+        opts['no_mosaic'] = True
+        print("[Resume] keep_mosaic_closed=true; training mosaic is disabled.")
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
 
     gradient_projection_cfg = t_cfg.get('gradient_projection', {})
@@ -924,6 +936,12 @@ def main():
         )
 
     dynamic_cfg = t_cfg.get('dynamic_weights', {})
+    task_weights_cfg = t_cfg.get('task_weights', {}) or {}
+    base_det_weight = float(task_weights_cfg.get('det', task_weights_cfg.get('detection', 1.0)))
+    base_pose_weight = float(task_weights_cfg.get('pose', 1.0))
+    if base_det_weight < 0 or base_pose_weight < 0:
+        raise ValueError("training.task_weights det/pose must be >= 0")
+    print(f"Base task weights: det={base_det_weight:.4g} pose={base_pose_weight:.4g}")
     task_loss_history = []
     dynamic_enabled = bool(dynamic_cfg.get('enabled', False))
     dynamic_method = str(dynamic_cfg.get('method', 'dwa')).lower()
@@ -962,14 +980,14 @@ def main():
         if hasattr(model, 'train_det') and hasattr(model, 'train_pose'):
             if not model.train_det or not model.train_pose:
                 if hasattr(model, 'set_task_weights'):
-                    model.set_task_weights(1.0 if model.train_det else 0.0,
-                                           1.0 if model.train_pose else 0.0)
+                    model.set_task_weights(base_det_weight if model.train_det else 0.0,
+                                           base_pose_weight if model.train_pose else 0.0)
                 return
         if dynamic_enabled and dynamic_method == 'uncertainty':
             return
         if not dynamic_enabled:
             if hasattr(model, 'set_task_weights'):
-                model.set_task_weights(1.0, 1.0)
+                model.set_task_weights(base_det_weight, base_pose_weight)
             return
         method = dynamic_method
         if method != 'dwa':
@@ -1000,6 +1018,8 @@ def main():
             det_weight = num_tasks * det_score / norm
             pose_weight = num_tasks * pose_score / norm
 
+        det_weight *= base_det_weight
+        pose_weight *= base_pose_weight
         det_weight = float(min(max(det_weight, dynamic_cfg.get('det_min', 0.2)), dynamic_cfg.get('det_max', 5.0)))
         pose_weight = float(min(max(pose_weight, dynamic_cfg.get('pose_min', 0.2)), dynamic_cfg.get('pose_max', 5.0)))
         if hasattr(model, 'set_task_weights'):
@@ -1050,6 +1070,57 @@ def main():
         gc.collect()
         if _is_cuda_device(device):
             torch.cuda.empty_cache()
+
+    def _preserve_resume_lr(trainer, total_epochs):
+        """Adjust base_lr so the first resumed epoch keeps checkpoint LR."""
+        if not resume or not _config_bool(resume_cfg.get('keep_current_lr', False)):
+            return
+        groups = trainer.optimizer.param_groups
+        if not groups:
+            return
+        reference_group = next(
+            (g for g in groups if abs(float(g.get('lr_mult', 1.0)) - 1.0) < 1e-12),
+            groups[0],
+        )
+        lr_mult = max(float(reference_group.get('lr_mult', 1.0)), 1e-12)
+        current_lr = float(reference_group.get('lr', trainer.base_lr * lr_mult)) / lr_mult
+        scale = float(resume_cfg.get('lr_scale', 1.0))
+        target_lr = current_lr * scale
+        factor = max(float(trainer._lr_factor(trainer.current_epoch, total_epochs)), 1e-12)
+        old_base_lr = trainer.base_lr
+        trainer.base_lr = target_lr / factor
+        for group in groups:
+            group['initial_lr'] = trainer.base_lr * float(group.get('lr_mult', 1.0))
+        print(
+            "[Resume] keep_current_lr=true: "
+            f"checkpoint_lr={current_lr:.6g}, scale={scale:.4g}, "
+            f"epoch={trainer.current_epoch}, total_epochs={total_epochs}, "
+            f"base_lr {old_base_lr:.6g}->{trainer.base_lr:.6g}, "
+            f"next_lr={target_lr:.6g}"
+        )
+
+    def _init_best_from_resume_loss(trainer, val_loader_to_check):
+        """Use the resumed checkpoint's validation loss as the initial best."""
+        if not resume or not _config_bool(resume_cfg.get('init_best_from_resume', False)):
+            return
+        if val_loader_to_check is None:
+            raise RuntimeError("resume.init_best_from_resume=true requires a validation loader")
+        print("[Resume] Computing validation loss for the resumed checkpoint...")
+        val_metrics = trainer.validate(val_loader_to_check)
+        current = val_metrics.get(
+            'val_loss_total',
+            val_metrics.get('val_total', float('inf')),
+        )
+        if not torch.isfinite(torch.tensor(float(current))).item():
+            raise RuntimeError(f"Resume validation loss is not finite: {current}")
+        trainer.best_metric = float(current)
+        print(f"[Resume] Initial best loss set to resumed checkpoint val loss: {trainer.best_metric:.4f}")
+        for line in Trainer.format_metric_lines(
+                val_metrics,
+                label='resume_val',
+                indent='  ',
+                prefix='val_'):
+            print(line)
 
     def _run_preflight(train_loader, val_loader_to_check=None, tag='train'):
         print(f"\n[Preflight] Checking one {tag} batch...")
@@ -1289,6 +1360,8 @@ def main():
             trainer.load(resume)
 
         epochs = 3 if opts['debug'] else opts['epochs']
+        _preserve_resume_lr(trainer, epochs)
+        _init_best_from_resume_loss(trainer, val_loader)
 
         trainer.fit(
             epochs=epochs,

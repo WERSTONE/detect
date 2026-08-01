@@ -105,6 +105,21 @@ training:
   close_mosaic_epochs: 20
   no_mosaic: false         # completely disable mosaic
 
+  # Resume controls. These options are only used when --resume is set.
+  resume:
+    # Keep the first resumed epoch at the checkpoint LR. This avoids the LR
+    # jumping up when epochs is increased for continuation training.
+    keep_current_lr: false
+    lr_scale: 1.0
+
+    # Compute validation loss on the resumed checkpoint and use it as the
+    # initial best loss before further training. This prevents replacing the
+    # best checkpoint with a worse resumed run just because best starts at inf.
+    init_best_from_resume: false
+
+    # Disable mosaic for continuation from a late close-mosaic checkpoint.
+    keep_mosaic_closed: false
+
   # Early stopping follows validation loss. COCOeval is run only after the
   # final training stage finishes.
   early_stop:
@@ -115,6 +130,10 @@ training:
 
   # Dynamic task weights at the task level.
   # Sub-loss weights stay in the loss section below.
+  task_weights:
+    det: 1.0
+    pose: 1.0
+
   dynamic_weights:
     enabled: true
     method: dwa            # fixed | uncertainty | dwa
