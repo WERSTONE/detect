@@ -1,5 +1,5 @@
 # BiFPN pose-only experiment with a YOLOv8-style single pose head.
-# Reference yolov8m-pose.pt train_args inspected locally:
+# Reference official YOLO pose train_args inspected locally:
 # task=pose, epochs=1000, batch=128, imgsz=640, optimizer=SGD,
 # pretrained=False, lr0=0.01, lrf=0.01, momentum=0.937,
 # weight_decay=0.0005, warmup_epochs=3.0, close_mosaic=20,

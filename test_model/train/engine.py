@@ -76,9 +76,7 @@ def parse_args():
                    help='Path to YAML config file')
     p.add_argument('--model', type=str, default=None,
                    choices=['bifpn', 'bifpn_dual', 'bifpn_detect', 'bifpn_det',
-                            'bifpn_pose', 'bifpn_pose_only',
-                            'yolov8n', 'yolov8nano',
-                            'yolov8m_pose', 'yolov8m-pose'],
+                            'bifpn_pose', 'bifpn_pose_only'],
                    help='Model variant (overrides config)')
     p.add_argument('--data', type=str, default=None,
                    help='Dataset root directory (overrides config)')
@@ -672,7 +670,7 @@ def main():
     model_kwargs = {
         'reg_max': cfg.get('reg_max', 16),
     }
-    if model_name in ('bifpn_detect', 'bifpn_det', 'yolov8n', 'yolov8nano'):
+    if model_name in ('bifpn_detect', 'bifpn_det'):
         neck_cfg = cfg.get('neck', {}) or {}
         assigner_cfg = cfg.get('assigner', {}) or {}
         detect_kwargs = {
@@ -683,14 +681,13 @@ def main():
             'assigner_beta': assigner_cfg.get('beta', 6.0),
             'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
         }
-        if model_name in ('bifpn_detect', 'bifpn_det'):
-            detect_kwargs.update({
-                'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
-                'neck_downsample': neck_cfg.get('downsample', 'conv'),
-                'neck_out_channels': neck_cfg.get('out_channels', None),
-            })
+        detect_kwargs.update({
+            'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+            'neck_downsample': neck_cfg.get('downsample', 'conv'),
+            'neck_out_channels': neck_cfg.get('out_channels', None),
+        })
         model_kwargs.update(detect_kwargs)
-    elif model_name in ('bifpn_pose', 'bifpn_pose_only', 'yolov8m_pose', 'yolov8m-pose'):
+    elif model_name in ('bifpn_pose', 'bifpn_pose_only'):
         neck_cfg = cfg.get('neck', {}) or {}
         assigner_cfg = cfg.get('assigner', {}) or {}
         pose_kwargs = {
@@ -701,12 +698,11 @@ def main():
             'assigner_beta': assigner_cfg.get('beta', 6.0),
             'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
         }
-        if model_name in ('bifpn_pose', 'bifpn_pose_only'):
-            pose_kwargs.update({
-                'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
-                'neck_downsample': neck_cfg.get('downsample', 'conv'),
-                'neck_out_channels': neck_cfg.get('out_channels', None),
-            })
+        pose_kwargs.update({
+            'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+            'neck_downsample': neck_cfg.get('downsample', 'conv'),
+            'neck_out_channels': neck_cfg.get('out_channels', None),
+        })
         model_kwargs.update(pose_kwargs)
     else:
         neck_cfg = cfg.get('neck', {}) or {}
@@ -736,8 +732,7 @@ def main():
         model.det_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
     if hasattr(model, 'pose_loss'):
         if model_name in ('bifpn', 'bifpn_dual',
-                          'bifpn_pose', 'bifpn_pose_only',
-                          'yolov8m_pose', 'yolov8m-pose'):
+                          'bifpn_pose', 'bifpn_pose_only'):
             model.pose_loss.w_box = l_cfg.get('w_box', 7.5)
             model.pose_loss.w_cls = l_cfg.get('w_cls', 0.5)
             model.pose_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
@@ -800,11 +795,16 @@ def main():
     score_cfg = validation_cfg.get('final_eval', {})
     if not isinstance(score_cfg, dict):
         score_cfg = {'enabled': bool(score_cfg)}
+    score_eval_cfg = validation_cfg.get('score_eval', {})
+    if not isinstance(score_eval_cfg, dict):
+        score_eval_cfg = {'enabled': bool(score_eval_cfg)}
     final_eval_enabled = bool(score_cfg.get('enabled', validation_cfg.get('backend') == 'cocoeval'))
+    per_epoch_score_enabled = bool(score_eval_cfg.get('enabled', False))
     score_loader = None
-    if final_eval_enabled:
+    if final_eval_enabled or per_epoch_score_enabled:
         score_loader = val_loader
-        score_samples = int(score_cfg.get('max_samples', 0) or 0)
+        score_samples = int(
+            score_eval_cfg.get('max_samples', score_cfg.get('max_samples', 0)) or 0)
         if score_samples > 0 and score_samples < len(val_loader.dataset):
             score_loader = DataLoader(
                 Subset(val_loader.dataset, range(score_samples)),
@@ -814,9 +814,9 @@ def main():
                 collate_fn=collate_fn,
                 pin_memory=_is_cuda_device(device),
             )
-            print(f"Final COCOeval: first {score_samples} val samples")
+            print(f"COCOeval: first {score_samples} val samples")
         else:
-            print("Final COCOeval: full val set")
+            print("COCOeval: full val set")
 
     score_eval_kwargs = {
         'score_thresh': cfg.get('eval', {}).get('score_thresh', 0.01),
@@ -838,6 +838,43 @@ def main():
     close_mosaic = t_cfg.get('close_mosaic_epochs', 10) if not opts['no_mosaic'] else 0
 
     gradient_projection_cfg = t_cfg.get('gradient_projection', {})
+    distillation_cfg = t_cfg.get('distillation', {}) or {}
+
+    def _build_distillation_teacher():
+        if not distillation_cfg.get('enabled', False):
+            return None
+        teacher_model_name = distillation_cfg.get('teacher_model', 'bifpn_detect')
+        teacher_weights = distillation_cfg.get('teacher_weights', None)
+        if not teacher_weights:
+            raise ValueError("training.distillation.teacher_weights is required when distillation is enabled")
+        teacher_path = _candidate_path(teacher_weights)
+        if not teacher_path.exists():
+            raise FileNotFoundError(f"Distillation teacher checkpoint not found: {teacher_path}")
+        neck_cfg = cfg.get('neck', {}) or {}
+        assigner_cfg = cfg.get('assigner', {}) or {}
+        teacher_kwargs = {
+            'reg_max': cfg.get('reg_max', 16),
+            'num_det_classes': int(distillation_cfg.get('teacher_num_classes', 80)),
+            'input_size': d_cfg.get('input_size', 640),
+            'neck_use_p2_context': neck_cfg.get('use_p2_context', False),
+            'neck_downsample': neck_cfg.get('downsample', 'conv'),
+            'neck_out_channels': neck_cfg.get('out_channels', None),
+            'assigner_topk': assigner_cfg.get('topk', 10),
+            'assigner_alpha': assigner_cfg.get('alpha', 0.5),
+            'assigner_beta': assigner_cfg.get('beta', 6.0),
+            'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
+        }
+        teacher = create_model(teacher_model_name, **teacher_kwargs).to(device)
+        ckpt = torch.load(str(teacher_path), map_location=device, weights_only=False)
+        state = ckpt.get('model_state_dict', ckpt)
+        teacher.load_state_dict(state, strict=True)
+        teacher.eval()
+        for param in teacher.parameters():
+            param.requires_grad = False
+        print(f"[Distill] Loaded frozen teacher: {teacher_path}")
+        return teacher
+
+    distill_teacher = _build_distillation_teacher()
 
     def _make_trainer(lr, save_dir_suffix='', gradient_projection_enabled=None,
                       stage_cfg=None):
@@ -890,12 +927,28 @@ def main():
             early_stop_min_delta=t_cfg.get('early_stop', {}).get('min_delta', 0.0),
             early_stop_start_epoch=t_cfg.get('early_stop', {}).get('start_epoch', 0),
             score_interval=1,
-            score_det_baseline=score_cfg.get('det_baseline_mAP50_95', 1.0),
-            score_pose_baseline=score_cfg.get('pose_baseline_mAP50_95', 1.0),
-            score_det_metric=score_cfg.get('det_metric', 'bbox/AP'),
-            score_pose_metric=score_cfg.get('pose_metric', 'keypoints/AP'),
+            score_det_baseline=score_eval_cfg.get(
+                'det_baseline_mAP50_95',
+                score_cfg.get('det_baseline_mAP50_95', 1.0)),
+            score_pose_baseline=score_eval_cfg.get(
+                'pose_baseline_mAP50_95',
+                score_cfg.get('pose_baseline_mAP50_95', 1.0)),
+            score_det_metric=score_eval_cfg.get(
+                'det_metric', score_cfg.get('det_metric', 'bbox/AP')),
+            score_pose_metric=score_eval_cfg.get(
+                'pose_metric', score_cfg.get('pose_metric', 'keypoints/AP')),
+            score_eval_enabled=per_epoch_score_enabled,
+            score_eval_interval=score_eval_cfg.get(
+                'interval', t_cfg.get('val_interval', 1)),
+            score_joint_metric=score_eval_cfg.get('joint_metric', 'score'),
             gradient_projection_enabled=use_gradient_projection,
+            gradient_projection_method=gradient_projection_cfg.get('method', 'pcgrad'),
+            gradient_projection_scope=gradient_projection_cfg.get('scope', 'all'),
             gradient_projection_eps=gradient_projection_cfg.get('eps', 1.0e-12),
+            cagrad_c=gradient_projection_cfg.get('cagrad_c', 0.5),
+            gradnorm_alpha=gradient_projection_cfg.get('gradnorm_alpha', 1.0),
+            distill_teacher=distill_teacher,
+            distill_cfg=distillation_cfg,
         )
 
     def _make_train_loader(person_only=None, require_keypoints=None):
@@ -1121,6 +1174,31 @@ def main():
                 indent='  ',
                 prefix='val_'):
             print(line)
+
+    def _init_score_bests_from_resume(trainer, score_loader_to_check,
+                                      save_prefix):
+        """Use the resumed checkpoint's COCO metrics as score-best baselines."""
+        if not resume or not _config_bool(
+                resume_cfg.get('init_score_best_from_resume', False)):
+            return
+        if not per_epoch_score_enabled:
+            return
+        if score_loader_to_check is None:
+            raise RuntimeError(
+                "resume.init_score_best_from_resume=true requires a COCOeval loader")
+        print("[Resume] Computing COCOeval metrics for the resumed checkpoint...")
+        score_metrics = trainer.validate_score(
+            score_loader_to_check,
+            **score_eval_kwargs,
+        )
+        trainer.init_score_bests(
+            score_metrics,
+            save_prefix=save_prefix if _config_bool(
+                resume_cfg.get('save_score_best_aliases', True)) else None,
+        )
+        for key, value in score_metrics.items():
+            if isinstance(value, float):
+                print(f"  resume_coco/{key}: {value:.4f}")
 
     def _run_preflight(train_loader, val_loader_to_check=None, tag='train'):
         print(f"\n[Preflight] Checking one {tag} batch...")
@@ -1368,6 +1446,7 @@ def main():
         epochs = 3 if opts['debug'] else opts['epochs']
         _preserve_resume_lr(trainer, epochs)
         _init_best_from_resume_loss(trainer, val_loader)
+        _init_score_bests_from_resume(trainer, score_loader, model_name)
 
         trainer.fit(
             epochs=epochs,

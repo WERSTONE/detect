@@ -9,7 +9,6 @@ from test_model.model.common import Conv
 from test_model.model.head import YOLOLikeDetectHead
 from test_model.model.loss import YOLOPoseLoss
 from test_model.model.neck import BiFPN
-from test_model.model.yolov8nano import YOLOv8PAN
 
 
 class YOLOLikePoseHead(nn.Module):
@@ -156,35 +155,6 @@ class _SinglePoseModel(nn.Module):
                     'kpts': torch.zeros(0, self.num_kpts, 3, device=device),
                 })
         return results
-
-
-class YOLOv8MPoseModel(_SinglePoseModel):
-    """YOLOv8m-pose architecture replica with local training interfaces."""
-
-    def __init__(self, num_kpts=17, reg_max=16, input_size=640,
-                 assigner_topk=10, assigner_alpha=0.5, assigner_beta=6.0,
-                 assigner_eps=1.0e-9):
-        super().__init__(
-            num_kpts=num_kpts,
-            reg_max=reg_max,
-            input_size=input_size,
-            assigner_topk=assigner_topk,
-            assigner_alpha=assigner_alpha,
-            assigner_beta=assigner_beta,
-            assigner_eps=assigner_eps,
-        )
-        self.backbone = CSPDarkNet(depth=0.67, width=0.75, max_ch=768)
-        self.neck = YOLOv8PAN(self.backbone.out_channels, depth=0.67, width=0.75, max_ch=768)
-        self.pose_head = YOLOLikePoseHead(
-            self.neck.out_channels,
-            num_kpts=self.num_kpts,
-            reg_max=self.reg_max,
-            strides=self.strides,
-            img_size=self.input_size,
-        )
-
-    def _forward_head(self, x):
-        return self.pose_head(self.neck(self.backbone(x)))
 
 
 class BifpnPoseModel(_SinglePoseModel):

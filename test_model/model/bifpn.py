@@ -203,6 +203,18 @@ class ModelE_BiFPN(nn.Module):
     def _forward_head(self, x):
         return self._forward_selected_heads(x, need_det=True, need_pose=True)
 
+    def forward_det_outputs(self, x, return_features=False):
+        neck_feats = self._forward_features(x)
+        det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
+        out = self.det_head(det_feats)
+        if return_features:
+            return {
+                'out': out,
+                'neck_feats': neck_feats,
+                'det_feats': det_feats,
+            }
+        return out
+
     def _forward_selected_heads(self, x, need_det=True, need_pose=True):
         neck_feats = self._forward_features(x)
         det_out = None

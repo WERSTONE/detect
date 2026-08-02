@@ -64,6 +64,19 @@ class BifpnDetectModel(nn.Module):
         det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
         return self.det_head(det_feats)
 
+    def forward_det_outputs(self, x, return_features=False):
+        feats = self.backbone(x)
+        neck_feats = self.neck(feats)
+        det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
+        out = self.det_head(det_feats)
+        if return_features:
+            return {
+                'out': out,
+                'neck_feats': neck_feats,
+                'det_feats': det_feats,
+            }
+        return out
+
     def forward(self, x):
         return self._forward_head(x)
 

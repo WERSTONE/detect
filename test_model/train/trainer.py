@@ -17,6 +17,7 @@ from pathlib import Path
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 
 class Trainer:
@@ -58,8 +59,14 @@ class Trainer:
                  score_interval=1, score_det_baseline=1.0,
                  score_pose_baseline=1.0, score_det_metric='mAP@0.5:0.95',
                  score_pose_metric='AP_pose@0.5:0.95',
+                 score_eval_enabled=False, score_eval_interval=1,
+                 score_joint_metric='score',
                  gradient_projection_enabled=False,
-                 gradient_projection_eps=1.0e-12):
+                 gradient_projection_method='pcgrad',
+                 gradient_projection_scope='all',
+                 gradient_projection_eps=1.0e-12,
+                 cagrad_c=0.5, gradnorm_alpha=1.0,
+                 distill_teacher=None, distill_cfg=None):
         self.model = model.to(device)
         self.device = torch.device(device)
         self.grad_clip = grad_clip
@@ -130,8 +137,22 @@ class Trainer:
         self.score_pose_baseline = max(float(score_pose_baseline), 1e-8)
         self.score_det_metric = score_det_metric
         self.score_pose_metric = score_pose_metric
+        self.score_eval_enabled = bool(score_eval_enabled)
+        self.score_eval_interval = max(1, int(score_eval_interval))
+        self.score_joint_metric = str(score_joint_metric or 'score')
+        self.best_score_metrics = {
+            'joint': float('-inf'),
+            'det': float('-inf'),
+            'pose': float('-inf'),
+        }
         self.gradient_projection_enabled = bool(gradient_projection_enabled)
+        self.gradient_projection_method = str(gradient_projection_method or 'pcgrad').lower()
+        self.gradient_projection_scope = str(gradient_projection_scope or 'all').lower()
         self.gradient_projection_eps = float(gradient_projection_eps)
+        self.cagrad_c = float(cagrad_c)
+        self.gradnorm_alpha = float(gradnorm_alpha)
+        self.distill_teacher = distill_teacher
+        self.distill_cfg = distill_cfg or {}
 
         # EMA
         self.ema_decay = ema_decay
@@ -355,6 +376,12 @@ class Trainer:
                 ('dyn_w_det', 'w_det'),
                 ('dyn_w_pose', 'w_pose'),
             ]),
+            ('distill', [
+                ('distill_total', 'total'),
+                ('distill_cls', 'cls'),
+                ('distill_reg', 'reg'),
+                ('distill_feat', 'feat'),
+            ]),
             ('misc', [
                 ('loss_total', 'loss'),
                 ('total', 'obj'),
@@ -407,26 +434,37 @@ class Trainer:
             return torch.tensor(0.0, device=self.device)
         return norm
 
-    def _apply_gradient_projection(self, losses, total_loss):
-        det_loss = losses.get('_gp_det_loss')
-        pose_loss = losses.get('_gp_pose_loss')
-        task_losses = [
-            loss for loss in (det_loss, pose_loss)
-            if isinstance(loss, torch.Tensor) and loss.requires_grad
-        ]
-        if len(task_losses) < 2:
-            if self.scaler:
-                self.scaler.scale(total_loss).backward()
-            else:
-                total_loss.backward()
-            return False
+    def _gradient_param_groups(self):
+        scoped = []
+        other = []
+        for name, param in self.model.named_parameters():
+            if not param.requires_grad:
+                continue
+            in_scope = True
+            if self.gradient_projection_scope == 'shared':
+                in_scope = (
+                    name.startswith('backbone.') or
+                    name.startswith('neck.')
+                )
+            elif self.gradient_projection_scope != 'all':
+                roots = [
+                    root.strip()
+                    for root in self.gradient_projection_scope.split(',')
+                    if root.strip()
+                ]
+                in_scope = any(name == root or name.startswith(root + '.') for root in roots)
+            (scoped if in_scope else other).append(param)
+        return scoped, other
 
-        params = [p for p in self.model.parameters() if p.requires_grad]
-        task_grads = [
-            self._collect_task_grads(loss, params, retain_graph=(idx < len(task_losses) - 1))
-            for idx, loss in enumerate(task_losses)
-        ]
+    @staticmethod
+    def _clone_param_grads(params):
+        return [None if p.grad is None else p.grad.detach().clone() for p in params]
 
+    @staticmethod
+    def _scale_grads(grads, scale):
+        return [None if g is None else g * scale for g in grads]
+
+    def _pcgrad(self, task_grads):
         projected = []
         for i, grads_i in enumerate(task_grads):
             grads_proj = [None if g is None else g.clone() for g in grads_i]
@@ -442,6 +480,108 @@ class Trainer:
                     if g_proj is not None and g_ref is not None:
                         grads_proj[k] = g_proj - scale * g_ref
             projected.append(grads_proj)
+        return projected
+
+    def _gradnorm_grads(self, task_grads):
+        norms = [
+            torch.sqrt(self._grad_norm_sq(grads) + self.gradient_projection_eps)
+            for grads in task_grads
+        ]
+        avg_norm = torch.stack(norms).mean()
+        normalized = []
+        for grads, norm in zip(task_grads, norms):
+            scale = (avg_norm / (norm + self.gradient_projection_eps)).pow(self.gradnorm_alpha)
+            normalized.append(self._scale_grads(grads, scale.detach()))
+        return normalized
+
+    def _cagrad_grads(self, task_grads):
+        if len(task_grads) != 2:
+            return task_grads
+        g1, g2 = task_grads
+        dot12 = self._grad_dot(g1, g2)
+        n1 = self._grad_norm_sq(g1)
+        n2 = self._grad_norm_sq(g2)
+        denom = n1 + n2 - 2.0 * dot12
+        if denom.abs().item() <= self.gradient_projection_eps:
+            alpha = torch.tensor(0.5, device=self.device)
+        else:
+            alpha = ((n2 - dot12) / (denom + self.gradient_projection_eps)).clamp(0.0, 1.0)
+        avg = []
+        min_norm = []
+        for ga, gb in zip(g1, g2):
+            if ga is None and gb is None:
+                avg.append(None)
+                min_norm.append(None)
+            elif ga is None:
+                avg.append(gb * 0.5)
+                min_norm.append(gb * (1.0 - alpha))
+            elif gb is None:
+                avg.append(ga * 0.5)
+                min_norm.append(ga * alpha)
+            else:
+                avg.append((ga + gb) * 0.5)
+                min_norm.append(alpha * ga + (1.0 - alpha) * gb)
+        c = min(max(self.cagrad_c, 0.0), 1.0)
+        combined = []
+        for ga, gm in zip(avg, min_norm):
+            if ga is None and gm is None:
+                combined.append(None)
+            elif ga is None:
+                combined.append(gm)
+            elif gm is None:
+                combined.append(ga)
+            else:
+                combined.append((1.0 - c) * ga + c * gm)
+        return [combined]
+
+    def _combine_task_grads(self, task_grads):
+        method = self.gradient_projection_method
+        if method == 'pcgrad':
+            return self._pcgrad(task_grads)
+        if method == 'gradnorm':
+            return self._gradnorm_grads(task_grads)
+        if method == 'cagrad':
+            return self._cagrad_grads(task_grads)
+        raise ValueError(
+            f"Unsupported gradient projection method: {method}. "
+            "Use pcgrad, gradnorm, or cagrad.")
+
+    def _apply_gradient_projection(self, losses, total_loss):
+        det_loss = losses.get('_gp_det_loss')
+        pose_loss = losses.get('_gp_pose_loss')
+        task_losses = [
+            loss for loss in (det_loss, pose_loss)
+            if isinstance(loss, torch.Tensor) and loss.requires_grad
+        ]
+        if len(task_losses) < 2:
+            if self.scaler:
+                self.scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
+            return False
+
+        params, other_params = self._gradient_param_groups()
+        if not params:
+            if self.scaler:
+                self.scaler.scale(total_loss).backward()
+            else:
+                total_loss.backward()
+            return False
+
+        other_grads = []
+        if other_params:
+            self.optimizer.zero_grad(set_to_none=True)
+            if self.scaler:
+                self.scaler.scale(total_loss).backward(retain_graph=True)
+            else:
+                total_loss.backward(retain_graph=True)
+            other_grads = self._clone_param_grads(other_params)
+
+        task_grads = [
+            self._collect_task_grads(loss, params, retain_graph=(idx < len(task_losses) - 1))
+            for idx, loss in enumerate(task_losses)
+        ]
+        projected = self._combine_task_grads(task_grads)
 
         self.optimizer.zero_grad(set_to_none=True)
         for param_index, p in enumerate(params):
@@ -453,6 +593,9 @@ class Trainer:
                 grad_sum = grad if grad_sum is None else grad_sum + grad
             if grad_sum is not None:
                 p.grad = grad_sum
+        for p, grad in zip(other_params, other_grads):
+            if grad is not None:
+                p.grad = grad
         return True
 
     def _build_ema(self):
@@ -518,6 +661,88 @@ class Trainer:
         return current > self.best_metric + self.early_stop_min_delta
 
     @staticmethod
+    def _finite_float(value, default=float('-inf')):
+        try:
+            value = float(value)
+        except (TypeError, ValueError):
+            return default
+        return value if math.isfinite(value) else default
+
+    def init_score_bests(self, metrics, save_prefix=None):
+        """Initialize COCOeval best trackers from an existing checkpoint."""
+        if not metrics:
+            return
+        joint = self._finite_float(metrics.get(self.score_joint_metric))
+        if joint == float('-inf'):
+            joint = self._finite_float(metrics.get('score'))
+        if joint == float('-inf'):
+            joint = self._finite_float(metrics.get('mean_mAP50_95'))
+        det = self._finite_float(metrics.get(self.score_det_metric))
+        pose = self._finite_float(metrics.get(self.score_pose_metric))
+        self.best_score_metrics.update({
+            'joint': joint,
+            'det': det,
+            'pose': pose,
+        })
+        print(
+            "[Resume] Initial COCO bests from resumed checkpoint: "
+            f"joint={joint:.4f} det={det:.4f} pose={pose:.4f}"
+        )
+        if save_prefix:
+            if joint != float('-inf'):
+                self.save(self.save_dir / f"{save_prefix}_coco_best.pt", metrics)
+            if det != float('-inf'):
+                self.save(self.save_dir / f"{save_prefix}_det_best.pt", metrics)
+            if pose != float('-inf'):
+                self.save(self.save_dir / f"{save_prefix}_pose_best.pt", metrics)
+
+    def _format_score_line(self, metrics, label='val/coco', indent='  '):
+        keys = [
+            (self.score_joint_metric, 'joint'),
+            ('score', 'score'),
+            (self.score_det_metric, 'det'),
+            (self.score_pose_metric, 'pose'),
+            ('det_ratio', 'det_ratio'),
+            ('pose_ratio', 'pose_ratio'),
+            ('mean_mAP50_95', 'mean'),
+            ('joint_mAP50_95', 'min_ap'),
+        ]
+        seen = set()
+        parts = []
+        for key, alias in keys:
+            if key in seen or key not in metrics:
+                continue
+            seen.add(key)
+            parts.append(f"{alias}={self._format_metric_value(metrics[key])}")
+        if not parts:
+            return None
+        return f"{indent}{label}: " + " ".join(parts)
+
+    def _save_score_bests(self, score_metrics, save_prefix):
+        statuses = []
+        joint = self._finite_float(score_metrics.get(self.score_joint_metric))
+        if joint == float('-inf'):
+            joint = self._finite_float(score_metrics.get('score'))
+        if joint == float('-inf'):
+            joint = self._finite_float(score_metrics.get('mean_mAP50_95'))
+        det = self._finite_float(score_metrics.get(self.score_det_metric))
+        pose = self._finite_float(score_metrics.get(self.score_pose_metric))
+
+        if joint > self.best_score_metrics['joint'] + self.early_stop_min_delta:
+            self.best_score_metrics['joint'] = joint
+            self.save(self.save_dir / f"{save_prefix}_coco_best.pt", score_metrics)
+            statuses.append('COCO_BEST')
+        if det > self.best_score_metrics['det'] + self.early_stop_min_delta:
+            self.best_score_metrics['det'] = det
+            self.save(self.save_dir / f"{save_prefix}_det_best.pt", score_metrics)
+            statuses.append('DET_BEST')
+        if pose > self.best_score_metrics['pose'] + self.early_stop_min_delta:
+            self.best_score_metrics['pose'] = pose
+            self.save(self.save_dir / f"{save_prefix}_pose_best.pt", score_metrics)
+            statuses.append('POSE_BEST')
+        return statuses
+
+    @staticmethod
     def _score_from_metrics(metrics, det_metric, pose_metric, det_baseline,
                             pose_baseline, task='both'):
         out = {}
@@ -572,6 +797,94 @@ class Trainer:
             metrics, self.score_det_metric, self.score_pose_metric,
             self.score_det_baseline, self.score_pose_baseline, task=task))
         return metrics
+
+    @staticmethod
+    def _as_loss_weight(cfg, key, default=0.0):
+        try:
+            return float((cfg or {}).get(key, default))
+        except (TypeError, ValueError):
+            return float(default)
+
+    @staticmethod
+    def _non_person_teacher_cls(teacher_cls, student_cls):
+        if teacher_cls.shape[1] == student_cls.shape[1] + 1:
+            return teacher_cls[:, 1:, :, :]
+        return teacher_cls
+
+    def _distill_detect_outputs(self, student_out, teacher_out, cfg):
+        cls_w = self._as_loss_weight(cfg, 'cls_weight', 0.0)
+        reg_w = self._as_loss_weight(cfg, 'dfl_weight', cfg.get('reg_weight', 0.0))
+        if cls_w <= 0.0 and reg_w <= 0.0:
+            device = student_out['cls'][0].device
+            zero = torch.zeros((), device=device)
+            return zero, zero, zero
+
+        cls_loss = None
+        reg_loss = None
+        for s_cls, t_cls in zip(student_out['cls'], teacher_out['cls']):
+            t_cls = self._non_person_teacher_cls(t_cls.detach(), s_cls)
+            if t_cls.shape == s_cls.shape and cls_w > 0.0:
+                loss = F.mse_loss(s_cls.float(), t_cls.float())
+                cls_loss = loss if cls_loss is None else cls_loss + loss
+        for s_reg, t_reg in zip(student_out['reg'], teacher_out['reg']):
+            if t_reg.shape == s_reg.shape and reg_w > 0.0:
+                loss = F.mse_loss(s_reg.float(), t_reg.detach().float())
+                reg_loss = loss if reg_loss is None else reg_loss + loss
+
+        device = student_out['cls'][0].device
+        zero = torch.zeros((), device=device)
+        cls_loss = zero if cls_loss is None else cls_loss / max(len(student_out['cls']), 1)
+        reg_loss = zero if reg_loss is None else reg_loss / max(len(student_out['reg']), 1)
+        total = cls_w * cls_loss + reg_w * reg_loss
+        return total, cls_loss.detach(), reg_loss.detach()
+
+    def _distill_features(self, student_feats, teacher_feats, cfg):
+        feat_w = self._as_loss_weight(cfg, 'feature_weight', 0.0)
+        if feat_w <= 0.0:
+            return torch.zeros((), device=student_feats[0].device)
+        losses = []
+        for s_feat, t_feat in zip(student_feats, teacher_feats):
+            if s_feat.shape == t_feat.shape:
+                losses.append(F.mse_loss(s_feat.float(), t_feat.detach().float()))
+        if not losses:
+            return torch.zeros((), device=student_feats[0].device)
+        return feat_w * sum(losses) / len(losses)
+
+    def _apply_distillation(self, images, losses):
+        cfg = self.distill_cfg or {}
+        if not cfg.get('enabled', False) or self.distill_teacher is None:
+            return losses
+        if not hasattr(self.model, 'forward_det_outputs'):
+            return losses
+
+        det_cfg = cfg.get('det', {}) or {}
+        if not det_cfg.get('enabled', True):
+            return losses
+
+        teacher = self.distill_teacher
+        teacher.eval()
+        with torch.no_grad():
+            teacher_data = teacher.forward_det_outputs(images, return_features=True)
+        student_data = self.model.forward_det_outputs(images, return_features=True)
+        out_total, cls_loss, reg_loss = self._distill_detect_outputs(
+            student_data['out'], teacher_data['out'], det_cfg)
+        feat_loss = self._distill_features(
+            student_data.get('det_feats', []),
+            teacher_data.get('det_feats', []),
+            det_cfg,
+        )
+        total = (out_total + feat_loss) * max(int(images.shape[0]), 1)
+        if total.detach().abs().item() == 0.0:
+            return losses
+
+        losses['total'] = losses['total'] + total
+        if isinstance(losses.get('_gp_det_loss'), torch.Tensor):
+            losses['_gp_det_loss'] = losses['_gp_det_loss'] + total
+        losses['distill_total'] = total.detach()
+        losses['distill_cls'] = cls_loss.detach()
+        losses['distill_reg'] = reg_loss.detach()
+        losses['distill_feat'] = feat_loss.detach()
+        return losses
 
     def train_epoch(self, loader, max_epochs, epoch, close_mosaic=None):
         """Train one epoch.
@@ -629,8 +942,10 @@ class Trainer:
             if self.use_amp:
                 with torch.amp.autocast('cuda'):
                     losses = self.model.compute_loss(images, gt_list)
+                    losses = self._apply_distillation(images, losses)
             else:
                 losses = self.model.compute_loss(images, gt_list)
+                losses = self._apply_distillation(images, losses)
 
             total_loss = losses['total']
 
@@ -850,6 +1165,13 @@ class Trainer:
             f"Batch: {self.batch_size} | nbs={self.nbs} | accumulate={self.accumulate} | "
             f"param_groups={self.param_group_mode} | weight_decay={self.weight_decay:.6g} | "
             f"yolo_warmup={self.yolo_warmup}")
+        if self.gradient_projection_enabled:
+            print(
+                "Gradient strategy: "
+                f"method={self.gradient_projection_method} "
+                f"scope={self.gradient_projection_scope}")
+        if self.distill_cfg.get('enabled', False):
+            print("Distillation: enabled")
         group_parts = []
         for group in self.optimizer.param_groups:
             n_params = sum(p.numel() for p in group['params'])
@@ -889,11 +1211,25 @@ class Trainer:
                     self.best_metric = current
                     self.early_stop_bad_epochs = 0
                     self.save(self.save_dir / f"{save_prefix}_best.pt", metric_payload)
+                    self.save(self.save_dir / f"{save_prefix}_loss_best.pt", metric_payload)
                     status = ' [BEST]'
                 elif (self.early_stop_enabled and
                       epoch + 1 >= self.early_stop_start_epoch):
                     self.early_stop_bad_epochs += 1
                     status = f" [NO_IMPROVE {self.early_stop_bad_epochs}/{self.early_stop_patience}]"
+
+            score_m = None
+            score_statuses = []
+            do_score = (
+                do_val and self.score_eval_enabled and score_loader is not None and
+                (epoch + 1) % self.score_eval_interval == 0
+            )
+            if do_score:
+                print(f"Running COCOeval at epoch {epoch + 1}...")
+                score_m = self.validate_score(score_loader, **(score_eval_kwargs or {}))
+                if val_m is not None:
+                    score_m.update({k: v for k, v in val_m.items() if k not in score_m})
+                score_statuses = self._save_score_bests(score_m, save_prefix)
 
             print(f"Epoch {epoch + 1:3d}/{epochs} | {elapsed:.0f}s{status}")
             for line in self.format_metric_lines(train_m, label='train', indent='  '):
@@ -905,6 +1241,11 @@ class Trainer:
                         indent='  ',
                         prefix='val_'):
                     print(line)
+            if score_m is not None:
+                score_line = self._format_score_line(score_m, label='val/coco', indent='  ')
+                if score_line:
+                    suffix = f" [{' '.join(score_statuses)}]" if score_statuses else ""
+                    print(score_line + suffix)
 
             if self.writer:
                 for k, v in train_m.items():
@@ -912,6 +1253,10 @@ class Trainer:
                 if do_val:
                     for k, v in val_m.items():
                         self.writer.add_scalar(f'epoch/{k}', v, epoch)
+                if score_m is not None:
+                    for k, v in score_m.items():
+                        if isinstance(v, (int, float, np.floating)):
+                            self.writer.add_scalar(f'coco/{k}', float(v), epoch)
 
             if (epoch + 1) % self.save_interval == 0:
                 self.save(self.save_dir / f"{save_prefix}_epoch{epoch + 1}.pt")

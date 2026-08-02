@@ -29,7 +29,7 @@ pretrained:
     enabled: false
     weights: auto        # explicit path, filename, or auto to infer yolov8m* weights
     auto_download: false # from-scratch dual-head run: do not download/load weights
-    prefer_pose: false    # prefer yolov8m-pose.pt before yolov8m.pt for backbone init
+    prefer_pose: false    # prefer official pose weights before detect weights for backbone init
     cache_dir: checkpoints/yolo
     strict: false        # if true, require a near-complete backbone match
   modules:
@@ -166,8 +166,22 @@ training:
   # Recommended for joint stages only; keep off for single-task warmups.
   gradient_projection:
     enabled: false
-    method: pcgrad
+    method: pcgrad            # pcgrad | gradnorm | cagrad
+    scope: shared             # shared | all | comma-separated module roots
     eps: 1.0e-12
+    gradnorm_alpha: 1.0
+    cagrad_c: 0.5
+
+  distillation:
+    enabled: false
+    teacher_model: bifpn_detect
+    teacher_weights: checkpoints/single_bifpn_det/bifpn_detect/bifpn_detect_best.pt
+    teacher_num_classes: 80
+    det:
+      enabled: true
+      cls_weight: 0.25
+      dfl_weight: 0.25
+      feature_weight: 0.5
 
   freeze:
     enabled: false
@@ -219,6 +233,15 @@ augmentation:
 validation:
   backend: cocoeval
   task: both
+  score_eval:
+    enabled: false
+    interval: 1
+    max_samples: 0
+    det_metric: bbox/AP
+    pose_metric: keypoints/AP
+    joint_metric: score
+    det_baseline_mAP50_95: 0.5056917003412625
+    pose_baseline_mAP50_95: 0.6503568561462488
   final_eval:
     enabled: true
     max_samples: 0        # 0 = full validation set

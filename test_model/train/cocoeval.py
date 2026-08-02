@@ -39,9 +39,7 @@ def parse_args():
     p.add_argument("--weights", type=str, required=True)
     p.add_argument("--model", type=str, default=None,
                    choices=["bifpn", "bifpn_dual", "bifpn_detect", "bifpn_det",
-                            "bifpn_pose", "bifpn_pose_only",
-                            "yolov8n", "yolov8nano",
-                            "yolov8m_pose", "yolov8m-pose"])
+                            "bifpn_pose", "bifpn_pose_only"])
     p.add_argument("--data", type=str, default=None)
     p.add_argument("--img-dir", type=str, default=None)
     p.add_argument("--label-dir", type=str, default=None)
@@ -88,7 +86,7 @@ def load_config(path):
 def build_model(args, cfg, device):
     model_name = args.model or cfg.get("model", "bifpn_dual")
     model_kwargs = {"reg_max": cfg.get("reg_max", 16)}
-    if model_name in ("bifpn_detect", "bifpn_det", "yolov8n", "yolov8nano"):
+    if model_name in ("bifpn_detect", "bifpn_det"):
         neck_cfg = cfg.get("neck", {}) or {}
         assigner_cfg = cfg.get("assigner", {}) or {}
         detect_kwargs = {
@@ -99,14 +97,13 @@ def build_model(args, cfg, device):
             "assigner_beta": assigner_cfg.get("beta", 6.0),
             "assigner_eps": assigner_cfg.get("eps", 1.0e-9),
         }
-        if model_name in ("bifpn_detect", "bifpn_det"):
-            detect_kwargs.update({
-                "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
-                "neck_downsample": neck_cfg.get("downsample", "conv"),
-                "neck_out_channels": neck_cfg.get("out_channels", None),
-            })
+        detect_kwargs.update({
+            "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+            "neck_downsample": neck_cfg.get("downsample", "conv"),
+            "neck_out_channels": neck_cfg.get("out_channels", None),
+        })
         model_kwargs.update(detect_kwargs)
-    elif model_name in ("bifpn_pose", "bifpn_pose_only", "yolov8m_pose", "yolov8m-pose"):
+    elif model_name in ("bifpn_pose", "bifpn_pose_only"):
         neck_cfg = cfg.get("neck", {}) or {}
         assigner_cfg = cfg.get("assigner", {}) or {}
         pose_kwargs = {
@@ -117,12 +114,11 @@ def build_model(args, cfg, device):
             "assigner_beta": assigner_cfg.get("beta", 6.0),
             "assigner_eps": assigner_cfg.get("eps", 1.0e-9),
         }
-        if model_name in ("bifpn_pose", "bifpn_pose_only"):
-            pose_kwargs.update({
-                "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
-                "neck_downsample": neck_cfg.get("downsample", "conv"),
-                "neck_out_channels": neck_cfg.get("out_channels", None),
-            })
+        pose_kwargs.update({
+            "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+            "neck_downsample": neck_cfg.get("downsample", "conv"),
+            "neck_out_channels": neck_cfg.get("out_channels", None),
+        })
         model_kwargs.update(pose_kwargs)
     else:
         neck_cfg = cfg.get("neck", {}) or {}
