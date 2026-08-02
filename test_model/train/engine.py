@@ -89,6 +89,8 @@ def parse_args():
     p.add_argument('--save-dir', type=str, default=None)
     p.add_argument('--resume', type=str, default=None,
                    help='Resume from checkpoint')
+    p.add_argument('--init-weights', type=str, default=None,
+                   help='Load model weights only, then start a fresh experiment from epoch 0')
     p.add_argument('--backbone-weights', type=str, default=None,
                    help='Path to backbone pretrained weights (YOLO official or compatible checkpoint)')
     p.add_argument('--backbone-strict', action='store_true', default=None,
@@ -134,6 +136,9 @@ def load_config(args):
         not cfg.get('training', {}).get('amp', True)
     )
     debug = args.debug if args.debug is not None else cfg.get('debug', False)
+    init_weights = args.init_weights or cfg.get('training', {}).get('init_weights', None)
+    if args.resume and init_weights:
+        raise ValueError("--resume and --init-weights cannot be used together")
     pretrained_cfg = cfg.setdefault('pretrained', {}).setdefault('backbone', {})
     if args.backbone_weights is not None:
         pretrained_cfg['enabled'] = True
@@ -154,6 +159,7 @@ def load_config(args):
         'no_mosaic': no_mosaic,
         'no_amp': no_amp,
         'debug': debug,
+        'init_weights': init_weights,
         'config': cfg,
     }, args.resume
 
@@ -335,7 +341,7 @@ def _load_pretrained_backbone(model, cfg, resume_path=None):
         return None
 
     if resume_path:
-        print(f"[Backbone preload] Resume is set ({resume_path}); skipping backbone preload.")
+        print(f"[Backbone preload] Model checkpoint is set ({resume_path}); skipping backbone preload.")
         return None
 
     weights_path = _resolve_backbone_weights_path(model, cfg)
@@ -468,7 +474,7 @@ def _load_pretrained_modules(model, cfg, resume_path=None):
     if not modules_cfg or not modules_cfg.get('enabled', False):
         return None
     if resume_path:
-        print(f"[Module preload] Resume is set ({resume_path}); skipping module preload.")
+        print(f"[Module preload] Model checkpoint is set ({resume_path}); skipping module preload.")
         return None
 
     weights_value = modules_cfg.get('weights', None)
@@ -638,7 +644,7 @@ def _load_model_weights_for_staged_resume(model, path, device):
     if not isinstance(state_dict, dict):
         raise KeyError(f"Could not find model_state_dict in resume checkpoint: {path}")
     model.load_state_dict(state_dict, strict=True)
-    print(f"[Resume] Loaded model weights from {path} (epoch {ckpt.get('epoch', 'unknown')})")
+    print(f"[Weights] Loaded model weights from {path} (epoch {ckpt.get('epoch', 'unknown')})")
     return ckpt
 
 
@@ -666,6 +672,7 @@ def main():
 
     # Create model with loss weights from config
     model_name = opts['model']
+    init_weights = opts.get('init_weights', None)
     print(f"Creating model: {model_name}")
     model_kwargs = {
         'reg_max': cfg.get('reg_max', 16),
@@ -722,8 +729,15 @@ def main():
 
     model = create_model(model_name, **model_kwargs)
     print(f"Parameters: {model.num_params / 1e6:.2f}M")
-    _load_pretrained_backbone(model, cfg, resume_path=resume)
-    _load_pretrained_modules(model, cfg, resume_path=resume)
+    load_anchor = resume or init_weights
+    _load_pretrained_backbone(model, cfg, resume_path=load_anchor)
+    _load_pretrained_modules(model, cfg, resume_path=load_anchor)
+    if init_weights:
+        init_path = _candidate_path(init_weights)
+        if not init_path.exists():
+            raise FileNotFoundError(f"Initial weights checkpoint not found: {init_path}")
+        _load_model_weights_for_staged_resume(model, init_path, device='cpu')
+        print(f"[Init] Loaded model weights only from {init_path}; epoch will start at 0")
 
     # Set loss weights (override defaults)
     if hasattr(model, 'det_loss'):
@@ -1152,41 +1166,54 @@ def main():
             f"next_lr={target_lr:.6g}"
         )
 
-    def _init_best_from_resume_loss(trainer, val_loader_to_check):
-        """Use the resumed checkpoint's validation loss as the initial best."""
-        if not resume or not _config_bool(resume_cfg.get('init_best_from_resume', False)):
+    def _init_best_from_loaded_loss(trainer, val_loader_to_check, save_prefix):
+        """Use the loaded checkpoint's validation loss as the initial best."""
+        loaded_weights = resume or init_weights
+        enabled = (
+            _config_bool(resume_cfg.get('init_best_from_resume', False)) or
+            _config_bool(resume_cfg.get('init_best_from_loaded', False))
+        )
+        if not loaded_weights or not enabled:
             return
         if val_loader_to_check is None:
-            raise RuntimeError("resume.init_best_from_resume=true requires a validation loader")
-        print("[Resume] Computing validation loss for the resumed checkpoint...")
+            raise RuntimeError("initial best loss requires a validation loader")
+        label = "Resume" if resume else "Init"
+        print(f"[{label}] Computing validation loss for the loaded checkpoint...")
         val_metrics = trainer.validate(val_loader_to_check)
         current = val_metrics.get(
             'val_loss_total',
             val_metrics.get('val_total', float('inf')),
         )
         if not torch.isfinite(torch.tensor(float(current))).item():
-            raise RuntimeError(f"Resume validation loss is not finite: {current}")
+            raise RuntimeError(f"Initial validation loss is not finite: {current}")
         trainer.best_metric = float(current)
-        print(f"[Resume] Initial best loss set to resumed checkpoint val loss: {trainer.best_metric:.4f}")
+        print(f"[{label}] Initial best loss set to loaded checkpoint val loss: {trainer.best_metric:.4f}")
+        trainer.save(trainer.save_dir / f"{save_prefix}_best.pt", val_metrics)
+        trainer.save(trainer.save_dir / f"{save_prefix}_loss_best.pt", val_metrics)
         for line in Trainer.format_metric_lines(
                 val_metrics,
-                label='resume_val',
+                label=f'{label.lower()}_val',
                 indent='  ',
                 prefix='val_'):
             print(line)
 
-    def _init_score_bests_from_resume(trainer, score_loader_to_check,
+    def _init_score_bests_from_loaded(trainer, score_loader_to_check,
                                       save_prefix):
-        """Use the resumed checkpoint's COCO metrics as score-best baselines."""
-        if not resume or not _config_bool(
-                resume_cfg.get('init_score_best_from_resume', False)):
+        """Use the loaded checkpoint's COCO metrics as score-best baselines."""
+        loaded_weights = resume or init_weights
+        enabled = (
+            _config_bool(resume_cfg.get('init_score_best_from_resume', False)) or
+            _config_bool(resume_cfg.get('init_score_best_from_loaded', False))
+        )
+        if not loaded_weights or not enabled:
             return
         if not per_epoch_score_enabled:
             return
         if score_loader_to_check is None:
             raise RuntimeError(
-                "resume.init_score_best_from_resume=true requires a COCOeval loader")
-        print("[Resume] Computing COCOeval metrics for the resumed checkpoint...")
+                "initial COCO bests require a COCOeval loader")
+        label = "Resume" if resume else "Init"
+        print(f"[{label}] Computing COCOeval metrics for the loaded checkpoint...")
         score_metrics = trainer.validate_score(
             score_loader_to_check,
             **score_eval_kwargs,
@@ -1198,7 +1225,7 @@ def main():
         )
         for key, value in score_metrics.items():
             if isinstance(value, float):
-                print(f"  resume_coco/{key}: {value:.4f}")
+                print(f"  {label.lower()}_coco/{key}: {value:.4f}")
 
     def _run_preflight(train_loader, val_loader_to_check=None, tag='train'):
         print(f"\n[Preflight] Checking one {tag} batch...")
@@ -1445,8 +1472,8 @@ def main():
 
         epochs = 3 if opts['debug'] else opts['epochs']
         _preserve_resume_lr(trainer, epochs)
-        _init_best_from_resume_loss(trainer, val_loader)
-        _init_score_bests_from_resume(trainer, score_loader, model_name)
+        _init_best_from_loaded_loss(trainer, val_loader, model_name)
+        _init_score_bests_from_loaded(trainer, score_loader, model_name)
 
         trainer.fit(
             epochs=epochs,
