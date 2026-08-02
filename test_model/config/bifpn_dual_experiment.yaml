@@ -50,7 +50,7 @@ data:
 
 training:
   epochs: 50
-  batch_size: 32
+  batch_size: 16
   workers: 14
 
   optimizer: sgd
@@ -137,7 +137,7 @@ training:
       enabled: true
       cls_weight: 0.25
       dfl_weight: 0.25
-      feature_weight: 0.25
+      feature_weight: 0.0
 
   freeze:
     enabled: false

@@ -845,7 +845,7 @@ class Trainer:
         losses = []
         for s_feat, t_feat in zip(student_feats, teacher_feats):
             if s_feat.shape == t_feat.shape:
-                losses.append(F.mse_loss(s_feat.float(), t_feat.detach().float()))
+                losses.append(F.mse_loss(s_feat, t_feat.detach().to(dtype=s_feat.dtype)))
         if not losses:
             return torch.zeros((), device=student_feats[0].device)
         return feat_w * sum(losses) / len(losses)
@@ -865,7 +865,12 @@ class Trainer:
         teacher.eval()
         with torch.no_grad():
             teacher_data = teacher.forward_det_outputs(images, return_features=True)
-        student_data = self.model.forward_det_outputs(images, return_features=True)
+        student_data = {
+            'out': losses.get('_distill_det_out'),
+            'det_feats': losses.get('_distill_det_feats', []),
+        }
+        if student_data['out'] is None:
+            student_data = self.model.forward_det_outputs(images, return_features=True)
         out_total, cls_loss, reg_loss = self._distill_detect_outputs(
             student_data['out'], teacher_data['out'], det_cfg)
         feat_loss = self._distill_features(

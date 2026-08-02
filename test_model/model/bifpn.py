@@ -376,11 +376,16 @@ class ModelE_BiFPN(nn.Module):
     def compute_loss(self, images, gt_dict_list):
         device = next(self.parameters()).device
         images = images.to(device, non_blocking=True)
-        det_out, pose_out = self._forward_selected_heads(
-            images,
-            need_det=self.train_det,
-            need_pose=self.train_pose,
-        )
+        neck_feats = self._forward_features(images)
+        det_out = None
+        pose_out = None
+        det_feats = []
+        if self.train_det:
+            det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
+            det_out = self.det_head(det_feats)
+        if self.train_pose:
+            pose_feats = [adapter(feat) for adapter, feat in zip(self.pose_adapter, neck_feats)]
+            pose_out = self.pose_head(pose_feats)
 
         if self.train_det:
             det_losses = self.det_loss(det_out, self._filter_non_person_gt(gt_dict_list, device))
@@ -448,6 +453,9 @@ class ModelE_BiFPN(nn.Module):
             'uncertainty_w_det': torch.exp(-det_log_var.detach()),
             'uncertainty_w_pose': torch.exp(-pose_log_var.detach()),
         }
+        if self.training and self.train_det:
+            loss_dict['_distill_det_out'] = det_out
+            loss_dict['_distill_det_feats'] = det_feats
         return loss_dict
 
     @staticmethod
