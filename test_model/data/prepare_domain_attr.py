@@ -23,6 +23,7 @@ import numpy as np
 
 ATTR_NAMES = ["smoking", "falling", "waving", "helmet_on"]
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
+DATASET_NAMES = ("fall", "hat", "water", "fire", "smoking", "coco_pose")
 
 
 @dataclass
@@ -149,6 +150,66 @@ def collect_pairs(img_dir, label_dir):
     return pairs
 
 
+def candidate_has_standard_layout(root):
+    root = Path(root)
+    return any((root / name / "images").exists() and
+               (root / name / "labels").exists()
+               for name in DATASET_NAMES)
+
+
+def normalize_backslash_candidate_root(candidate_root):
+    """Repair candidate zips extracted with literal Windows backslashes.
+
+    Some Linux unzip builds warn about backslash path separators but still
+    create files like ``full\\fall\\images\\xxx.jpg``.  The training-data
+    processor expects normal directories, so this copies those files into the
+    requested candidate root using POSIX-style separators.
+    """
+    candidate_root = Path(candidate_root)
+    if candidate_root.exists() and candidate_has_standard_layout(candidate_root):
+        return candidate_root
+
+    search_root = candidate_root if candidate_root.exists() else candidate_root.parent
+    if not search_root.exists():
+        raise FileNotFoundError(
+            f"candidate root not found: {candidate_root}; "
+            f"also cannot scan parent: {search_root}"
+        )
+
+    prefix = candidate_root.name
+    repaired = 0
+    for src in search_root.rglob("*"):
+        if not src.is_file():
+            continue
+        rel = str(src.relative_to(search_root)).replace("\\", "/")
+        parts = [p for p in rel.split("/") if p]
+        if len(parts) < 4 or parts[0] != prefix:
+            continue
+        if parts[1] not in DATASET_NAMES or parts[2] not in ("images", "labels"):
+            continue
+        dst = candidate_root.joinpath(*parts[1:])
+        if src.resolve() == dst.resolve():
+            continue
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        if not dst.exists() or src.stat().st_size != dst.stat().st_size:
+            shutil.copy2(src, dst)
+        repaired += 1
+
+    if repaired:
+        print(
+            f"Normalized {repaired} backslash-path candidate files into "
+            f"{candidate_root}",
+            flush=True,
+        )
+
+    if not candidate_has_standard_layout(candidate_root):
+        raise FileNotFoundError(
+            f"No candidate dataset layout found under {candidate_root}. "
+            "Expected fall/images+labels, hat/images+labels, ..."
+        )
+    return candidate_root
+
+
 def collect_split_pairs(root, splits=("train", "valid", "val", "test")):
     root = Path(root)
     pairs = []
@@ -211,12 +272,10 @@ def sample_pairs(name, pairs, sample_n, rng, valid_fn):
 
 
 def load_candidate_pairs(candidate_root):
-    candidate_root = Path(candidate_root)
-    if not candidate_root.exists():
-        raise FileNotFoundError(f"candidate root not found: {candidate_root}")
+    candidate_root = normalize_backslash_candidate_root(candidate_root)
 
     selected = {}
-    for name in ("fall", "hat", "water", "fire", "smoking", "coco_pose"):
+    for name in DATASET_NAMES:
         pairs = collect_pairs(candidate_root / name / "images",
                               candidate_root / name / "labels")
         items = []
