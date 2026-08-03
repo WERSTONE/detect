@@ -614,9 +614,14 @@ class DomainAttrBiFPN(ModelE_BiFPN):
         )
         self.det_loss = self.domain_det_loss
         self.attr_loss_weight = 1.0
+        self.attr_task_weight = 1.0
         self.train_domain_det = True
+        self.train_det = True
         self.train_attr = True
         self.train_pose = False
+
+    def set_attr_task_weight(self, attr_weight=1.0):
+        self.attr_task_weight = float(attr_weight)
 
     def forward(self, x):
         return self._forward_head(x)
@@ -777,7 +782,7 @@ class DomainAttrBiFPN(ModelE_BiFPN):
         total = (
             self.det_task_weight * det_losses['total'] +
             self.pose_task_weight * pose_losses['total'] +
-            attr_total
+            self.attr_task_weight * attr_total
         )
         raw_total = det_losses['total'] + pose_losses['total'] + attr_total
 
@@ -811,6 +816,10 @@ class DomainAttrBiFPN(ModelE_BiFPN):
             ),
             'task_w_det': torch.tensor(self.det_task_weight, device=device),
             'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
+            'task_w_attr': torch.tensor(
+                self.attr_task_weight if self.train_attr else 0.0,
+                device=device,
+            ),
         }
 
     @torch.no_grad()

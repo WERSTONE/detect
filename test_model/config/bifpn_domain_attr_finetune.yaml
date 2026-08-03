@@ -141,7 +141,69 @@ training:
 
   task_weights:
     det: 1.0
+    attr: 1.0
     pose: 0.0
+
+  staged_training:
+    enabled: true
+    start_stage: 1
+    stages:
+      - name: new_heads
+        epochs: 40
+        lr0: 0.0005
+        train_domain_det: true
+        train_attr: true
+        train_pose: false
+        det_weight: 1.0
+        attr_weight: 1.0
+        pose_weight: 0.0
+        close_mosaic_epochs: 0
+        load_best_for_next_stage: true
+        freeze:
+          enabled: true
+          trainable_modules:
+            - domain_det_head
+            - attr_head
+          freeze_bn: true
+
+      - name: det_adapter
+        epochs: 40
+        lr0: 0.0002
+        train_domain_det: true
+        train_attr: true
+        train_pose: false
+        det_weight: 1.0
+        attr_weight: 1.0
+        pose_weight: 0.0
+        close_mosaic_epochs: 0
+        load_best_for_next_stage: true
+        freeze:
+          enabled: true
+          trainable_modules:
+            - det_adapter
+            - domain_det_head
+            - attr_head
+          freeze_bn: true
+
+      - name: neck_guarded
+        epochs: 30
+        lr0: 0.00005
+        train_domain_det: true
+        train_attr: true
+        train_pose: true
+        det_weight: 1.0
+        attr_weight: 1.0
+        pose_weight: 0.05
+        close_mosaic_epochs: 0
+        load_best_for_next_stage: true
+        freeze:
+          enabled: true
+          trainable_modules:
+            - neck
+            - det_adapter
+            - domain_det_head
+            - attr_head
+          freeze_bn: true
 
   dynamic_weights:
     enabled: false

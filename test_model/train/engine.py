@@ -1062,9 +1062,16 @@ def main():
     task_weights_cfg = t_cfg.get('task_weights', {}) or {}
     base_det_weight = float(task_weights_cfg.get('det', task_weights_cfg.get('detection', 1.0)))
     base_pose_weight = float(task_weights_cfg.get('pose', 1.0))
-    if base_det_weight < 0 or base_pose_weight < 0:
-        raise ValueError("training.task_weights det/pose must be >= 0")
-    print(f"Base task weights: det={base_det_weight:.4g} pose={base_pose_weight:.4g}")
+    base_attr_weight = float(task_weights_cfg.get('attr', task_weights_cfg.get('attributes', 1.0)))
+    if base_det_weight < 0 or base_pose_weight < 0 or base_attr_weight < 0:
+        raise ValueError("training.task_weights det/pose/attr must be >= 0")
+    print(
+        "Base task weights: "
+        f"det={base_det_weight:.4g} pose={base_pose_weight:.4g} "
+        f"attr={base_attr_weight:.4g}"
+    )
+    if hasattr(model, 'set_attr_task_weight'):
+        model.set_attr_task_weight(base_attr_weight if getattr(model, 'train_attr', True) else 0.0)
     task_loss_history = []
     dynamic_enabled = bool(dynamic_cfg.get('enabled', False))
     dynamic_method = str(dynamic_cfg.get('method', 'dwa')).lower()
@@ -1100,6 +1107,10 @@ def main():
     def _apply_dynamic_weights(epoch):
         if hasattr(model, 'disable_pose_proposal_training'):
             model.disable_pose_proposal_training()
+        if hasattr(model, 'train_domain_det') and hasattr(model, 'train_det'):
+            model.train_det = bool(model.train_domain_det)
+        if hasattr(model, 'set_attr_task_weight'):
+            model.set_attr_task_weight(base_attr_weight if getattr(model, 'train_attr', True) else 0.0)
         if hasattr(model, 'train_det') and hasattr(model, 'train_pose'):
             if not model.train_det or not model.train_pose:
                 if hasattr(model, 'set_task_weights'):
@@ -1111,6 +1122,8 @@ def main():
         if not dynamic_enabled:
             if hasattr(model, 'set_task_weights'):
                 model.set_task_weights(base_det_weight, base_pose_weight)
+            if hasattr(model, 'set_attr_task_weight'):
+                model.set_attr_task_weight(base_attr_weight if getattr(model, 'train_attr', True) else 0.0)
             return
         method = dynamic_method
         if method != 'dwa':
@@ -1340,12 +1353,25 @@ def main():
         setattr(model, '_frozen_module_roots', [])
 
         model.train_det = bool(stage_cfg.get('train_det', True))
+        if hasattr(model, 'train_domain_det'):
+            model.train_domain_det = bool(
+                stage_cfg.get('train_domain_det', stage_cfg.get('train_det', True)))
+            model.train_det = model.train_domain_det
+        if hasattr(model, 'train_attr'):
+            model.train_attr = bool(stage_cfg.get('train_attr', True))
         model.train_pose = bool(stage_cfg.get('train_pose', True))
         model.det_weight_mult = float(stage_cfg.get('det_weight_mult', 1.0))
         if hasattr(model, 'set_task_weights'):
             model.set_task_weights(
-                stage_cfg.get('det_weight', 1.0 if model.train_det else 0.0),
-                stage_cfg.get('pose_weight', 1.0 if model.train_pose else 0.0),
+                stage_cfg.get('det_weight', base_det_weight if model.train_det else 0.0),
+                stage_cfg.get('pose_weight', base_pose_weight if model.train_pose else 0.0),
+            )
+        if hasattr(model, 'set_attr_task_weight'):
+            model.set_attr_task_weight(
+                stage_cfg.get(
+                    'attr_weight',
+                    base_attr_weight if getattr(model, 'train_attr', True) else 0.0,
+                )
             )
 
         if stage_cfg.get('freeze_backbone', False):
@@ -1407,7 +1433,12 @@ def main():
         return _callback
 
     staged_cfg = t_cfg.get('staged_training', {})
-    is_bifpn_model = model_name in ('bifpn', 'bifpn_dual')
+    is_bifpn_model = model_name in (
+        'bifpn',
+        'bifpn_dual',
+        'bifpn_dual_domain_attr',
+        'bifpn_domain_attr',
+    )
     if staged_cfg.get('enabled') and is_bifpn_model:
         stages = staged_cfg.get('stages', [])
         if not stages:
@@ -1450,7 +1481,12 @@ def main():
             print(f"Stage {stage_index}: {stage_name} | Epochs: {stage_epochs} | LR: {stage_lr}")
             print(
                 f"  train_det={getattr(model, 'train_det', True)} "
+                f"train_domain_det={getattr(model, 'train_domain_det', None)} "
+                f"train_attr={getattr(model, 'train_attr', None)} "
                 f"train_pose={getattr(model, 'train_pose', True)} "
+                f"w_det={getattr(model, 'det_task_weight', 1.0):.4g} "
+                f"w_attr={getattr(model, 'attr_task_weight', 0.0):.4g} "
+                f"w_pose={getattr(model, 'pose_task_weight', 1.0):.4g} "
                 f"freeze_backbone={stage_cfg.get('freeze_backbone', False)} "
                 f"trainable_backbone_layers={stage_cfg.get('trainable_backbone_layers', 'all')} "
                 f"person_only={effective_person_only} "
@@ -1473,11 +1509,16 @@ def main():
                     gradient_projection_cfg.get('enabled', False),
                 ),
                 stage_cfg=stage_cfg)
+            stage_save_prefix = (
+                model_name if stage_index == len(stages) else f"{model_name}_{stage_name}"
+            )
+            _init_best_from_loaded_loss(trainer_stage, val_loader, stage_save_prefix)
+            _init_score_bests_from_loaded(trainer_stage, score_loader, stage_save_prefix)
             trainer_stage.fit(
                 epochs=stage_epochs,
                 train_loader=train_loader_stage,
                 val_loader=val_loader,
-                save_prefix=model_name if stage_index == len(stages) else f"{model_name}_{stage_name}",
+                save_prefix=stage_save_prefix,
                 close_mosaic_epochs=stage_cfg.get('close_mosaic_epochs', close_mosaic),
                 on_epoch_start=_stage_epoch_callback(stage_cfg),
                 on_epoch_end=_record_task_losses,
@@ -1488,8 +1529,6 @@ def main():
 
             if stage_index < len(stages) and stage_cfg.get('load_best_for_next_stage', True):
                 stage_save_dir = Path(opts['save_dir']) / (
-                    model_name if stage_index == len(stages) else f"{model_name}_{stage_name}")
-                stage_save_prefix = (
                     model_name if stage_index == len(stages) else f"{model_name}_{stage_name}")
                 best_ckpt = stage_save_dir / f"{stage_save_prefix}_best.pt"
                 if best_ckpt.exists():

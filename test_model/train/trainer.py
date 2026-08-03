@@ -372,6 +372,12 @@ class Trainer:
                 ('pose_num_pos', 'pos'),
                 ('target_scores_sum_pose', 'score_sum'),
             ]),
+            ('attr', [
+                ('attr_bce', 'bce'),
+                ('attr_total', 'total'),
+                ('attr_count', 'count'),
+                ('task_w_attr', 'w'),
+            ]),
             ('dyn', [
                 ('dyn_w_det', 'w_det'),
                 ('dyn_w_pose', 'w_pose'),
