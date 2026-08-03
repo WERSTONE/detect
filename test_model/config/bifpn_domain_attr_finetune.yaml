@@ -84,7 +84,7 @@ training:
 
   task_weights:
     det: 1.0
-    attr: 1.0
+    attr: 3.0
     pose: 0.0
 
   staged_training:
@@ -98,7 +98,7 @@ training:
         train_attr: true
         train_pose: false
         det_weight: 1.0
-        attr_weight: 1.0
+        attr_weight: 3.0
         pose_weight: 0.0
         load_best_for_next_stage: true
         freeze:
@@ -113,7 +113,7 @@ training:
         train_attr: true
         train_pose: false
         det_weight: 1.0
-        attr_weight: 1.0
+        attr_weight: 3.0
         pose_weight: 0.0
         load_best_for_next_stage: true
         freeze:
@@ -128,7 +128,7 @@ training:
         train_attr: true
         train_pose: true
         det_weight: 1.0
-        attr_weight: 1.0
+        attr_weight: 3.0
         pose_weight: 0.05
         load_best_for_next_stage: true
         freeze:
@@ -141,6 +141,11 @@ loss:
   w_cls: 0.5
   w_dfl: 1.5
   w_attr: 1.0
+  attr_pos_weight:
+    smoking: 4.0
+    falling: 2.0
+    waving: 12.0
+    helmet_on: 2.0
   w_pose: 12.0
   w_kobj: 1.0
 

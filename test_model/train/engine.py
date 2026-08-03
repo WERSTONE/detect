@@ -70,6 +70,124 @@ def _config_bool(value, default=False):
     return bool(value)
 
 
+def _resolve_attr_pos_weight(raw, attr_names, num_attrs):
+    attr_names = list(attr_names or [])
+    if raw is None:
+        return [1.0] * int(num_attrs)
+    if isinstance(raw, (int, float)):
+        return [float(raw)] * int(num_attrs)
+    if isinstance(raw, (list, tuple)):
+        values = [float(v) for v in raw]
+        if len(values) != int(num_attrs):
+            raise ValueError(
+                f"loss.attr_pos_weight has {len(values)} values, "
+                f"expected {num_attrs}")
+        return values
+    if isinstance(raw, dict):
+        values = [1.0] * int(num_attrs)
+        name_to_idx = {str(name): idx for idx, name in enumerate(attr_names)}
+        for key, value in raw.items():
+            key_s = str(key)
+            if key_s in name_to_idx:
+                idx = name_to_idx[key_s]
+            else:
+                try:
+                    idx = int(key_s)
+                except ValueError as exc:
+                    raise ValueError(f"Unknown attr_pos_weight key: {key}") from exc
+            if idx < 0 or idx >= int(num_attrs):
+                raise ValueError(f"attr_pos_weight index out of range: {idx}")
+            values[idx] = float(value)
+        return values
+    raise TypeError(
+        "loss.attr_pos_weight must be a scalar, list, or dict keyed by "
+        "attribute name/index")
+
+
+def _collect_attr_label_stats(dataset, num_attrs):
+    samples = getattr(dataset, 'samples', None)
+    if samples is None and hasattr(dataset, 'dataset'):
+        samples = getattr(dataset.dataset, 'samples', None)
+    if not samples:
+        return None
+
+    stats = {
+        'label_files': 0,
+        'person_rows': 0,
+        'person_rows_with_attrs': 0,
+        'pos': [0] * int(num_attrs),
+        'neg': [0] * int(num_attrs),
+        'unknown': [0] * int(num_attrs),
+    }
+    for _img_path, label_path in samples:
+        if not label_path:
+            continue
+        label = Path(label_path)
+        if not label.exists():
+            continue
+        stats['label_files'] += 1
+        try:
+            lines = label.read_text(encoding='utf-8').splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            parts = line.strip().split()
+            if len(parts) < 5:
+                continue
+            try:
+                cls = int(float(parts[0]))
+            except ValueError:
+                continue
+            if cls != 0:
+                continue
+            stats['person_rows'] += 1
+            if len(parts) < 64:
+                for idx in range(int(num_attrs)):
+                    stats['unknown'][idx] += 1
+                continue
+            stats['person_rows_with_attrs'] += 1
+            attr_start = 56
+            mask_start = attr_start + int(num_attrs)
+            attrs = [float(v) for v in parts[attr_start:mask_start]]
+            masks = [float(v) for v in parts[mask_start:mask_start + int(num_attrs)]]
+            for idx, (attr, mask) in enumerate(zip(attrs, masks)):
+                if mask > 0:
+                    if attr > 0.5:
+                        stats['pos'][idx] += 1
+                    else:
+                        stats['neg'][idx] += 1
+                else:
+                    stats['unknown'][idx] += 1
+    return stats
+
+
+def _print_attr_label_stats(label, dataset, attr_names):
+    attr_names = list(attr_names or [])
+    if not attr_names:
+        return
+    stats = _collect_attr_label_stats(dataset, len(attr_names))
+    if not stats:
+        return
+    print(
+        f"Attr labels ({label}): labels={stats['label_files']} "
+        f"persons={stats['person_rows']} "
+        f"with_attrs={stats['person_rows_with_attrs']}",
+        flush=True,
+    )
+    for idx, name in enumerate(attr_names):
+        pos = stats['pos'][idx]
+        neg = stats['neg'][idx]
+        unknown = stats['unknown'][idx]
+        known = pos + neg
+        pos_rate = pos / max(known, 1)
+        neg_pos = neg / max(pos, 1)
+        print(
+            f"  attr/{name}: pos={pos} neg={neg} unknown={unknown} "
+            f"pos_rate={pos_rate:.4f} neg_pos={neg_pos:.2f}",
+            flush=True,
+        )
+
+
 def parse_args():
     p = argparse.ArgumentParser(description='Train multi-head verification model')
     p.add_argument('--config', type=str, default=None,
@@ -780,6 +898,18 @@ def main():
         model.det_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
     if hasattr(model, 'attr_loss_weight'):
         model.attr_loss_weight = float(l_cfg.get('w_attr', 1.0))
+    if hasattr(model, 'set_attr_pos_weight'):
+        attr_pos_weight = _resolve_attr_pos_weight(
+            l_cfg.get('attr_pos_weight', None),
+            getattr(model, 'attr_names', []),
+            getattr(model, 'num_attrs', 4),
+        )
+        model.set_attr_pos_weight(attr_pos_weight)
+        parts = [
+            f"{name}={weight:.4g}"
+            for name, weight in zip(getattr(model, 'attr_names', []), attr_pos_weight)
+        ]
+        print("Attr positive weights: " + ", ".join(parts))
     if hasattr(model, 'pose_loss'):
         if model_name in ('bifpn', 'bifpn_dual',
                           'bifpn_pose', 'bifpn_pose_only'):
@@ -860,6 +990,8 @@ def main():
         require_keypoints=val_require_keypoints,
     )
     print(f"Val: {len(val_loader.dataset)} samples")
+    if hasattr(model, 'attr_names'):
+        _print_attr_label_stats('val', val_loader.dataset, model.attr_names)
 
     validation_cfg = cfg.get('validation', {})
     score_cfg = validation_cfg.get('final_eval', {})
@@ -1504,6 +1636,8 @@ def main():
                 person_only=stage_person_only,
                 require_keypoints=stage_require_keypoints,
             )
+            if stage_index == start_stage and hasattr(model, 'attr_names'):
+                _print_attr_label_stats('train', train_loader_stage.dataset, model.attr_names)
             print(f"\n{'='*60}")
             print(f"Stage {stage_index}: {stage_name} | Epochs: {stage_epochs} | LR: {stage_lr}")
             print(
@@ -1582,6 +1716,8 @@ def main():
                 model.disable_pose_proposal_training()
         train_loader = _make_train_loader()
         print(f"Train: {len(train_loader.dataset)} samples")
+        if hasattr(model, 'attr_names'):
+            _print_attr_label_stats('train', train_loader.dataset, model.attr_names)
         _run_preflight(train_loader, val_loader, tag='single-stage')
 
         trainer = _make_trainer(opts['lr'])

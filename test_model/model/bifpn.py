@@ -615,6 +615,11 @@ class DomainAttrBiFPN(ModelE_BiFPN):
         self.det_loss = self.domain_det_loss
         self.attr_loss_weight = 1.0
         self.attr_task_weight = 1.0
+        self.register_buffer(
+            'attr_pos_weight',
+            torch.ones(self.num_attrs),
+            persistent=False,
+        )
         self.train_domain_det = True
         self.train_det = True
         self.train_attr = True
@@ -622,6 +627,17 @@ class DomainAttrBiFPN(ModelE_BiFPN):
 
     def set_attr_task_weight(self, attr_weight=1.0):
         self.attr_task_weight = float(attr_weight)
+
+    def set_attr_pos_weight(self, pos_weight):
+        value = torch.as_tensor(pos_weight, dtype=self.attr_pos_weight.dtype)
+        if value.numel() == 1:
+            value = value.repeat(self.num_attrs)
+        if value.numel() != self.num_attrs:
+            raise ValueError(
+                f"attr_pos_weight has {value.numel()} values, "
+                f"expected {self.num_attrs}")
+        self.attr_pos_weight.copy_(
+            value.reshape(self.num_attrs).to(self.attr_pos_weight.device))
 
     def forward(self, x):
         return self._forward_head(x)
@@ -712,6 +728,10 @@ class DomainAttrBiFPN(ModelE_BiFPN):
                 raw = F.binary_cross_entropy_with_logits(
                     logits.float(),
                     attrs[i].float(),
+                    pos_weight=self.attr_pos_weight.to(
+                        device=logits.device,
+                        dtype=torch.float32,
+                    ),
                     reduction='none',
                 )
                 mask = attr_mask[i].float()
