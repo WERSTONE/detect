@@ -901,7 +901,34 @@ def main():
         'coco_max_det': cfg.get('eval', {}).get('coco_max_det', 100),
     }
 
-    resume_cfg = t_cfg.get('resume', {}) or {}
+    resume_cfg = dict(t_cfg.get('resume', {}) or {})
+    loaded_checkpoint_cfg = t_cfg.get('loaded_checkpoint', {}) or {}
+    if loaded_checkpoint_cfg:
+        if 'init_best' in loaded_checkpoint_cfg:
+            resume_cfg.setdefault(
+                'init_best_from_loaded',
+                loaded_checkpoint_cfg.get('init_best'),
+            )
+        if 'init_best_from_loaded' in loaded_checkpoint_cfg:
+            resume_cfg.setdefault(
+                'init_best_from_loaded',
+                loaded_checkpoint_cfg.get('init_best_from_loaded'),
+            )
+        if 'init_score_best' in loaded_checkpoint_cfg:
+            resume_cfg.setdefault(
+                'init_score_best_from_loaded',
+                loaded_checkpoint_cfg.get('init_score_best'),
+            )
+        if 'init_score_best_from_loaded' in loaded_checkpoint_cfg:
+            resume_cfg.setdefault(
+                'init_score_best_from_loaded',
+                loaded_checkpoint_cfg.get('init_score_best_from_loaded'),
+            )
+        if 'save_score_best_aliases' in loaded_checkpoint_cfg:
+            resume_cfg.setdefault(
+                'save_score_best_aliases',
+                loaded_checkpoint_cfg.get('save_score_best_aliases'),
+            )
     if resume and _config_bool(resume_cfg.get('keep_mosaic_closed', False)):
         opts['no_mosaic'] = True
         print("[Resume] keep_mosaic_closed=true; training mosaic is disabled.")
