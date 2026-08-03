@@ -369,32 +369,30 @@ def assign_fall_attrs(persons, action_boxes, attrs, masks):
 
 
 def assign_helmet_attrs(persons, label_boxes, attrs, masks, img_w, img_h):
-    heads = [b for b in label_boxes if b.cls == 1]
-    hats = [b for b in label_boxes if b.cls == 0]
-    head_to_person = greedy_match(heads, persons, min_score=0.25, metric="ioa")
-    if not head_to_person:
-        return
-
-    hat_candidates = []
-    for hi, head in enumerate(heads):
-        expanded = expand_box(head.xyxy, 1.35, img_w, img_h)
-        for ti, hat in enumerate(hats):
-            score = ioa(hat.xyxy, expanded)
-            if center_in(hat.xyxy, expanded):
-                score += 0.1
-            if score >= 0.15:
-                hat_candidates.append((score, hi, ti))
-    hat_candidates.sort(reverse=True)
-    head_has_hat = set()
-    used_hat = set()
-    for _score, hi, ti in hat_candidates:
-        if hi in head_has_hat or ti in used_hat:
+    # The safety-helmet source dataset uses mutually exclusive head labels:
+    #   0=hat/helmet head, 1=bare head.
+    # Match each small head label to at most one YOLO-pose person and assign
+    # the per-person helmet_on attribute directly.
+    candidates = []
+    for bi, box in enumerate(label_boxes):
+        if box.cls not in (0, 1):
             continue
-        head_has_hat.add(hi)
-        used_hat.add(ti)
+        for pi, person in enumerate(persons):
+            score = ioa(box.xyxy, person.xyxy)
+            if center_in(box.xyxy, person.xyxy):
+                score += 0.05
+            if score >= 0.2:
+                candidates.append((score, bi, pi))
+    candidates.sort(reverse=True)
 
-    for hi, pi in head_to_person.items():
-        attrs[pi][3] = 1.0 if hi in head_has_hat else 0.0
+    used_box = set()
+    used_person = set()
+    for _score, bi, pi in candidates:
+        if bi in used_box or pi in used_person:
+            continue
+        used_box.add(bi)
+        used_person.add(pi)
+        attrs[pi][3] = 1.0 if label_boxes[bi].cls == 0 else 0.0
         masks[pi][3] = 1.0
 
 
