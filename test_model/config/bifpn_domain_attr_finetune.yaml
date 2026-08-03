@@ -1,7 +1,7 @@
 # Target-domain fine-tuning from the trained dual-head checkpoint.
 #
 # Effective training length is defined only by staged_training.stages:
-#   new_heads 40 + det_adapter 40 + neck_guarded 30 = 110 epochs
+#   new_heads 50 + det_adapter 50 + neck_guarded 60 + full_finetune 100 = 260 epochs
 #
 # Typical use:
 #   python3 -u -m test_model.main \
@@ -60,9 +60,9 @@ training:
   accumulate: auto
   scale_weight_decay: true
 
-  # Stage lr0 values below are the only effective base learning rates.
-  cos_lr: true
-  lrf: 0.1
+  # Stage lr0/cos_lr/lrf values below are the effective learning-rate schedule.
+  cos_lr: false
+  lrf: 1.0
   yolo_warmup: false
   warmup_epochs: 0
   grad_clip: 10.0
@@ -84,21 +84,23 @@ training:
 
   task_weights:
     det: 1.0
-    attr: 3.0
-    pose: 0.0
+    attr: 10.0
+    pose: 1.0
 
   staged_training:
     enabled: true
     start_stage: 1
     stages:
       - name: new_heads
-        epochs: 40
-        lr0: 0.001
+        epochs: 50
+        lr0: 0.003
+        cos_lr: false
+        lrf: 1.0
         train_domain_det: true
         train_attr: true
         train_pose: false
         det_weight: 1.0
-        attr_weight: 3.0
+        attr_weight: 10.0
         pose_weight: 0.0
         load_best_for_next_stage: true
         freeze:
@@ -107,13 +109,15 @@ training:
           freeze_bn: true
 
       - name: det_adapter
-        epochs: 40
-        lr0: 0.0001
+        epochs: 50
+        lr0: 0.0003
+        cos_lr: false
+        lrf: 1.0
         train_domain_det: true
         train_attr: true
         train_pose: false
         det_weight: 1.0
-        attr_weight: 3.0
+        attr_weight: 10.0
         pose_weight: 0.0
         load_best_for_next_stage: true
         freeze:
@@ -122,24 +126,46 @@ training:
           freeze_bn: true
 
       - name: neck_guarded
-        epochs: 30
-        lr0: 0.00005
+        epochs: 60
+        lr0: 0.0001
+        cos_lr: false
+        lrf: 1.0
         train_domain_det: true
         train_attr: true
         train_pose: true
         det_weight: 1.0
-        attr_weight: 3.0
-        pose_weight: 0.05
+        attr_weight: 10.0
+        pose_weight: 0.75
         load_best_for_next_stage: true
         freeze:
           enabled: true
           trainable_modules: [neck, det_adapter, domain_det_head, attr_head]
           freeze_bn: true
 
+      - name: full_finetune
+        epochs: 100
+        lr0: 0.00003
+        cos_lr: true
+        lrf: 0.2
+        train_domain_det: true
+        train_attr: true
+        train_pose: true
+        det_weight: 1.0
+        attr_weight: 10.0
+        pose_weight: 1.0
+        load_best_for_next_stage: false
+        freeze:
+          enabled: false
+
 loss:
   w_box: 7.5
   w_cls: 0.5
   w_dfl: 1.5
+  pose_det:
+    enabled: true
+    w_box: 7.5
+    w_cls: 0.5
+    w_dfl: 1.5
   w_attr: 1.0
   attr_pos_weight:
     smoking: 4.0
@@ -165,6 +191,17 @@ augmentation:
 validation:
   backend: loss
   task: domain
+  final_eval:
+    enabled: true
+    task: keypoints
+    data_root: /root/autodl-tmp/coco2017
+    val_img: val2017
+    val_label: labels/val2017
+    class_id_format: yolo80
+    person_only: true
+    require_keypoints: true
+    max_samples: 0
+    pose_metric: keypoints/AP
 
 eval:
   score_thresh: 0.01

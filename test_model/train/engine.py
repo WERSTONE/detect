@@ -911,17 +911,25 @@ def main():
         ]
         print("Attr positive weights: " + ", ".join(parts))
     if hasattr(model, 'pose_loss'):
-        if model_name in ('bifpn', 'bifpn_dual',
-                          'bifpn_pose', 'bifpn_pose_only'):
-            model.pose_loss.w_box = l_cfg.get('w_box', 7.5)
-            model.pose_loss.w_cls = l_cfg.get('w_cls', 0.5)
-            model.pose_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
+        pose_det_cfg = l_cfg.get('pose_det', {}) or {}
+        pose_det_enabled = _config_bool(pose_det_cfg.get('enabled', True), True)
+        if pose_det_enabled:
+            model.pose_loss.w_box = pose_det_cfg.get('w_box', l_cfg.get('w_box', 7.5))
+            model.pose_loss.w_cls = pose_det_cfg.get('w_cls', l_cfg.get('w_cls', 0.5))
+            model.pose_loss.w_dfl = pose_det_cfg.get('w_dfl', l_cfg.get('w_dfl', 1.5))
         else:
             model.pose_loss.w_box = 0.0
             model.pose_loss.w_cls = 0.0
             model.pose_loss.w_dfl = 0.0
         model.pose_loss.w_pose = l_cfg.get('w_pose', 12.0)
         model.pose_loss.w_kobj = l_cfg.get('w_kobj', 1.0)
+        print(
+            "Pose det loss: "
+            f"enabled={pose_det_enabled} "
+            f"w_box={model.pose_loss.w_box:.4g} "
+            f"w_cls={model.pose_loss.w_cls:.4g} "
+            f"w_dfl={model.pose_loss.w_dfl:.4g}"
+        )
     if hasattr(model, 'disable_pose_proposal_training'):
         model.disable_pose_proposal_training()
     if hasattr(model, 'loss_fn'):
@@ -1003,14 +1011,58 @@ def main():
     final_eval_enabled = bool(score_cfg.get('enabled', validation_cfg.get('backend') == 'cocoeval'))
     per_epoch_score_enabled = bool(score_eval_cfg.get('enabled', False))
     score_loader = None
+    score_data_root = data_root
+    score_keep_classes = keep_classes
+    score_num_classes = cfg.get('num_classes', 80)
+    score_task = score_cfg.get('task', validation_cfg.get('task', 'both'))
     if final_eval_enabled or per_epoch_score_enabled:
         score_loader = val_loader
+        score_batch_size = cfg.get('eval', {}).get('batch_size', opts['batch'])
+        final_eval_has_loader = any(
+            key in score_cfg for key in (
+                'data_root', 'root', 'val_img', 'img_dir',
+                'val_label', 'label_dir', 'person_only',
+                'require_keypoints', 'keep_classes',
+            )
+        )
+        if final_eval_enabled and final_eval_has_loader:
+            score_data_root = Path(score_cfg.get('data_root', score_cfg.get('root', data_root)))
+            score_keep_classes = score_cfg.get('keep_classes', keep_classes)
+            if score_keep_classes is not None:
+                score_keep_classes = [int(c) for c in score_keep_classes]
+            score_num_classes = int(score_cfg.get('num_classes', score_num_classes))
+            score_class_id_format = score_cfg.get('class_id_format', class_id_format)
+            score_person_only = bool(score_cfg.get('person_only', False))
+            score_require_keypoints = bool(score_cfg.get('require_keypoints', False))
+            score_loader = create_dataloader(
+                data_dir=score_data_root,
+                img_dir=score_cfg.get('val_img', score_cfg.get('img_dir', 'val2017')),
+                label_dir=score_cfg.get('val_label', score_cfg.get('label_dir', 'labels/val2017')),
+                input_size=score_cfg.get('input_size', d_cfg.get('input_size', 640)),
+                batch_size=score_batch_size,
+                use_mosaic=False,
+                augment=False,
+                shuffle=False,
+                num_workers=opts['workers'],
+                drop_last=False,
+                class_id_format=score_class_id_format,
+                keep_classes=score_keep_classes,
+                person_only=score_person_only,
+                require_keypoints=score_require_keypoints,
+            )
+            print(
+                "Final COCOeval loader: "
+                f"root={score_data_root} samples={len(score_loader.dataset)} "
+                f"task={score_task} keep_classes={score_keep_classes} "
+                f"person_only={score_person_only} "
+                f"require_keypoints={score_require_keypoints}"
+            )
         score_samples = int(
             score_eval_cfg.get('max_samples', score_cfg.get('max_samples', 0)) or 0)
-        if score_samples > 0 and score_samples < len(val_loader.dataset):
+        if score_samples > 0 and score_samples < len(score_loader.dataset):
             score_loader = DataLoader(
-                Subset(val_loader.dataset, range(score_samples)),
-                batch_size=cfg.get('eval', {}).get('batch_size', opts['batch']),
+                Subset(score_loader.dataset, range(score_samples)),
+                batch_size=score_batch_size,
                 shuffle=False,
                 num_workers=opts['workers'],
                 collate_fn=collate_fn,
@@ -1021,16 +1073,16 @@ def main():
             print("COCOeval: full val set")
 
     score_eval_kwargs = {
-        'score_thresh': cfg.get('eval', {}).get('score_thresh', 0.01),
-        'iou_thresh': cfg.get('eval', {}).get('iou_thresh', 0.6),
-        'max_det': cfg.get('eval', {}).get('max_det', 300),
-        'num_classes': cfg.get('num_classes', 80),
-        'keep_classes': keep_classes,
-        'data_root': data_root,
-        'task': validation_cfg.get('task', 'both'),
-        'instances_json': validation_cfg.get('instances_json', None),
-        'keypoints_json': validation_cfg.get('keypoints_json', None),
-        'coco_max_det': cfg.get('eval', {}).get('coco_max_det', 100),
+        'score_thresh': score_cfg.get('score_thresh', cfg.get('eval', {}).get('score_thresh', 0.01)),
+        'iou_thresh': score_cfg.get('iou_thresh', cfg.get('eval', {}).get('iou_thresh', 0.6)),
+        'max_det': score_cfg.get('max_det', cfg.get('eval', {}).get('max_det', 300)),
+        'num_classes': score_num_classes,
+        'keep_classes': score_keep_classes,
+        'data_root': score_data_root,
+        'task': score_task,
+        'instances_json': score_cfg.get('instances_json', validation_cfg.get('instances_json', None)),
+        'keypoints_json': score_cfg.get('keypoints_json', validation_cfg.get('keypoints_json', None)),
+        'coco_max_det': score_cfg.get('coco_max_det', cfg.get('eval', {}).get('coco_max_det', 100)),
     }
 
     resume_cfg = dict(t_cfg.get('resume', {}) or {})
@@ -1129,7 +1181,7 @@ def main():
             momentum=t_cfg.get('momentum', 0.937),
             weight_decay=t_cfg.get('weight_decay', 5e-4),
             nesterov=t_cfg.get('nesterov', True),
-            final_lr_ratio=t_cfg.get('lrf', 0.01),
+            final_lr_ratio=stage_cfg.get('lrf', t_cfg.get('lrf', 0.01)),
             backbone_lr=backbone_lr,
             backbone_lr_mult=backbone_lr_mult,
             param_groups=t_cfg.get('param_groups', 'basic'),
@@ -1137,7 +1189,7 @@ def main():
             nbs=t_cfg.get('nbs', 64),
             accumulate=t_cfg.get('accumulate', 'auto'),
             scale_weight_decay=t_cfg.get('scale_weight_decay', False),
-            cos_lr=t_cfg.get('cos_lr', True),
+            cos_lr=stage_cfg.get('cos_lr', t_cfg.get('cos_lr', True)),
             warmup_epochs=t_cfg.get('warmup_epochs', 3),
             warmup_momentum=t_cfg.get('warmup_momentum', 0.8),
             warmup_bias_lr=t_cfg.get('warmup_bias_lr', 0.1),
@@ -1652,6 +1704,8 @@ def main():
                 f"trainable_backbone_layers={stage_cfg.get('trainable_backbone_layers', 'all')} "
                 f"person_only={effective_person_only} "
                 f"require_keypoints={effective_require_keypoints} "
+                f"cos_lr={stage_cfg.get('cos_lr', t_cfg.get('cos_lr', True))} "
+                f"lrf={stage_cfg.get('lrf', t_cfg.get('lrf', 0.01))} "
                 f"dynamic={stage_cfg.get('use_dynamic_weights', False)} "
                 f"grad_proj={stage_cfg.get('use_gradient_projection', gradient_projection_cfg.get('enabled', False))}"
             )
