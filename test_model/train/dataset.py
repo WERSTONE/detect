@@ -211,21 +211,24 @@ class COCOMultiTaskDataset(Dataset):
         return self._load_single(idx)
 
     def _load_single(self, idx):
-        img, boxes, classes, kpts, img_path, orig_shape = self._load_raw(idx)
+        img, boxes, classes, kpts, attrs, attr_masks, img_path, orig_shape = self._load_raw(idx)
         orig_h, orig_w = orig_shape
 
         if self.augment:
             img, boxes, kpts, scale = self._resize_keep_ratio_no_pad(img, boxes, kpts)
-            img, boxes, classes, kpts = self._augment(
+            img, boxes, classes, kpts, attrs, attr_masks = self._augment(
                 img, boxes, classes, kpts,
+                attrs, attr_masks,
                 output_size=(self.input_size, self.input_size),
                 area_thr=0.10,
             )
-            boxes, classes, kpts = self._sanitize_targets(boxes, classes, kpts)
+            boxes, classes, kpts, attrs, attr_masks = self._sanitize_targets(
+                boxes, classes, kpts, attrs, attr_masks)
             pad_l, pad_t = 0, 0
         else:
             img, boxes, kpts, (pad_l, pad_t), scale = self._letterbox(img, boxes, kpts)
-            boxes, classes, kpts = self._sanitize_targets(boxes, classes, kpts)
+            boxes, classes, kpts, attrs, attr_masks = self._sanitize_targets(
+                boxes, classes, kpts, attrs, attr_masks)
 
         img = img.astype(np.float32) / 255.0
         img = torch.from_numpy(img).permute(2, 0, 1)
@@ -234,12 +237,19 @@ class COCOMultiTaskDataset(Dataset):
         classes = torch.tensor(classes, dtype=torch.long) if classes else torch.zeros(0, dtype=torch.long)
         kpts_t = np.array(kpts, dtype=np.float32) if kpts else np.zeros((0, 17, 3), dtype=np.float32)
         kpts = torch.from_numpy(kpts_t)
+        attrs_t = np.array(attrs, dtype=np.float32) if attrs else np.zeros((0, 4), dtype=np.float32)
+        attr_masks_t = (
+            np.array(attr_masks, dtype=np.float32)
+            if attr_masks else np.zeros((0, 4), dtype=np.float32)
+        )
 
         return {
             'image': img,
             'boxes': boxes,
             'classes': classes,
             'kpts': kpts,
+            'attrs': torch.from_numpy(attrs_t),
+            'attr_mask': torch.from_numpy(attr_masks_t),
             'scale': scale,
             'pad': (pad_l, pad_t),
             'img_path': img_path,
@@ -255,11 +265,13 @@ class COCOMultiTaskDataset(Dataset):
         orig_h, orig_w = img.shape[:2]
         img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
 
-        boxes, classes, kpts = [], [], []
+        boxes, classes, kpts, attrs, attr_masks = [], [], [], [], []
         if label_path and Path(label_path).exists():
-            boxes, classes, kpts = self._parse_yolo_label(label_path, img.shape[1], img.shape[0])
-        boxes, classes, kpts = self._filter_targets_by_class(boxes, classes, kpts)
-        return img, boxes, classes, kpts, img_path, (orig_h, orig_w)
+            boxes, classes, kpts, attrs, attr_masks = self._parse_yolo_label(
+                label_path, img.shape[1], img.shape[0])
+        boxes, classes, kpts, attrs, attr_masks = self._filter_targets_by_class(
+            boxes, classes, kpts, attrs, attr_masks)
+        return img, boxes, classes, kpts, attrs, attr_masks, img_path, (orig_h, orig_w)
 
     def _resize_keep_ratio_no_pad(self, img, boxes, kpts):
         """YOLO train-time resize: scale max side to imgsz without padding."""
@@ -287,9 +299,11 @@ class COCOMultiTaskDataset(Dataset):
         mosaic_boxes = []
         mosaic_classes = []
         mosaic_kpts = []
+        mosaic_attrs = []
+        mosaic_attr_masks = []
 
         for i, idx_i in enumerate(indices):
-            img, boxes_i, classes_i, kpts_i, _, _ = self._load_raw(idx_i)
+            img, boxes_i, classes_i, kpts_i, attrs_i, attr_masks_i, _, _ = self._load_raw(idx_i)
             img, boxes_i, kpts_i, _ = self._resize_keep_ratio_no_pad(img, boxes_i, kpts_i)
             h, w = img.shape[:2]
 
@@ -314,6 +328,9 @@ class COCOMultiTaskDataset(Dataset):
             for b, box in enumerate(boxes_i):
                 mosaic_boxes.append([box[0] + padw, box[1] + padh, box[2] + padw, box[3] + padh])
                 mosaic_classes.append(classes_i[b])
+                mosaic_attrs.append(attrs_i[b] if b < len(attrs_i) else np.zeros(4, dtype=np.float32))
+                mosaic_attr_masks.append(
+                    attr_masks_i[b] if b < len(attr_masks_i) else np.zeros(4, dtype=np.float32))
                 if kpts_i and b < len(kpts_i):
                     k = kpts_i[b].copy()
                     k[..., 0] += padw
@@ -322,14 +339,15 @@ class COCOMultiTaskDataset(Dataset):
                 else:
                     mosaic_kpts.append(np.zeros((17, 3), dtype=np.float32))
 
-        mosaic_img, mosaic_boxes, mosaic_classes, mosaic_kpts = self._augment(
+        mosaic_img, mosaic_boxes, mosaic_classes, mosaic_kpts, mosaic_attrs, mosaic_attr_masks = self._augment(
             mosaic_img, mosaic_boxes, mosaic_classes, mosaic_kpts,
+            mosaic_attrs, mosaic_attr_masks,
             output_size=(s, s),
             area_thr=0.10,
         )
 
-        mosaic_boxes, mosaic_classes, mosaic_kpts = self._sanitize_targets(
-            mosaic_boxes, mosaic_classes, mosaic_kpts)
+        mosaic_boxes, mosaic_classes, mosaic_kpts, mosaic_attrs, mosaic_attr_masks = self._sanitize_targets(
+            mosaic_boxes, mosaic_classes, mosaic_kpts, mosaic_attrs, mosaic_attr_masks)
 
         # Normalize to YOLO-style [0, 1] tensors.
         mosaic_img = mosaic_img.astype(np.float32) / 255.0
@@ -339,12 +357,18 @@ class COCOMultiTaskDataset(Dataset):
         classes_t = torch.tensor(mosaic_classes, dtype=torch.long) if mosaic_classes else torch.zeros(0, dtype=torch.long)
         kpts_t = (torch.from_numpy(np.asarray(mosaic_kpts, dtype=np.float32))
                   if mosaic_kpts else torch.zeros(0, 17, 3))
+        attrs_t = (torch.from_numpy(np.asarray(mosaic_attrs, dtype=np.float32))
+                   if mosaic_attrs else torch.zeros(0, 4))
+        attr_masks_t = (torch.from_numpy(np.asarray(mosaic_attr_masks, dtype=np.float32))
+                        if mosaic_attr_masks else torch.zeros(0, 4))
 
         return {
             'image': mosaic_img,
             'boxes': boxes_t,
             'classes': classes_t,
             'kpts': kpts_t,
+            'attrs': attrs_t,
+            'attr_mask': attr_masks_t,
             'scale': 1.0,
             'pad': (0, 0),
             'img_path': '',
@@ -368,7 +392,7 @@ class COCOMultiTaskDataset(Dataset):
             classes: [cls, ...]
             kpts: [[17, 3], ...] in pixel coordinates
         """
-        boxes, classes, kpts = [], [], []
+        boxes, classes, kpts, attrs, attr_masks = [], [], [], [], []
         with open(label_path, 'r') as f:
             for line in f:
                 parts = line.strip().split()
@@ -394,7 +418,7 @@ class COCOMultiTaskDataset(Dataset):
                 # Keypoints
                 kpt = np.zeros((17, 3), dtype=np.float32)
                 if has_kpts and mapped_cls == 0:
-                    kpt_data = parts[5:]
+                    kpt_data = parts[5:56]
                     for j in range(min(17, len(kpt_data) // 3)):
                         px = float(kpt_data[j * 3]) * img_w
                         py = float(kpt_data[j * 3 + 1]) * img_h
@@ -402,18 +426,28 @@ class COCOMultiTaskDataset(Dataset):
                         kpt[j] = [px, py, pv]
                 kpts.append(kpt)
 
-        return boxes, classes, kpts
+                attr = np.zeros(4, dtype=np.float32)
+                attr_mask = np.zeros(4, dtype=np.float32)
+                if mapped_cls == 0 and len(parts) >= 64:
+                    attr[:] = [float(x) for x in parts[56:60]]
+                    attr_mask[:] = [float(x) for x in parts[60:64]]
+                attrs.append(attr)
+                attr_masks.append(attr_mask)
 
-    def _filter_targets_by_class(self, boxes, classes, kpts):
+        return boxes, classes, kpts, attrs, attr_masks
+
+    def _filter_targets_by_class(self, boxes, classes, kpts, attrs=None, attr_masks=None):
         if self.keep_classes is None or not classes:
-            return boxes, classes, kpts
+            return boxes, classes, kpts, attrs or [], attr_masks or []
         keep = [i for i, cls in enumerate(classes) if int(cls) in self.keep_classes]
         if len(keep) == len(classes):
-            return boxes, classes, kpts
+            return boxes, classes, kpts, attrs or [], attr_masks or []
         return (
             [boxes[i] for i in keep],
             [classes[i] for i in keep],
             [kpts[i] for i in keep] if kpts else [],
+            [attrs[i] for i in keep] if attrs else [],
+            [attr_masks[i] for i in keep] if attr_masks else [],
         )
 
     def _map_class_id(self, cls, has_kpts=False):
@@ -437,10 +471,10 @@ class COCOMultiTaskDataset(Dataset):
             return COCO_CATEGORY_ID_TO_80.get(cls)
         return cls if 0 <= cls < len(COCO80_CLASSES) else None
 
-    def _sanitize_targets(self, boxes, classes, kpts):
+    def _sanitize_targets(self, boxes, classes, kpts, attrs=None, attr_masks=None):
         """Clip targets to the training image and drop invalid annotations."""
         if not boxes:
-            return [], [], []
+            return [], [], [], [], []
 
         boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         classes_np = np.asarray(classes, dtype=np.int64).reshape(-1)
@@ -448,11 +482,21 @@ class COCOMultiTaskDataset(Dataset):
             kpts_np = np.asarray(kpts, dtype=np.float32).reshape(-1, 17, 3)
         else:
             kpts_np = np.zeros((len(boxes_np), 17, 3), dtype=np.float32)
+        attrs_np = (
+            np.asarray(attrs, dtype=np.float32).reshape(-1, 4)
+            if attrs else np.zeros((len(boxes_np), 4), dtype=np.float32)
+        )
+        attr_masks_np = (
+            np.asarray(attr_masks, dtype=np.float32).reshape(-1, 4)
+            if attr_masks else np.zeros((len(boxes_np), 4), dtype=np.float32)
+        )
 
-        n = min(len(boxes_np), len(classes_np), len(kpts_np))
+        n = min(len(boxes_np), len(classes_np), len(kpts_np), len(attrs_np), len(attr_masks_np))
         boxes_np = boxes_np[:n]
         classes_np = classes_np[:n]
         kpts_np = kpts_np[:n]
+        attrs_np = attrs_np[:n]
+        attr_masks_np = attr_masks_np[:n]
 
         finite_boxes = np.isfinite(boxes_np).all(axis=1)
         boxes_np[:, [0, 2]] = np.clip(boxes_np[:, [0, 2]], 0, self.input_size - 1)
@@ -466,8 +510,10 @@ class COCOMultiTaskDataset(Dataset):
         boxes_np = boxes_np[valid_boxes]
         classes_np = classes_np[valid_boxes]
         kpts_np = kpts_np[valid_boxes]
+        attrs_np = attrs_np[valid_boxes]
+        attr_masks_np = attr_masks_np[valid_boxes]
         if len(boxes_np) == 0:
-            return [], [], []
+            return [], [], [], [], []
 
         xy = kpts_np[..., :2]
         vis = kpts_np[..., 2]
@@ -482,13 +528,23 @@ class COCOMultiTaskDataset(Dataset):
         kpts_np[..., 1] = np.clip(np.nan_to_num(xy[..., 1], nan=0.0), 0, self.input_size - 1)
         kpts_np[..., 2] = np.where(keep_vis, vis, 0.0)
         kpts_np[classes_np != 0] = 0.0
+        attrs_np[classes_np != 0] = 0.0
+        attr_masks_np[classes_np != 0] = 0.0
 
-        return boxes_np.tolist(), classes_np.tolist(), [k for k in kpts_np]
+        return (
+            boxes_np.tolist(),
+            classes_np.tolist(),
+            [k for k in kpts_np],
+            [a for a in attrs_np],
+            [m for m in attr_masks_np],
+        )
 
-    def _augment(self, img, boxes, classes, kpts, output_size=None, area_thr=0.10):
+    def _augment(self, img, boxes, classes, kpts, attrs=None, attr_masks=None,
+                 output_size=None, area_thr=0.10):
         """Apply YOLO-style geometry, HSV, channel, and flip augmentations."""
-        img, boxes, classes, kpts = self._random_affine(
+        img, boxes, classes, kpts, attrs, attr_masks = self._random_affine(
             img, boxes, classes, kpts,
+            attrs, attr_masks,
             degrees=self.degrees,
             translate=self.translate,
             scale=self.scale,
@@ -525,9 +581,10 @@ class COCOMultiTaskDataset(Dataset):
                     k[:, 0] = w - k[:, 0]
                     kpts[i] = k[KPT_FLIP_MAP]
 
-        return img, boxes, classes, kpts
+        return img, boxes, classes, kpts, attrs or [], attr_masks or []
 
-    def _random_affine(self, img, boxes, classes, kpts, degrees=0.0, translate=0.1,
+    def _random_affine(self, img, boxes, classes, kpts, attrs=None, attr_masks=None,
+                       degrees=0.0, translate=0.1,
                        scale=0.5, shear=0.0, perspective=0.0,
                        output_size=None, area_thr=0.10):
         """YOLO-style random affine transform with synchronized targets."""
@@ -538,7 +595,7 @@ class COCOMultiTaskDataset(Dataset):
                 img = cv2.warpAffine(
                     img, np.array([[1, 0, 0], [0, 1, 0]], dtype=np.float32),
                     dsize=(out_w, out_h), borderValue=(114, 114, 114))
-            return img, boxes, classes, kpts
+            return img, boxes, classes, kpts, attrs or [], attr_masks or []
 
         c = np.eye(3, dtype=np.float32)
         c[0, 2] = -w / 2
@@ -570,10 +627,18 @@ class COCOMultiTaskDataset(Dataset):
                 img, m[:2], dsize=(out_w, out_h), borderValue=(114, 114, 114))
 
         if not boxes:
-            return img, boxes, classes, kpts
+            return img, boxes, classes, kpts, attrs or [], attr_masks or []
 
         boxes_np = np.asarray(boxes, dtype=np.float32).reshape(-1, 4)
         classes_np = np.asarray(classes, dtype=np.int64).reshape(-1)
+        attrs_np = (
+            np.asarray(attrs, dtype=np.float32).reshape(-1, 4)
+            if attrs else np.zeros((len(boxes_np), 4), dtype=np.float32)
+        )
+        attr_masks_np = (
+            np.asarray(attr_masks, dtype=np.float32).reshape(-1, 4)
+            if attr_masks else np.zeros((len(boxes_np), 4), dtype=np.float32)
+        )
         n = len(boxes_np)
         corners = np.ones((n * 4, 3), dtype=np.float32)
         corners[:, :2] = boxes_np[:, [0, 1, 2, 3, 0, 3, 2, 1]].reshape(n * 4, 2)
@@ -612,8 +677,17 @@ class COCOMultiTaskDataset(Dataset):
         new_boxes = new_boxes[keep]
         classes_np = classes_np[:n][keep]
         new_kpts_np = new_kpts_np[:n][keep]
+        attrs_np = attrs_np[:n][keep]
+        attr_masks_np = attr_masks_np[:n][keep]
 
-        return img, new_boxes.tolist(), classes_np.tolist(), [k for k in new_kpts_np]
+        return (
+            img,
+            new_boxes.tolist(),
+            classes_np.tolist(),
+            [k for k in new_kpts_np],
+            [a for a in attrs_np],
+            [m for m in attr_masks_np],
+        )
 
     def _apply_composite_augmentations(self, sample):
         """Apply sample-mixing augmentations after resize to input_size."""
@@ -632,6 +706,8 @@ class COCOMultiTaskDataset(Dataset):
         sample['boxes'] = self._cat_targets(sample['boxes'], src['boxes'], 4, torch.float32)
         sample['classes'] = self._cat_targets(sample['classes'], src['classes'], 0, torch.long)
         sample['kpts'] = self._cat_targets(sample['kpts'], src['kpts'], (17, 3), torch.float32)
+        sample['attrs'] = self._cat_targets(sample['attrs'], src['attrs'], (4,), torch.float32)
+        sample['attr_mask'] = self._cat_targets(sample['attr_mask'], src['attr_mask'], (4,), torch.float32)
         return sample
 
     def _copy_paste(self, sample, src_idx):
@@ -668,7 +744,7 @@ class COCOMultiTaskDataset(Dataset):
 
         sample['image'][:, ty1:ty1 + ph, tx1:tx1 + pw] = src['image'][:, sy1:sy2, sx1:sx2]
         dx, dy = tx1 - sx1, ty1 - sy1
-        keep_boxes, keep_classes, keep_kpts = [], [], []
+        keep_boxes, keep_classes, keep_kpts, keep_attrs, keep_attr_masks = [], [], [], [], []
         for bi, src_box in enumerate(src['boxes']):
             inter = self._intersect_box(src_box, torch.tensor([sx1, sy1, sx2, sy2], dtype=torch.float32))
             if inter is None:
@@ -690,6 +766,8 @@ class COCOMultiTaskDataset(Dataset):
             )
             kp[outside, 2] = 0
             keep_kpts.append(kp)
+            keep_attrs.append(src['attrs'][bi].clone())
+            keep_attr_masks.append(src['attr_mask'][bi].clone())
         if keep_boxes:
             sample['boxes'] = self._cat_targets(
                 sample['boxes'], torch.stack(keep_boxes), 4, torch.float32)
@@ -697,6 +775,10 @@ class COCOMultiTaskDataset(Dataset):
                 sample['classes'], torch.stack(keep_classes), 0, torch.long)
             sample['kpts'] = self._cat_targets(
                 sample['kpts'], torch.stack(keep_kpts), (17, 3), torch.float32)
+            sample['attrs'] = self._cat_targets(
+                sample['attrs'], torch.stack(keep_attrs), (4,), torch.float32)
+            sample['attr_mask'] = self._cat_targets(
+                sample['attr_mask'], torch.stack(keep_attr_masks), (4,), torch.float32)
         return sample
 
     @staticmethod
@@ -805,6 +887,8 @@ def collate_fn(batch):
         'boxes': [x['boxes'] for x in batch],
         'classes': [x['classes'] for x in batch],
         'kpts': [x['kpts'] for x in batch],
+        'attrs': [x.get('attrs', torch.zeros(0, 4)) for x in batch],
+        'attr_mask': [x.get('attr_mask', torch.zeros(0, 4)) for x in batch],
         'scale': [x.get('scale', 1.0) for x in batch],
         'pad': [x.get('pad', (0, 0)) for x in batch],
         'img_path': [x.get('img_path', '') for x in batch],

@@ -942,6 +942,8 @@ class Trainer:
                     'boxes': batch['boxes'][i],
                     'classes': batch['classes'][i],
                     'kpts': batch['kpts'][i],
+                    'attrs': batch.get('attrs', [None] * len(images))[i],
+                    'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
                 })
 
             if self.use_amp:
@@ -1051,6 +1053,8 @@ class Trainer:
                         'boxes': batch['boxes'][i],
                         'classes': batch['classes'][i],
                         'kpts': batch['kpts'][i],
+                        'attrs': batch.get('attrs', [None] * len(images))[i],
+                        'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
                     })
 
                 if self.use_amp:

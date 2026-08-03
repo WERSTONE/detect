@@ -118,6 +118,43 @@ class YOLOLikeDetectHead(nn.Module):
         return outs
 
 
+class YOLOLikeAttrHead(nn.Module):
+    """Per-person attribute head aligned to the pose anchors.
+
+    The head consumes pose-branch FPN features and predicts independent
+    sigmoid logits for each attribute at every anchor. Attribute supervision
+    should be applied only on matched person anchors with an explicit mask for
+    unknown attributes.
+    """
+
+    def __init__(self, channels, num_attrs=4, strides=(8, 16, 32)):
+        super().__init__()
+        if isinstance(channels, int):
+            channels = [channels] * len(strides)
+        self.channels = list(channels)
+        self.num_attrs = int(num_attrs)
+        self.strides = list(strides)
+
+        mid_ch = max(self.channels[0] // 2, 64)
+        self.attr_branches = nn.ModuleList(
+            nn.Sequential(
+                Conv(ch, mid_ch, 3),
+                Conv(mid_ch, mid_ch, 3),
+                nn.Conv2d(mid_ch, self.num_attrs, 1),
+            )
+            for ch in self.channels
+        )
+        self.bias_init()
+
+    def bias_init(self):
+        for branch in self.attr_branches:
+            nn.init.normal_(branch[-1].weight, 0.0, 0.01)
+            nn.init.constant_(branch[-1].bias, CLS_BIAS_INIT)
+
+    def forward(self, features):
+        return {'attr': [branch(feat) for branch, feat in zip(self.attr_branches, features)]}
+
+
 class PoseHead(nn.Module):
     """Pose head with keypoint prediction for person detections.
 

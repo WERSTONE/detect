@@ -4,10 +4,11 @@ import math
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from test_model.model.backbone import CSPDarkNet
 from test_model.model.common import Conv
-from test_model.model.head import YOLOLikeDetectHead
+from test_model.model.head import YOLOLikeAttrHead, YOLOLikeDetectHead
 from test_model.model.loss import YOLODetectionLoss, YOLOPoseLoss
 from test_model.model.neck import BiFPN
 
@@ -556,5 +557,313 @@ class ModelE_BiFPN(nn.Module):
                 'scores': scores[keep],
                 'classes': classes[keep],
                 'kpts': kpts[keep],
+            })
+        return results
+
+
+class DomainAttrBiFPN(ModelE_BiFPN):
+    """Business-domain fine-tuning model.
+
+    The original dual-head modules are kept so old bifpn_dual checkpoints load
+    cleanly. Inference/training for the new domain uses:
+        domain_det_head: fire/water detection
+        attr_head: person attributes attached to pose-branch features
+        pose_head: existing person box + keypoints head
+    """
+
+    def __init__(self, domain_num_classes=2, num_attrs=4,
+                 domain_class_map=None, attr_names=None, **kwargs):
+        super().__init__(**kwargs)
+        self.domain_num_classes = int(domain_num_classes)
+        self.num_attrs = int(num_attrs)
+        self.attr_names = list(attr_names or [
+            'smoking', 'falling', 'waving', 'helmet_on'])
+        if len(self.attr_names) != self.num_attrs:
+            raise ValueError(
+                f"num_attrs={self.num_attrs} but attr_names has "
+                f"{len(self.attr_names)} entries")
+
+        self.domain_class_map = {
+            int(k): int(v) for k, v in (domain_class_map or {}).items()
+        }
+        # The COCO non-person head from ModelE_BiFPN is not used for the target
+        # domain. Drop its parameters so old det_head weights are skipped when
+        # initializing from a dual-task checkpoint.
+        self.det_head = nn.Identity()
+        ch = self.neck.out_channels
+        self.domain_det_head = YOLOLikeDetectHead(
+            ch,
+            num_classes=self.domain_num_classes,
+            reg_max=self.reg_max,
+            strides=self.strides,
+            img_size=self.input_size,
+        )
+        self.attr_head = YOLOLikeAttrHead(
+            ch,
+            num_attrs=self.num_attrs,
+            strides=self.strides,
+        )
+        self.domain_det_loss = YOLODetectionLoss(
+            num_classes=self.domain_num_classes,
+            reg_max=self.reg_max,
+            strides=self.strides,
+            assigner_topk=self.det_loss.assigner.topk,
+            assigner_alpha=self.det_loss.assigner.alpha,
+            assigner_beta=self.det_loss.assigner.beta,
+            assigner_eps=self.det_loss.assigner.eps,
+        )
+        self.det_loss = self.domain_det_loss
+        self.attr_loss_weight = 1.0
+        self.train_domain_det = True
+        self.train_attr = True
+        self.train_pose = False
+
+    def forward(self, x):
+        return self._forward_head(x)
+
+    def _forward_head(self, x):
+        neck_feats = self._forward_features(x)
+        det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
+        pose_feats = [adapter(feat) for adapter, feat in zip(self.pose_adapter, neck_feats)]
+        return {
+            'domain_det': self.domain_det_head(det_feats),
+            'pose': self.pose_head(pose_feats),
+            'attr': self.attr_head(pose_feats),
+        }
+
+    def _filter_domain_gt(self, gt_dict_list, device):
+        mapped = []
+        for gt in gt_dict_list:
+            boxes = gt['boxes'].to(device, non_blocking=True).float()
+            classes = gt['classes'].to(device, non_blocking=True).long()
+            keep_boxes = []
+            keep_classes = []
+            for idx, cls in enumerate(classes.tolist()):
+                if self.domain_class_map and int(cls) not in self.domain_class_map:
+                    continue
+                dst = self.domain_class_map.get(int(cls), int(cls))
+                if 0 <= dst < self.domain_num_classes:
+                    keep_boxes.append(boxes[idx])
+                    keep_classes.append(dst)
+            mapped.append({
+                'boxes': (
+                    torch.stack(keep_boxes)
+                    if keep_boxes else torch.zeros((0, 4), device=device)
+                ),
+                'classes': (
+                    torch.tensor(keep_classes, device=device, dtype=torch.long)
+                    if keep_classes else torch.zeros((0,), device=device, dtype=torch.long)
+                ),
+                'kpts': torch.zeros((len(keep_boxes), 17, 3), device=device),
+            })
+        return mapped
+
+    def _attribute_loss(self, attr_out, gt_dict_list, device, batch_size):
+        attr_feats = attr_out['attr']
+        loss_sum = torch.zeros((), device=device)
+        count = torch.zeros((), device=device)
+
+        for b, gt in enumerate(gt_dict_list):
+            attrs = gt.get('attrs', None)
+            attr_mask = gt.get('attr_mask', None)
+            if attrs is None or attr_mask is None:
+                continue
+
+            boxes = gt['boxes'].to(device, non_blocking=True).float()
+            classes = gt['classes'].to(device, non_blocking=True).long()
+            attrs = attrs.to(device, non_blocking=True).float()
+            attr_mask = attr_mask.to(device, non_blocking=True).float()
+            n = min(len(boxes), len(attrs), len(attr_mask))
+            if n == 0:
+                continue
+
+            boxes = boxes[:n]
+            classes = classes[:n]
+            attrs = attrs[:n, :self.num_attrs]
+            attr_mask = attr_mask[:n, :self.num_attrs]
+            person = classes == 0
+            if not person.any():
+                continue
+
+            boxes = boxes[person]
+            attrs = attrs[person]
+            attr_mask = attr_mask[person]
+            centers = (boxes[:, :2] + boxes[:, 2:]) * 0.5
+            max_side = (boxes[:, 2:] - boxes[:, :2]).clamp(min=0).amax(dim=1)
+
+            for i in range(len(boxes)):
+                if attr_mask[i].sum() <= 0:
+                    continue
+                level = 0
+                if max_side[i] >= self.strides[1] * 8:
+                    level = 2
+                elif max_side[i] >= self.strides[0] * 8:
+                    level = 1
+                feat = attr_feats[level]
+                _, _, h, w = feat.shape
+                gx = int(torch.clamp((centers[i, 0] / self.strides[level]).long(), 0, w - 1).item())
+                gy = int(torch.clamp((centers[i, 1] / self.strides[level]).long(), 0, h - 1).item())
+                logits = feat[b, :, gy, gx]
+                raw = F.binary_cross_entropy_with_logits(
+                    logits.float(),
+                    attrs[i].float(),
+                    reduction='none',
+                )
+                mask = attr_mask[i].float()
+                loss_sum = loss_sum + (raw * mask).sum()
+                count = count + mask.sum()
+
+        if count <= 0:
+            zero = torch.zeros((), device=device)
+            return zero, zero, zero
+        mean_loss = loss_sum / count.clamp(min=1.0)
+        weighted = mean_loss * self.attr_loss_weight
+        return weighted * batch_size, weighted.detach(), count.detach()
+
+    def _sample_attrs_for_boxes(self, attr_out, boxes):
+        attr_feats = attr_out['attr']
+        if boxes.numel() == 0:
+            return torch.zeros((0, self.num_attrs), device=boxes.device)
+
+        centers = (boxes[:, :2] + boxes[:, 2:]) * 0.5
+        max_side = (boxes[:, 2:] - boxes[:, :2]).clamp(min=0).amax(dim=1)
+        attrs = []
+        for i in range(len(boxes)):
+            level = 0
+            if max_side[i] >= self.strides[1] * 8:
+                level = 2
+            elif max_side[i] >= self.strides[0] * 8:
+                level = 1
+            feat = attr_feats[level]
+            _, _, h, w = feat.shape
+            gx = int(torch.clamp((centers[i, 0] / self.strides[level]).long(), 0, w - 1).item())
+            gy = int(torch.clamp((centers[i, 1] / self.strides[level]).long(), 0, h - 1).item())
+            attrs.append(feat[0, :, gy, gx].sigmoid())
+        return torch.stack(attrs) if attrs else torch.zeros((0, self.num_attrs), device=boxes.device)
+
+    def compute_loss(self, images, gt_dict_list):
+        device = next(self.parameters()).device
+        images = images.to(device, non_blocking=True)
+        outs = self._forward_head(images)
+
+        if self.train_domain_det:
+            det_losses = self.domain_det_loss(
+                outs['domain_det'],
+                self._filter_domain_gt(gt_dict_list, device),
+            )
+        else:
+            det_losses = self._zero_loss(device)
+
+        if self.train_pose:
+            pose_losses = self.pose_loss(outs['pose'], gt_dict_list)
+        else:
+            pose_losses = self._zero_loss(device)
+            pose_losses['pose_total'] = torch.zeros((), device=device)
+            pose_losses['pose_kpt'] = torch.zeros((), device=device)
+            pose_losses['pose_kobj'] = torch.zeros((), device=device)
+
+        if self.train_attr:
+            attr_total, attr_bce, attr_count = self._attribute_loss(
+                outs['attr'], gt_dict_list, device, images.shape[0])
+        else:
+            attr_total = torch.zeros((), device=device)
+            attr_bce = torch.zeros((), device=device)
+            attr_count = torch.zeros((), device=device)
+
+        pose_raw = (
+            pose_losses.get('det_total', torch.zeros((), device=device)) +
+            pose_losses.get('pose_total', torch.zeros((), device=device))
+        )
+        total = (
+            self.det_task_weight * det_losses['total'] +
+            self.pose_task_weight * pose_losses['total'] +
+            attr_total
+        )
+        raw_total = det_losses['total'] + pose_losses['total'] + attr_total
+
+        return {
+            'total': total,
+            'loss_total': raw_total.detach(),
+            'det_total': det_losses['det_total'].detach(),
+            'det_ciou': det_losses['det_ciou'].detach(),
+            'det_cls': det_losses['det_cls'].detach(),
+            'det_dfl': det_losses['det_dfl'].detach(),
+            'det_num_pos': det_losses.get('num_pos', torch.zeros((), device=device)).detach().float(),
+            'pose_total': pose_raw.detach(),
+            'pose_det_total': pose_losses.get('det_total', torch.zeros((), device=device)).detach(),
+            'pose_det_ciou': pose_losses.get('det_ciou', torch.zeros((), device=device)).detach(),
+            'pose_det_cls': pose_losses.get('det_cls', torch.zeros((), device=device)).detach(),
+            'pose_det_dfl': pose_losses.get('det_dfl', torch.zeros((), device=device)).detach(),
+            'pose_kpt_total': pose_losses.get('pose_total', torch.zeros((), device=device)).detach(),
+            'pose_kpt': pose_losses.get('pose_kpt', torch.zeros((), device=device)).detach(),
+            'pose_kobj': pose_losses.get('pose_kobj', torch.zeros((), device=device)).detach(),
+            'pose_num_pos': pose_losses.get('num_pos', torch.zeros((), device=device)).detach().float(),
+            'attr_total': attr_bce,
+            'attr_bce': attr_bce,
+            'attr_count': attr_count.float(),
+            'num_pos': (
+                det_losses.get('num_pos', torch.zeros((), device=device)).detach().float() +
+                pose_losses.get('num_pos', torch.zeros((), device=device)).detach().float()
+            ),
+            'target_scores_sum': (
+                det_losses.get('target_scores_sum', torch.zeros((), device=device)).detach() +
+                pose_losses.get('target_scores_sum', torch.zeros((), device=device)).detach()
+            ),
+            'task_w_det': torch.tensor(self.det_task_weight, device=device),
+            'task_w_pose': torch.tensor(self.pose_task_weight, device=device),
+        }
+
+    @torch.no_grad()
+    def predict_val(self, images, score_thresh=0.01, iou_thresh=0.6, max_det=300):
+        self.eval()
+        device = next(self.parameters()).device
+        images = images.to(device, non_blocking=True)
+        outs = self._forward_head(images)
+        domain_preds = self._decode_one_head(
+            outs['domain_det']['cls'],
+            outs['domain_det']['reg'],
+            kpt_list=None,
+            cls_offset=1,
+            score_thresh=score_thresh,
+        )
+        pose_preds = self._decode_one_head(
+            outs['pose']['cls'],
+            outs['pose']['reg'],
+            kpt_list=outs['pose']['kpt'],
+            cls_offset=0,
+            score_thresh=score_thresh,
+        )
+
+        results = []
+        for b, (domain, pose) in enumerate(zip(domain_preds, pose_preds)):
+            pose_attr_out = {'attr': [feat[b:b + 1] for feat in outs['attr']['attr']]}
+            pose_attrs = self._sample_attrs_for_boxes(pose_attr_out, pose['boxes'])
+            domain_attrs = torch.zeros(
+                (domain['boxes'].shape[0], self.num_attrs),
+                device=device,
+                dtype=pose_attrs.dtype,
+            )
+
+            boxes = torch.cat([pose['boxes'], domain['boxes']], dim=0)
+            scores = torch.cat([pose['scores'], domain['scores']], dim=0)
+            classes = torch.cat([pose['classes'], domain['classes']], dim=0)
+            kpts = torch.cat([pose['kpts'], domain['kpts']], dim=0)
+            attrs = torch.cat([pose_attrs, domain_attrs], dim=0)
+            if boxes.numel() == 0:
+                results.append({
+                    'boxes': boxes,
+                    'scores': scores,
+                    'classes': classes,
+                    'kpts': kpts,
+                    'attrs': attrs,
+                })
+                continue
+            keep = _batched_nms(boxes, scores, classes, iou_thresh=iou_thresh, max_det=max_det)
+            results.append({
+                'boxes': boxes[keep],
+                'scores': scores[keep],
+                'classes': classes[keep],
+                'kpts': kpts[keep],
+                'attrs': attrs[keep],
             })
         return results

@@ -1,0 +1,208 @@
+# Fine-tune the trained dual-head checkpoint for the target domain.
+#
+# Model outputs:
+#   pose_head: existing person detection + 17 keypoints, loaded from dual best
+#   domain_det_head: fire / water detection
+#   attr_head: per-person smoking / falling / waving / helmet_on attributes
+#
+# Typical use:
+#   python3 -u -m test_model.main \
+#     --config test_model/config/bifpn_domain_attr_finetune.yaml \
+#     --init-weights checkpoints/dual_dwa/bifpn_dual/bifpn_dual_best.pt
+
+model: bifpn_dual_domain_attr
+num_classes: 80
+num_det_classes: 79
+num_kpts: 17
+reg_max: 16
+
+domain_det:
+  enabled: true
+  num_classes: 2
+  names:
+    - fire
+    - water
+  # Raw labels are mapped into the new domain detection ids here.
+  # Current fire_smoke has 0=person, 1=fire, so person is ignored and 1->fire.
+  # If a future water dataset uses raw class 2, it maps to water. If it uses
+  # raw class 0, preprocess it first to avoid colliding with person.
+  class_map:
+    1: 0
+    2: 1
+
+attributes:
+  enabled: true
+  num_attrs: 4
+  names:
+    - smoking
+    - falling
+    - waving
+    - helmet_on
+  attach_to: pose_features
+  loss: masked_bce
+
+neck:
+  out_channels: 256
+  use_p2_context: false
+  downsample: conv
+
+assigner:
+  topk: 10
+  alpha: 0.5
+  beta: 6.0
+  eps: 1.0e-9
+
+pretrained:
+  backbone:
+    enabled: false
+    weights: auto
+    auto_download: false
+    prefer_pose: false
+    cache_dir: checkpoints/yolo
+    strict: false
+  modules:
+    enabled: false
+    weights:
+    include: []
+    exclude: []
+    strict: false
+
+data:
+  # Use a prepared unified target-domain dataset here. Raw datasets should be
+  # normalized first so labels contain person=0, fire=1, water=2, and person
+  # attributes are emitted with attr masks.
+  root: /root/detect/data/train_data
+  train_img: images/train
+  train_label: labels/train
+  val_img: images/val
+  val_label: labels/val
+  input_size: 640
+  class_id_format: yolo80
+
+training:
+  epochs: 50
+  batch_size: 16
+  workers: 8
+  init_weights: checkpoints/dual_dwa/bifpn_dual/bifpn_dual_best.pt
+
+  optimizer: sgd
+  lr0: 0.0005
+  lrf: 0.1
+  momentum: 0.937
+  weight_decay: 0.0005
+  nesterov: true
+  param_groups: yolo
+  nbs: 64
+  accumulate: auto
+  scale_weight_decay: true
+
+  warmup_epochs: 0
+  warmup_momentum: 0.8
+  warmup_bias_lr: 0.1
+  yolo_warmup: false
+  cos_lr: true
+
+  grad_clip: 10.0
+  ema_decay: 0.9999
+  amp: true
+
+  val_interval: 1
+  save_interval: 10
+  save_best_by: loss
+  save_dir: checkpoints/domain_attr_finetune
+
+  tensorboard: true
+  log_interval: 50
+
+  close_mosaic_epochs: 0
+  no_mosaic: true
+
+  resume:
+    keep_current_lr: false
+    lr_scale: 1.0
+    init_best_from_loaded: true
+    init_score_best_from_loaded: false
+    save_score_best_aliases: true
+    reset_ema_from_model: false
+    keep_mosaic_closed: false
+
+  early_stop:
+    enabled: false
+    patience: 50
+    min_delta: 0.0
+    start_epoch: 0
+
+  # Stage 1 preserves the learned person pose head and only learns the new
+  # business-domain detector plus per-person attributes.
+  tasks:
+    train_domain_det: true
+    train_attr: true
+    train_pose: false
+
+  task_weights:
+    det: 1.0
+    pose: 0.0
+
+  dynamic_weights:
+    enabled: false
+    method: fixed
+
+  gradient_projection:
+    enabled: false
+    method: pcgrad
+    scope: shared
+
+  distillation:
+    enabled: false
+
+  freeze:
+    enabled: true
+    trainable_modules:
+      - domain_det_head
+      - attr_head
+    freeze_bn: true
+
+loss:
+  w_box: 7.5
+  w_cls: 0.5
+  w_dfl: 1.5
+  w_pose: 12.0
+  w_kobj: 1.0
+  w_attr: 1.0
+
+augmentation:
+  hsv_h: 0.015
+  hsv_s: 0.7
+  hsv_v: 0.4
+  translate: 0.1
+  scale: 0.3
+  degrees: 0.0
+  shear: 0.0
+  perspective: 0.0
+  flip_lr: 0.5
+  flip_ud: 0.0
+  bgr: 0.0
+  mosaic_prob: 0.0
+  mixup_prob: 0.0
+  cutmix_prob: 0.0
+  copy_paste_prob: 0.0
+  copy_paste_ioa: 0.3
+  copy_paste_max_objects: 8
+
+validation:
+  backend: loss
+  task: domain
+  score_eval:
+    enabled: false
+  final_eval:
+    enabled: false
+
+eval:
+  score_thresh: 0.01
+  iou_thresh: 0.6
+  max_det: 300
+  batch_size: 16
+
+device: cuda
+gpu_id: 0
+debug: false

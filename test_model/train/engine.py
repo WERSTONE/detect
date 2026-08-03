@@ -76,7 +76,8 @@ def parse_args():
                    help='Path to YAML config file')
     p.add_argument('--model', type=str, default=None,
                    choices=['bifpn', 'bifpn_dual', 'bifpn_detect', 'bifpn_det',
-                            'bifpn_pose', 'bifpn_pose_only'],
+                            'bifpn_pose', 'bifpn_pose_only',
+                            'bifpn_dual_domain_attr', 'bifpn_domain_attr'],
                    help='Model variant (overrides config)')
     p.add_argument('--data', type=str, default=None,
                    help='Dataset root directory (overrides config)')
@@ -643,8 +644,29 @@ def _load_model_weights_for_staged_resume(model, path, device):
     state_dict = ckpt.get('model_state_dict', ckpt if isinstance(ckpt, dict) else None)
     if not isinstance(state_dict, dict):
         raise KeyError(f"Could not find model_state_dict in resume checkpoint: {path}")
-    model.load_state_dict(state_dict, strict=True)
-    print(f"[Weights] Loaded model weights from {path} (epoch {ckpt.get('epoch', 'unknown')})")
+    target_state = model.state_dict()
+    matched = {}
+    mismatched = []
+    skipped = 0
+    for key, value in state_dict.items():
+        if key not in target_state:
+            skipped += 1
+            continue
+        if tuple(target_state[key].shape) != tuple(value.shape):
+            mismatched.append((key, tuple(value.shape), tuple(target_state[key].shape)))
+            continue
+        matched[key] = value
+    model.load_state_dict(matched, strict=False)
+    missing = [key for key in target_state if key not in matched]
+    print(
+        f"[Weights] Loaded {len(matched)}/{len(target_state)} compatible tensors "
+        f"from {path} (epoch {ckpt.get('epoch', 'unknown')}); "
+        f"missing={len(missing)}, skipped={skipped}, mismatched={len(mismatched)}")
+    if missing:
+        print("  Missing/new sample keys: " + ", ".join(missing[:8]))
+    if mismatched:
+        key, src_shape, dst_shape = mismatched[0]
+        print(f"  First shape mismatch: {key} {src_shape} != {dst_shape}")
     return ckpt
 
 
@@ -726,6 +748,18 @@ def main():
             'assigner_beta': assigner_cfg.get('beta', 6.0),
             'assigner_eps': assigner_cfg.get('eps', 1.0e-9),
         })
+        if model_name in ('bifpn_dual_domain_attr', 'bifpn_domain_attr'):
+            domain_cfg = cfg.get('domain_det', {}) or {}
+            attr_cfg = cfg.get('attributes', {}) or {}
+            model_kwargs.update({
+                'domain_num_classes': domain_cfg.get('num_classes', 2),
+                'domain_class_map': domain_cfg.get('class_map', {}),
+                'num_attrs': attr_cfg.get(
+                    'num_attrs',
+                    len(attr_cfg.get('names', [])) if attr_cfg.get('names') else 4,
+                ),
+                'attr_names': attr_cfg.get('names', None),
+            })
 
     model = create_model(model_name, **model_kwargs)
     print(f"Parameters: {model.num_params / 1e6:.2f}M")
@@ -744,6 +778,8 @@ def main():
         model.det_loss.w_box = l_cfg.get('w_box', 7.5)
         model.det_loss.w_cls = l_cfg.get('w_cls', 0.5)
         model.det_loss.w_dfl = l_cfg.get('w_dfl', 1.5)
+    if hasattr(model, 'attr_loss_weight'):
+        model.attr_loss_weight = float(l_cfg.get('w_attr', 1.0))
     if hasattr(model, 'pose_loss'):
         if model_name in ('bifpn', 'bifpn_dual',
                           'bifpn_pose', 'bifpn_pose_only'):
@@ -764,6 +800,26 @@ def main():
         model.loss_fn.w_dfl = l_cfg.get('w_dfl', 1.5)
         model.loss_fn.w_pose = l_cfg.get('w_pose', 12.0)
         model.loss_fn.w_kobj = l_cfg.get('w_kobj', 1.0)
+
+    task_cfg = t_cfg.get('tasks', {}) or {}
+    if task_cfg:
+        if 'train_det' in task_cfg and hasattr(model, 'train_det'):
+            model.train_det = bool(task_cfg.get('train_det'))
+        if 'train_domain_det' in task_cfg and hasattr(model, 'train_domain_det'):
+            model.train_domain_det = bool(task_cfg.get('train_domain_det'))
+            if hasattr(model, 'train_det'):
+                model.train_det = model.train_domain_det
+        if 'train_attr' in task_cfg and hasattr(model, 'train_attr'):
+            model.train_attr = bool(task_cfg.get('train_attr'))
+        if 'train_pose' in task_cfg and hasattr(model, 'train_pose'):
+            model.train_pose = bool(task_cfg.get('train_pose'))
+    if hasattr(model, 'train_domain_det') or hasattr(model, 'train_attr'):
+        print(
+            "Task switches: "
+            f"domain_det={getattr(model, 'train_domain_det', None)} "
+            f"attr={getattr(model, 'train_attr', None)} "
+            f"pose={getattr(model, 'train_pose', None)}"
+        )
 
     # Create val dataloader (shared)
     data_root = Path(opts['data_root'])
@@ -1238,6 +1294,8 @@ def main():
             'boxes': batch['boxes'][i],
             'classes': batch['classes'][i],
             'kpts': batch['kpts'][i],
+            'attrs': batch.get('attrs', [None] * len(images))[i],
+            'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
         } for i in range(len(images))]
         with torch.no_grad():
             if (not opts['no_amp']) and _is_cuda_device(device):
