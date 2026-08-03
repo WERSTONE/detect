@@ -24,6 +24,8 @@ import numpy as np
 ATTR_NAMES = ["smoking", "falling", "waving", "helmet_on"]
 IMG_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
 DATASET_NAMES = ("fall", "hat", "water", "fire", "smoking", "coco_pose")
+FALLING_ACTION_CLASSES = {0, 2}  # falling, sleeping
+WAVING_ACTION_CLASSES = {5}      # waving hands
 
 
 @dataclass
@@ -358,10 +360,10 @@ def assign_fall_attrs(persons, action_boxes, attrs, masks):
     matches = greedy_match(action_boxes, persons, min_score=0.2, metric="ioa")
     for ai, pi in matches.items():
         cls = action_boxes[ai].cls
-        if cls == 0:  # falling
+        if cls in FALLING_ACTION_CLASSES:
             attrs[pi][1] = 1.0
             attrs[pi][2] = 0.0
-        elif cls == 5:  # waving hands
+        elif cls in WAVING_ACTION_CLASSES:
             attrs[pi][1] = 0.0
             attrs[pi][2] = 1.0
 
