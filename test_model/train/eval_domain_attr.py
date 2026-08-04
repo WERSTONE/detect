@@ -185,9 +185,10 @@ def eval_ap(preds_by_class, gts_by_image_class, class_ids, iou_thresholds):
             "AP50": ap50,
             "AP50_95": float(np.mean(ap_values)) if ap_values else None,
         }
-    valid = [v["AP50_95"] for v in out.values() if v["AP50_95"] is not None]
+    class_metrics = [v for v in out.values() if isinstance(v, dict)]
+    valid = [v["AP50_95"] for v in class_metrics if v["AP50_95"] is not None]
     out["mAP50_95"] = float(np.mean(valid)) if valid else None
-    valid50 = [v["AP50"] for v in out.values() if v["AP50"] is not None]
+    valid50 = [v["AP50"] for v in class_metrics if v["AP50"] is not None]
     out["mAP50"] = float(np.mean(valid50)) if valid50 else None
     return out
 
