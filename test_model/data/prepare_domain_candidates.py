@@ -26,6 +26,16 @@ def parse_args():
     p.add_argument("--water-sample", type=int, default=None)
     p.add_argument("--fire-sample", type=int, default=None)
     p.add_argument("--smoking-sample", type=int, default=None)
+    p.add_argument(
+        "--extra-smoke-root",
+        default=None,
+        help=(
+            "Optional open-source smoking dataset root. Expected Roboflow/YOLO "
+            "layout with train/valid/test images+labels. Images with exactly "
+            "one source label are sampled and merged into the smoking candidates."
+        ),
+    )
+    p.add_argument("--extra-smoking-sample", type=int, default=3000)
     p.add_argument("--coco-pose-sample", type=int, default=None)
     p.add_argument("--debug-sample-per-dataset", type=int, default=80)
     p.add_argument("--seed", type=int, default=2026)
@@ -91,6 +101,10 @@ def has_class(class_id):
     return _fn
 
 
+def has_one_label(_img, label, _shape):
+    return len(read_yolo_lines(label)) == 1
+
+
 def has_pose_person(_img, label, _shape):
     for cls, parts in read_yolo_lines(label):
         if cls == 0 and len(parts) >= 56:
@@ -122,14 +136,14 @@ def clean_label_lines(dataset, label_path):
     return [" ".join(parts) for parts in keep]
 
 
-def sample_valid(name, pairs, sample_n, rng, valid_fn):
+def sample_valid(name, pairs, sample_n, rng, valid_fn, source_name=None):
     valid = []
     for img, label in pairs:
         shape = image_shape(img)
         if shape is None:
             continue
         if valid_fn(img, label, shape):
-            valid.append((img, label, shape))
+            valid.append((img, label, shape, source_name or name))
     rng.shuffle(valid)
     if sample_n and len(valid) > sample_n:
         valid = valid[:sample_n]
@@ -144,7 +158,12 @@ def copy_dataset(output, dataset, items, debug_items):
         label_out = output / subset_name / dataset / "labels"
         img_out.mkdir(parents=True, exist_ok=True)
         label_out.mkdir(parents=True, exist_ok=True)
-        for idx, (img, label, shape) in enumerate(subset_items):
+        for idx, item in enumerate(subset_items):
+            if len(item) == 4:
+                img, label, shape, source_name = item
+            else:
+                img, label, shape = item
+                source_name = dataset
             suffix = img.suffix.lower()
             stem = f"{dataset}_{idx:05d}_{img.stem}"
             out_img = img_out / f"{stem}{suffix}"
@@ -155,6 +174,7 @@ def copy_dataset(output, dataset, items, debug_items):
             records.append({
                 "subset": subset_name,
                 "dataset": dataset,
+                "source_dataset": source_name,
                 "source_image": str(img),
                 "source_label": str(label),
                 "image": str(out_img),
@@ -255,6 +275,23 @@ def main():
         },
     }
 
+    extra_smoking_items = []
+    if args.extra_smoke_root:
+        extra_root = Path(args.extra_smoke_root)
+        extra_pairs = collect_split_pairs(extra_root)
+        extra_smoking_items = sample_valid(
+            "smoking_extra",
+            extra_pairs,
+            args.extra_smoking_sample,
+            rng,
+            has_one_label,
+            source_name="smoking_extra",
+        )
+        print(
+            f"Extra smoking: source_pairs={len(extra_pairs)} "
+            f"selected={len(extra_smoking_items)}"
+        )
+
     all_records = []
     stats = {}
     sample_overrides = {
@@ -272,6 +309,10 @@ def main():
             else sample_overrides[dataset]
         )
         items = sample_valid(dataset, cfg["pairs"], sample_n, rng, cfg["valid"])
+        if dataset == "smoking" and extra_smoking_items:
+            items = items + extra_smoking_items
+            rng.shuffle(items)
+            print(f"Smoking merged: total={len(items)} including extra={len(extra_smoking_items)}")
         debug_items = items[:min(args.debug_sample_per_dataset, len(items))]
         print(f"Copying {dataset}: full={len(items)} debug={len(debug_items)}")
         records = copy_dataset(output, dataset, items, debug_items)
@@ -281,6 +322,9 @@ def main():
             "full": len(items),
             "debug": len(debug_items),
         }
+        if dataset == "smoking" and extra_smoking_items:
+            stats[dataset]["extra_full"] = len(extra_smoking_items)
+            stats[dataset]["extra_root"] = str(Path(args.extra_smoke_root))
 
     (output / "meta" / "candidate_index.json").write_text(
         json.dumps(all_records, ensure_ascii=False, indent=2), encoding="utf-8")

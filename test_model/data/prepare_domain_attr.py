@@ -63,6 +63,28 @@ def parse_args():
     p.add_argument("--pose-imgsz", type=int, default=640)
     p.add_argument("--pose-half", action="store_true")
     p.add_argument("--pose-max-det", type=int, default=100)
+    p.add_argument(
+        "--smoking-single-person-only",
+        action="store_true",
+        help="For smoking candidates, keep only images with exactly one qualified pose person.",
+    )
+    p.add_argument(
+        "--smoking-min-person-score",
+        type=float,
+        default=0.70,
+        help="Minimum YOLO-pose person confidence used by --smoking-single-person-only.",
+    )
+    p.add_argument(
+        "--smoking-min-visible-kpts",
+        type=int,
+        default=6,
+        help="Minimum visible keypoints used by --smoking-single-person-only.",
+    )
+    p.add_argument(
+        "--smoking-require-smoke-in-person",
+        action="store_true",
+        help="Require the single source smoke box center to be inside the retained person box.",
+    )
     p.add_argument("--force", action="store_true")
     p.add_argument("--preview", type=int, default=36)
     p.add_argument("--weak-neg-fall-wave", action="store_true", default=True)
@@ -410,6 +432,23 @@ def weak_negative_attrs(dataset_name, attrs, masks, weak_neg_fall_wave):
             mask[2] = 1.0
 
 
+def filter_smoking_persons(persons, label_boxes, args):
+    if not args.smoking_single_person_only:
+        return persons, None
+    qualified = []
+    for person in persons:
+        visible = int(np.sum(person.kpts[:, 2] > 0))
+        if person.score >= args.smoking_min_person_score and visible >= args.smoking_min_visible_kpts:
+            qualified.append(person)
+    if len(qualified) != 1:
+        return [], "not_single_qualified_person"
+    person = qualified[0]
+    if args.smoking_require_smoke_in_person and len(label_boxes) == 1:
+        if not center_in(label_boxes[0].xyxy, person.xyxy):
+            return [], "smoke_box_not_in_person"
+    return [person], None
+
+
 def write_label(path, persons, domain_boxes, img_w, img_h):
     lines = []
     for person, attrs, masks in persons:
@@ -567,6 +606,8 @@ def main():
         "datasets": {},
         "written": 0,
         "skipped_no_person": 0,
+        "skipped_smoking_strict": 0,
+        "skipped_smoking_reasons": {},
     }
     records = []
 
@@ -593,6 +634,13 @@ def main():
                 domain_boxes = [(1, b.xyxy) for b in label_boxes if b.cls == 1]
             elif dataset_name == "water":
                 domain_boxes = [(2, b.xyxy) for b in label_boxes if b.cls == 2]
+            elif dataset_name == "smoking":
+                raw_persons, reason = filter_smoking_persons(raw_persons, label_boxes, args)
+                if reason:
+                    stats["skipped_smoking_strict"] += 1
+                    stats["skipped_smoking_reasons"][reason] = (
+                        stats["skipped_smoking_reasons"].get(reason, 0) + 1
+                    )
 
             if dataset_name in ("fall", "hat", "smoking") and not raw_persons:
                 stats["skipped_no_person"] += 1
