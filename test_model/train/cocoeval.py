@@ -39,7 +39,8 @@ def parse_args():
     p.add_argument("--weights", type=str, required=True)
     p.add_argument("--model", type=str, default=None,
                    choices=["bifpn", "bifpn_dual", "bifpn_detect", "bifpn_det",
-                            "bifpn_pose", "bifpn_pose_only"])
+                            "bifpn_pose", "bifpn_pose_only",
+                            "bifpn_dual_domain_attr", "bifpn_domain_attr"])
     p.add_argument("--data", type=str, default=None)
     p.add_argument("--img-dir", type=str, default=None)
     p.add_argument("--label-dir", type=str, default=None)
@@ -120,6 +121,31 @@ def build_model(args, cfg, device):
             "neck_out_channels": neck_cfg.get("out_channels", None),
         })
         model_kwargs.update(pose_kwargs)
+    elif model_name in ("bifpn_dual_domain_attr", "bifpn_domain_attr"):
+        data_cfg = cfg.get("data", {}) or {}
+        neck_cfg = cfg.get("neck", {}) or {}
+        assigner_cfg = cfg.get("assigner", {}) or {}
+        domain_cfg = cfg.get("domain_det", {}) or {}
+        attr_cfg = cfg.get("attributes", {}) or {}
+        model_kwargs.update({
+            "num_kpts": cfg.get("num_kpts", 17),
+            "num_det_classes": cfg.get("num_det_classes", cfg.get("num_classes", 80)),
+            "input_size": data_cfg.get("input_size", 640),
+            "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+            "neck_downsample": neck_cfg.get("downsample", "conv"),
+            "neck_out_channels": neck_cfg.get("out_channels", None),
+            "assigner_topk": assigner_cfg.get("topk", 10),
+            "assigner_alpha": assigner_cfg.get("alpha", 0.5),
+            "assigner_beta": assigner_cfg.get("beta", 6.0),
+            "assigner_eps": assigner_cfg.get("eps", 1.0e-9),
+            "domain_num_classes": domain_cfg.get("num_classes", 2),
+            "domain_class_map": domain_cfg.get("class_map", None),
+            "num_attrs": attr_cfg.get(
+                "num_attrs",
+                len(attr_cfg.get("names", [])) if attr_cfg.get("names") else 4,
+            ),
+            "attr_names": attr_cfg.get("names", None),
+        })
     else:
         neck_cfg = cfg.get("neck", {}) or {}
         assigner_cfg = cfg.get("assigner", {}) or {}
@@ -138,10 +164,16 @@ def build_model(args, cfg, device):
 
     model = create_model(model_name, **model_kwargs)
     ckpt = torch.load(args.weights, map_location="cpu", weights_only=False)
-    state = ckpt.get("model_state_dict", ckpt)
-    model.load_state_dict(state)
+    state = ckpt.get("model_state_dict", ckpt) if isinstance(ckpt, dict) else ckpt
+    if isinstance(ckpt, dict) and not isinstance(state, dict):
+        state = ckpt.get("state_dict", ckpt.get("ema_state"))
+    missing, unexpected = model.load_state_dict(state, strict=False)
     model.to(device).eval()
     print(f"Loaded checkpoint: {args.weights}")
+    if missing:
+        print(f"  missing keys: {len(missing)} sample={missing[:6]}")
+    if unexpected:
+        print(f"  unexpected keys: {len(unexpected)} sample={unexpected[:6]}")
     print(f"Model: {model_name} | params={model.num_params / 1e6:.2f}M")
     return model
 
