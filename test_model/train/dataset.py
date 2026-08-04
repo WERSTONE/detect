@@ -35,6 +35,8 @@ COCO80_CLASSES = [
     'scissors', 'teddy bear', 'hair drier', 'toothbrush',
 ]
 
+IMAGE_EXTS = ('.jpg', '.jpeg', '.png', '.bmp', '.webp')
+
 
 COCO_CATEGORY_ID_TO_80 = {
     1: 0, 2: 1, 3: 2, 4: 3, 5: 4, 6: 5, 7: 6, 8: 7, 9: 8, 10: 9,
@@ -126,11 +128,13 @@ class COCOMultiTaskDataset(Dataset):
                         n_no_keypoints += 1
                         continue
 
-                img_name = lb.stem + '.jpg'
-                img_path = self.img_dir / img_name
-                if not img_path.exists():
-                    img_path = self.img_dir / (lb.stem + '.png')
-                if img_path.exists():
+                img_path = None
+                for ext in IMAGE_EXTS:
+                    candidate = self.img_dir / (lb.stem + ext)
+                    if candidate.exists():
+                        img_path = candidate
+                        break
+                if img_path is not None and img_path.exists():
                     self.samples.append((str(img_path), str(lb)))
                 else:
                     n_no_image += 1
@@ -142,7 +146,7 @@ class COCOMultiTaskDataset(Dataset):
                       f"{n_no_image} no image, {len(self.samples)} kept", flush=True)
         else:
             # Only images (no labels) for prediction
-            for ext in ('*.jpg', '*.png', '*.jpeg'):
+            for ext in IMAGE_EXTS:
                 for p in self.img_dir.glob(ext):
                     self.samples.append((str(p), None))
 
