@@ -1,4 +1,4 @@
-"""Evaluate domain detection and person attributes on the custom val set."""
+"""Evaluate domain detection and person attributes on custom train/val labels."""
 
 import argparse
 import json
@@ -18,10 +18,12 @@ from test_model.train.dataset import create_dataloader  # noqa: E402
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="Evaluate bifpn_dual_domain_attr on custom validation labels")
+        description="Evaluate bifpn_dual_domain_attr on custom train/val labels")
     parser.add_argument("--config", default=str(PROJECT_ROOT / "test_model/config/bifpn_domain_attr_finetune.yaml"))
     parser.add_argument("--weights", required=True)
     parser.add_argument("--data", default=None)
+    parser.add_argument("--split", default="val", choices=["train", "val", "all"],
+                        help="Evaluate train, val, or the merged train+val set")
     parser.add_argument("--img-dir", default=None)
     parser.add_argument("--label-dir", default=None)
     parser.add_argument("--batch", type=int, default=None)
@@ -115,6 +117,27 @@ def build_model(cfg, weights, device, prefer_ema=False):
         print(f"  unexpected sample: {unexpected[:6]}", flush=True)
     model.eval()
     return model
+
+
+def split_dirs(args, data_cfg):
+    if args.split == "all":
+        return [
+            ("train", data_cfg.get("train_img", "images/train"),
+             data_cfg.get("train_label", "labels/train")),
+            ("val", data_cfg.get("val_img", "images/val"),
+             data_cfg.get("val_label", "labels/val")),
+        ]
+    if args.split == "train":
+        return [
+            ("train",
+             args.img_dir or data_cfg.get("train_img", "images/train"),
+             args.label_dir or data_cfg.get("train_label", "labels/train")),
+        ]
+    return [
+        ("val",
+         args.img_dir or data_cfg.get("val_img", "images/val"),
+         args.label_dir or data_cfg.get("val_label", "labels/val")),
+    ]
 
 
 def box_iou(a, b):
@@ -348,8 +371,6 @@ def main():
     attr_cfg = cfg.get("attributes", {}) or {}
 
     data_root = args.data or data_cfg.get("root")
-    img_dir = args.img_dir or data_cfg.get("val_img", "images/val")
-    label_dir = args.label_dir or data_cfg.get("val_label", "labels/val")
     input_size = int(args.input_size or data_cfg.get("input_size", 640))
     batch = int(args.batch or eval_cfg.get("batch_size", 16))
     workers = int(args.workers if args.workers is not None else 8)
@@ -358,19 +379,24 @@ def main():
     device = normalize_device(args.device)
 
     model = build_model(cfg, args.weights, device, prefer_ema=args.prefer_ema)
-    loader = create_dataloader(
-        data_dir=data_root,
-        img_dir=img_dir,
-        label_dir=label_dir,
-        input_size=input_size,
-        batch_size=batch,
-        use_mosaic=False,
-        augment=False,
-        shuffle=False,
-        num_workers=workers,
-        drop_last=False,
-        class_id_format=data_cfg.get("class_id_format", "yolo80"),
-    )
+    eval_splits = split_dirs(args, data_cfg)
+    loaders = []
+    for split_name, img_dir, label_dir in eval_splits:
+        loader = create_dataloader(
+            data_dir=data_root,
+            img_dir=img_dir,
+            label_dir=label_dir,
+            input_size=input_size,
+            batch_size=batch,
+            use_mosaic=False,
+            augment=False,
+            shuffle=False,
+            num_workers=workers,
+            drop_last=False,
+            class_id_format=data_cfg.get("class_id_format", "yolo80"),
+        )
+        loaders.append((split_name, img_dir, label_dir, loader))
+        print(f"Eval split {split_name}: {img_dir} / {label_dir} | images={len(loader.dataset)}", flush=True)
 
     domain_names = list(domain_cfg.get("names", ["fire", "water"]))
     domain_class_map = {int(k): int(v) for k, v in (domain_cfg.get("class_map", {}) or {}).items()}
@@ -383,58 +409,66 @@ def main():
     gt_persons = {"boxes": [], "attrs": [], "masks": []}
     pred_persons = {"boxes": [], "attrs": [], "scores": []}
     image_idx = 0
+    total_images = sum(len(loader.dataset) for _name, _img, _label, loader in loaders)
 
     with torch.no_grad():
-        for batch_idx, batch_data in enumerate(loader, start=1):
-            images = batch_data["image"].to(device, non_blocking=True)
-            preds = model.predict_val(
-                images,
-                score_thresh=args.score_thresh,
-                iou_thresh=iou_thresh,
-                max_det=max_det,
-            )
-            bs = len(preds)
-            for bi in range(bs):
-                gt_boxes = batch_data["boxes"][bi].numpy()
-                gt_classes = batch_data["classes"][bi].numpy().astype(int)
-                gt_attrs_i = batch_data["attrs"][bi].numpy()
-                gt_masks_i = batch_data["attr_mask"][bi].numpy()
+        for split_name, _img_dir, _label_dir, loader in loaders:
+            split_seen = 0
+            for batch_idx, batch_data in enumerate(loader, start=1):
+                images = batch_data["image"].to(device, non_blocking=True)
+                preds = model.predict_val(
+                    images,
+                    score_thresh=args.score_thresh,
+                    iou_thresh=iou_thresh,
+                    max_det=max_det,
+                )
+                bs = len(preds)
+                for bi in range(bs):
+                    gt_boxes = batch_data["boxes"][bi].numpy()
+                    gt_classes = batch_data["classes"][bi].numpy().astype(int)
+                    gt_attrs_i = batch_data["attrs"][bi].numpy()
+                    gt_masks_i = batch_data["attr_mask"][bi].numpy()
 
-                for cls_id in domain_pred_classes:
-                    boxes = gt_boxes[gt_classes == cls_id]
-                    gts_by_image_class[(image_idx, cls_id)] = boxes.astype(np.float32)
+                    for cls_id in domain_pred_classes:
+                        boxes = gt_boxes[gt_classes == cls_id]
+                        gts_by_image_class[(image_idx, cls_id)] = boxes.astype(np.float32)
 
-                person_mask = gt_classes == 0
-                gt_persons["boxes"].append(gt_boxes[person_mask].astype(np.float32))
-                gt_persons["attrs"].append(gt_attrs_i[person_mask].astype(np.float32))
-                gt_persons["masks"].append(gt_masks_i[person_mask].astype(np.float32))
+                    person_mask = gt_classes == 0
+                    gt_persons["boxes"].append(gt_boxes[person_mask].astype(np.float32))
+                    gt_persons["attrs"].append(gt_attrs_i[person_mask].astype(np.float32))
+                    gt_persons["masks"].append(gt_masks_i[person_mask].astype(np.float32))
 
-                pred = {
-                    key: value.detach().cpu().numpy() if torch.is_tensor(value) else value
-                    for key, value in preds[bi].items()
-                }
-                p_boxes = pred["boxes"].astype(np.float32)
-                p_scores = pred["scores"].astype(np.float32)
-                p_classes = pred["classes"].astype(int)
-                p_attrs = pred.get("attrs", np.zeros((len(p_boxes), len(attr_names)), dtype=np.float32))
+                    pred = {
+                        key: value.detach().cpu().numpy() if torch.is_tensor(value) else value
+                        for key, value in preds[bi].items()
+                    }
+                    p_boxes = pred["boxes"].astype(np.float32)
+                    p_scores = pred["scores"].astype(np.float32)
+                    p_classes = pred["classes"].astype(int)
+                    p_attrs = pred.get("attrs", np.zeros((len(p_boxes), len(attr_names)), dtype=np.float32))
 
-                for cls_id in domain_pred_classes:
-                    keep = p_classes == cls_id
-                    for box, score in zip(p_boxes[keep], p_scores[keep]):
-                        preds_by_class.setdefault(cls_id, []).append({
-                            "image_idx": image_idx,
-                            "box": box.astype(np.float32),
-                            "score": float(score),
-                        })
+                    for cls_id in domain_pred_classes:
+                        keep = p_classes == cls_id
+                        for box, score in zip(p_boxes[keep], p_scores[keep]):
+                            preds_by_class.setdefault(cls_id, []).append({
+                                "image_idx": image_idx,
+                                "box": box.astype(np.float32),
+                                "score": float(score),
+                            })
 
-                keep_person = (p_classes == 0) & (p_scores >= args.person_conf)
-                pred_persons["boxes"].append(p_boxes[keep_person].astype(np.float32))
-                pred_persons["attrs"].append(p_attrs[keep_person].astype(np.float32))
-                pred_persons["scores"].append(p_scores[keep_person].astype(np.float32))
+                    keep_person = (p_classes == 0) & (p_scores >= args.person_conf)
+                    pred_persons["boxes"].append(p_boxes[keep_person].astype(np.float32))
+                    pred_persons["attrs"].append(p_attrs[keep_person].astype(np.float32))
+                    pred_persons["scores"].append(p_scores[keep_person].astype(np.float32))
 
-                image_idx += 1
-            if batch_idx == 1 or batch_idx % 20 == 0:
-                print(f"Evaluated {image_idx}/{len(loader.dataset)} images", flush=True)
+                    image_idx += 1
+                    split_seen += 1
+                if batch_idx == 1 or batch_idx % 20 == 0:
+                    print(
+                        f"Evaluated {split_name}: {split_seen}/{len(loader.dataset)} "
+                        f"merged={image_idx}/{total_images}",
+                        flush=True,
+                    )
 
     iou_thresholds = np.arange(0.5, 0.96, 0.05)
     det_ap = eval_ap(preds_by_class, gts_by_image_class, domain_pred_classes, iou_thresholds)
@@ -466,8 +500,11 @@ def main():
         "weights": str(args.weights),
         "config": str(args.config),
         "data_root": str(data_root),
-        "val_img": str(img_dir),
-        "val_label": str(label_dir),
+        "split": args.split,
+        "evaluated_splits": [
+            {"split": name, "img_dir": str(img_dir), "label_dir": str(label_dir), "images": len(loader.dataset)}
+            for name, img_dir, label_dir, loader in loaders
+        ],
         "num_images": int(image_idx),
         "thresholds": {
             "decode_score": float(args.score_thresh),
