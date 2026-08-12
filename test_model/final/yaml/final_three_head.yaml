@@ -32,12 +32,11 @@ data:
   input_size: 640
   train:
     detect:
-      # Relative to the repo root (resolved at runtime).
-      root: data/Detect
+      root: /root/autodl-tmp/Detect
       images: train/images
       labels: train/labels
     attr:
-      root: data/Attr
+      root: /root/autodl-tmp/Attr
       split: train
     pose:
       # Server path; point this to the selected COCO person-pose subset.
@@ -48,11 +47,11 @@ data:
 
   val:
     detect:
-      root: data/Detect
+      root: /root/autodl-tmp/Detect
       images: valid/images
       labels: valid/labels
     attr:
-      root: data/Attr
+      root: /root/autodl-tmp/Attr
       split: val
     pose:
       # Server path; optional. Skipped automatically when unavailable.
