@@ -80,7 +80,7 @@ training:
   init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_pose_best.pt
   save_dir: checkpoints/final_three_head
   batch_size: 32
-  workers: 12
+  workers: 16
   optimizer: sgd
   momentum: 0.937
   weight_decay: 0.0005
