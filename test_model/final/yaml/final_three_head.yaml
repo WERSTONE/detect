@@ -1,0 +1,216 @@
+model: final_three_head
+num_kpts: 17
+reg_max: 16
+
+domain_det:
+  num_classes: 4
+  names: [puddle, fire, smoke, other]
+  # Detect labels are 0..3. The shared model keeps person as class 0 and maps
+  # detect targets internally to 0..3, so final/data.py shifts detect labels by +1.
+  class_map:
+    1: 0
+    2: 1
+    3: 2
+    4: 3
+
+attributes:
+  num_attrs: 4
+  names: [smoking, falling, waving, helmet_on]
+
+neck:
+  out_channels: 256
+  use_p2_context: false
+  downsample: conv
+
+assigner:
+  topk: 10
+  alpha: 0.5
+  beta: 6.0
+  eps: 1.0e-9
+
+data:
+  input_size: 640
+  train:
+    detect:
+      # Relative to the repo root (resolved at runtime).
+      root: data/Detect
+      images: train/images
+      labels: train/labels
+    attr:
+      root: data/Attr
+      split: train
+    pose:
+      # Server path; point this to the selected COCO person-pose subset.
+      root: /root/autodl-tmp/coco2017
+      images: train2017
+      labels: labels/train2017
+      class_id_format: yolo80
+
+  val:
+    detect:
+      root: data/Detect
+      images: valid/images
+      labels: valid/labels
+    attr:
+      root: data/Attr
+      split: val
+    pose:
+      # Server path; optional. Skipped automatically when unavailable.
+      root: /root/autodl-tmp/coco2017
+      images: val2017
+      labels: labels/val2017
+      class_id_format: yolo80
+
+# Training now uses a SINGLE random loader over the concatenated detect/attr/pose
+# datasets; batches do not guarantee per-task presence. Task balance is set by
+# dataset construction:
+#   - detect: full (train=11131)
+#   - attr:   full (train=21605; 4 attributes ~5k each, kept for focused training)
+#   - pose:   COCO person subset capped to 8000 via the filter script, e.g.:
+#       python scripts/filter_coco_person_pose.py --coco-root /root/autodl-tmp/coco2017 \
+#           --splits train2017 val2017 --max-images 8000
+#   Combined ~= 40.7k -> batch ratio roughly attr 53% / detect 27% / pose 20%.
+# The ratios below are used only by the balanced validation loader.
+batch_sampling:
+  ratios:
+    detect: 1
+    attr: 1
+    pose: 1
+
+training:
+  init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_best.pt
+  save_dir: checkpoints/final_three_head
+  batch_size: 32
+  workers: 12
+  optimizer: sgd
+  momentum: 0.937
+  weight_decay: 0.0005
+  nesterov: true
+  param_groups: yolo
+  nbs: 64
+  accumulate: auto
+  scale_weight_decay: true
+  amp: true
+  ema_decay: 0.9999
+  grad_clip: 10.0
+  log_interval: 50
+  save_interval: 10
+  val_interval: 1
+  tensorboard: true
+  check_finite_loss: true
+
+  stages:
+    - name: new_heads
+      epochs: 30
+      lr0: 0.003
+      cos_lr: false
+      lrf: 1.0
+      train_detect: true
+      train_attr: true
+      train_pose: false
+      det_weight: 1.0
+      attr_weight: 8.0
+      pose_weight: 0.0
+      load_best_for_next_stage: true
+      freeze:
+        enabled: true
+        trainable_modules: [domain_det_head, attr_head]
+
+    - name: adapters
+      epochs: 40
+      lr0: 0.0003
+      cos_lr: false
+      lrf: 1.0
+      train_detect: true
+      train_attr: true
+      train_pose: true
+      det_weight: 1.0
+      attr_weight: 8.0
+      pose_weight: 0.5
+      load_best_for_next_stage: true
+      freeze:
+        enabled: true
+        trainable_modules: [det_adapter, pose_adapter, domain_det_head, attr_head]
+
+    - name: neck_guarded
+      epochs: 60
+      lr0: 0.0001
+      cos_lr: true
+      lrf: 0.3
+      train_detect: true
+      train_attr: true
+      train_pose: true
+      det_weight: 1.0
+      attr_weight: 8.0
+      pose_weight: 1.0
+      load_best_for_next_stage: true
+      freeze:
+        enabled: true
+        trainable_modules: [neck, det_adapter, pose_adapter, domain_det_head, attr_head]
+
+    - name: full_finetune
+      epochs: 80
+      lr0: 0.00003
+      cos_lr: true
+      lrf: 0.2
+      train_detect: true
+      train_attr: true
+      train_pose: true
+      det_weight: 1.0
+      attr_weight: 8.0
+      pose_weight: 1.0
+      load_best_for_next_stage: false
+      freeze:
+        enabled: false
+
+loss:
+  w_attr: 1.0
+  attr_pos_weight:
+    smoking: 1.6
+    falling: 4.4
+    waving: 6.2
+    helmet_on: 2.2
+
+eval:
+  enabled: true
+  batch_size: 16
+  score_thresh: 0.01
+  domain_conf: 0.25
+  person_conf: 0.25
+  attr_thresh: 0.5
+  iou_thresh: 0.6
+  match_iou: 0.5
+  max_det: 300
+  output_dir: checkpoints/final_three_head/eval
+  # Server-only COCO pose eval. Requires annotations under the pose root:
+  #   <pose.root>/annotations/instances_val2017.json
+  #   <pose.root>/annotations/person_keypoints_val2017.json
+  coco_pose: true
+
+augmentation:
+  detect:
+    augment: true
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    translate: 0.08
+    scale: 0.25
+    flip_lr: 0.5
+  attr:
+    augment: true
+    hsv_h: 0.01
+    hsv_s: 0.35
+    hsv_v: 0.25
+    translate: 0.03
+    scale: 0.08
+    flip_lr: 0.5
+  pose:
+    augment: true
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.3
+    translate: 0.06
+    scale: 0.2
+    flip_lr: 0.5
+
+device: cuda

@@ -50,8 +50,8 @@ data:
 
 training:
   epochs: 50
-  batch_size: 16
-  workers: 14
+  batch_size: 32
+  workers: 16
 
   optimizer: sgd
   lr0: 0.0001
@@ -131,7 +131,7 @@ training:
   distillation:
     enabled: true
     teacher_model: bifpn_detect
-    teacher_weights: checkpoints/single_bifpn_det/bifpn_detect/bifpn_detect_best.pt
+    teacher_weights: checkpoints/bifpn_detect_best.pt
     teacher_num_classes: 80
     det:
       enabled: true

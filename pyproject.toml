@@ -23,7 +23,7 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-export = ["onnx>=1.14.0", "onnxruntime>=1.15.0"]
+export = ["onnx>=1.14.0", "onnxruntime>=1.15.0", "onnxsim>=0.4.36"]
 gstreamer = ["pygobject>=3.44.0"]
 
 [project.scripts]
