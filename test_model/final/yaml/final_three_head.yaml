@@ -93,14 +93,14 @@ training:
   ema_decay: 0.9999
   grad_clip: 10.0
   log_interval: 50
-  save_interval: 10
+  save_interval: 20
   val_interval: 1
   tensorboard: true
   check_finite_loss: true
 
   stages:
     - name: new_heads
-      epochs: 30
+      epochs: 80
       lr0: 0.003
       cos_lr: false
       lrf: 1.0
@@ -116,7 +116,7 @@ training:
         trainable_modules: [domain_det_head, attr_head]
 
     - name: adapters
-      epochs: 40
+      epochs: 80
       lr0: 0.0003
       cos_lr: false
       lrf: 1.0
@@ -132,7 +132,7 @@ training:
         trainable_modules: [det_adapter, pose_adapter, domain_det_head, attr_head]
 
     - name: neck_guarded
-      epochs: 60
+      epochs: 100
       lr0: 0.0001
       cos_lr: true
       lrf: 0.3
@@ -148,7 +148,7 @@ training:
         trainable_modules: [neck, det_adapter, pose_adapter, domain_det_head, attr_head]
 
     - name: full_finetune
-      epochs: 80
+      epochs: 150
       lr0: 0.00003
       cos_lr: true
       lrf: 0.2
