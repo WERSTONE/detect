@@ -42,7 +42,7 @@ data:
       # Server path; point this to the selected COCO person-pose subset.
       root: /root/autodl-tmp/coco2017
       images: train2017
-      labels: labels/train2017
+      labels: labels_person/train2017
       class_id_format: yolo80
 
   val:
@@ -57,7 +57,7 @@ data:
       # Server path; optional. Skipped automatically when unavailable.
       root: /root/autodl-tmp/coco2017
       images: val2017
-      labels: labels/val2017
+      labels: labels_person/val2017
       class_id_format: yolo80
 
 # Training now uses a SINGLE random loader over the concatenated detect/attr/pose
@@ -77,7 +77,7 @@ batch_sampling:
     pose: 1
 
 training:
-  init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_best.pt
+  init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_pose_best.pt
   save_dir: checkpoints/final_three_head
   batch_size: 32
   workers: 12
