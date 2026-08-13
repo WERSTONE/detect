@@ -464,11 +464,15 @@ class FinalTaskBatchLoader:
     def __init__(self, loaders: dict[str, DataLoader]):
         self.loaders = loaders
         self.dataset = self
-        self._iters = {name: iter(loader) for name, loader in loaders.items()}
         self.samples = []
+        self._iters = None
 
     def __len__(self):
         return max(len(loader) for loader in self.loaders.values())
+
+    def _ensure_iters(self):
+        if self._iters is None:
+            self._iters = {name: iter(loader) for name, loader in self.loaders.items()}
 
     def _next(self, name):
         try:
@@ -478,6 +482,7 @@ class FinalTaskBatchLoader:
             return next(self._iters[name])
 
     def __iter__(self):
+        self._ensure_iters()
         for _ in range(len(self)):
             parts = [self._next(name) for name in ("detect", "attr", "pose") if name in self.loaders]
             yield merge_batches(parts)
@@ -598,7 +603,8 @@ def build_final_val_loader(cfg: dict) -> FinalTaskBatchLoader:
     val_cfg = data_cfg.get("val", {}) or {}
     batch_cfg = cfg.get("batch_sampling", {})
     input_size = int(data_cfg.get("input_size", 640))
-    workers = int(cfg["training"].get("workers", 8))
+    train_workers = int(cfg["training"].get("workers", 8))
+    val_workers = max(1, train_workers // 4)
     total_bs = int(cfg["training"]["batch_size"])
 
     tasks: dict[str, Dataset] = {}
@@ -649,7 +655,7 @@ def build_final_val_loader(cfg: dict) -> FinalTaskBatchLoader:
     task_bs = split_batch_size(total_bs, ratios)
     loaders = {
         name: make_loader(
-            tasks[name], task_bs[name], workers,
+            tasks[name], task_bs[name], val_workers,
             shuffle=False, drop_last=False,
         )
         for name in ratio_names
