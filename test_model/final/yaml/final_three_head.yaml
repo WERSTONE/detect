@@ -102,13 +102,14 @@ training:
     - name: new_heads
       epochs: 80
       lr0: 0.003
-      cos_lr: false
-      lrf: 1.0
+      warmup_epochs: 3
+      cos_lr: true
+      lrf: 0.1
       train_detect: true
       train_attr: true
       train_pose: false
       det_weight: 1.0
-      attr_weight: 8.0
+      attr_weight: 4.0
       pose_weight: 0.0
       load_best_for_next_stage: true
       freeze:
@@ -118,13 +119,13 @@ training:
     - name: adapters
       epochs: 80
       lr0: 0.0003
-      cos_lr: false
-      lrf: 1.0
+      cos_lr: true
+      lrf: 0.1
       train_detect: true
       train_attr: true
       train_pose: true
       det_weight: 1.0
-      attr_weight: 8.0
+      attr_weight: 4.0
       pose_weight: 0.5
       load_best_for_next_stage: true
       freeze:
@@ -140,7 +141,7 @@ training:
       train_attr: true
       train_pose: true
       det_weight: 1.0
-      attr_weight: 8.0
+      attr_weight: 4.0
       pose_weight: 1.0
       load_best_for_next_stage: true
       freeze:
@@ -156,7 +157,7 @@ training:
       train_attr: true
       train_pose: true
       det_weight: 1.0
-      attr_weight: 8.0
+      attr_weight: 4.0
       pose_weight: 1.0
       load_best_for_next_stage: false
       freeze:
@@ -198,10 +199,10 @@ augmentation:
   attr:
     augment: true
     hsv_h: 0.01
-    hsv_s: 0.35
-    hsv_v: 0.25
-    translate: 0.03
-    scale: 0.08
+    hsv_s: 0.45
+    hsv_v: 0.3
+    translate: 0.05
+    scale: 0.15
     flip_lr: 0.5
   pose:
     augment: true
