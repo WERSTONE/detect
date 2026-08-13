@@ -1208,13 +1208,16 @@ class Trainer:
 
             train_m = self.train_epoch(train_loader, epochs, epoch,
                                        close_mosaic=close_mosaic)
-            elapsed = time.time() - t0
+            train_elapsed = time.time() - t0
 
             do_val = val_loader and (epoch + 1) % self.val_interval == 0
             val_m = None
+            val_elapsed = 0.0
             status = ''
             if do_val:
+                val_t0 = time.time()
                 val_m = self.validate(val_loader)
+                val_elapsed = time.time() - val_t0
 
                 metric_payload = dict(val_m)
                 current = metric_payload.get(
@@ -1246,7 +1249,15 @@ class Trainer:
                     score_m.update({k: v for k, v in val_m.items() if k not in score_m})
                 score_statuses = self._save_score_bests(score_m, save_prefix)
 
-            print(f"Epoch {epoch + 1:3d}/{epochs} | {elapsed:.0f}s{status}")
+            total_elapsed = train_elapsed + val_elapsed
+            if do_val:
+                time_msg = (
+                    f"train={train_elapsed:.0f}s val={val_elapsed:.0f}s "
+                    f"total={total_elapsed:.0f}s"
+                )
+            else:
+                time_msg = f"train={train_elapsed:.0f}s total={total_elapsed:.0f}s"
+            print(f"Epoch {epoch + 1:3d}/{epochs} | {time_msg}{status}")
             for line in self.format_metric_lines(train_m, label='train', indent='  '):
                 print(line)
             if do_val:

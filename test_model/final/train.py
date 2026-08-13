@@ -32,6 +32,16 @@ def parse_args():
     )
     parser.add_argument("--device", default=None)
     parser.add_argument("--init-weights", default=None)
+    parser.add_argument(
+        "--start-stage",
+        default=None,
+        help="Stage to start from, either 1-based index such as 3 or a stage name such as neck_guarded.",
+    )
+    parser.add_argument(
+        "--stage-weights",
+        default=None,
+        help="Checkpoint to load before the selected start stage. Overrides init_weights when provided.",
+    )
     return parser.parse_args()
 
 
@@ -148,7 +158,7 @@ def build_trainer(model, cfg, device, stage, save_dir):
         grad_clip=train_cfg.get("grad_clip", 10.0),
         log_interval=train_cfg.get("log_interval", 50),
         save_interval=train_cfg.get("save_interval", 10),
-        val_interval=train_cfg.get("val_interval", 1),
+        val_interval=int(stage.get("val_interval", train_cfg.get("val_interval", 1))),
         save_dir=save_dir,
         use_amp=train_cfg.get("amp", True),
         ema_decay=train_cfg.get("ema_decay", 0.9999),
@@ -165,6 +175,24 @@ def build_trainer(model, cfg, device, stage, save_dir):
     )
 
 
+def resolve_start_stage(stages, start_stage):
+    if start_stage is None:
+        return 0
+    token = str(start_stage).strip()
+    if not token:
+        return 0
+    if token.isdigit():
+        index = int(token) - 1
+        if 0 <= index < len(stages):
+            return index
+        raise ValueError(f"--start-stage index out of range: {token}; valid range is 1..{len(stages)}")
+    for index, stage in enumerate(stages):
+        if str(stage.get("name", "")) == token:
+            return index
+    names = ", ".join(str(stage.get("name", f"stage{idx + 1}")) for idx, stage in enumerate(stages))
+    raise ValueError(f"--start-stage name not found: {token}; valid stage names: {names}")
+
+
 def main():
     args = parse_args()
     cfg = yaml.safe_load(Path(args.config).read_text(encoding="utf-8"))
@@ -174,8 +202,26 @@ def main():
 
     model = build_model(cfg)
     model.to(device)
-    init_weights = args.init_weights or cfg["training"].get("init_weights")
-    load_model_weights(model, init_weights, device)
+
+    stages = cfg["training"].get("stages", [])
+    if not stages:
+        stages = [{"name": "single", "epochs": cfg["training"].get("epochs", 100)}]
+    start_index = resolve_start_stage(stages, args.start_stage)
+    run_stages = stages[start_index:]
+    if not run_stages:
+        raise RuntimeError("No stages selected to run")
+
+    if args.stage_weights:
+        print(f"[resume] loading stage weights before stage {start_index + 1}: {args.stage_weights}")
+        load_model_weights(model, args.stage_weights, device)
+    else:
+        init_weights = args.init_weights or cfg["training"].get("init_weights")
+        if start_index > 0:
+            print(
+                f"[resume] --start-stage={args.start_stage} was set without --stage-weights; "
+                f"loading init_weights instead: {init_weights}"
+            )
+        load_model_weights(model, init_weights, device)
 
     loss_cfg = cfg.get("loss", {})
     if hasattr(model, "set_attr_pos_weight"):
@@ -192,14 +238,15 @@ def main():
             val_loader = build_final_val_loader(cfg)
         except RuntimeError as exc:
             print(f"[val] Skipping validation: {exc}")
-    stages = cfg["training"].get("stages", [])
-    if not stages:
-        stages = [{"name": "single", "epochs": cfg["training"].get("epochs", 100)}]
 
     base_save = Path(cfg["training"].get("save_dir", "checkpoints/final_three_head"))
     last_best = None
     last_stage_best = None
-    for index, stage_in in enumerate(stages, 1):
+    print(
+        f"[stage] selected stages: {start_index + 1}..{len(stages)} "
+        f"({', '.join(str(stage.get('name', f'stage{idx + 1}')) for idx, stage in enumerate(run_stages, start_index))})"
+    )
+    for index, stage_in in enumerate(run_stages, start_index + 1):
         stage = copy.deepcopy(stage_in)
         name = stage.get("name", f"stage{index}")
         apply_stage(model, stage)
@@ -240,7 +287,9 @@ def main():
     final_out = base_save / "final_three_head_final.pt"
     state = {
         "model_state_dict": model.state_dict(),
-        "epoch": sum(int(s.get("epochs", 1)) for s in stages),
+        "epoch": sum(int(s.get("epochs", 1)) for s in run_stages),
+        "start_stage": start_index + 1,
+        "stage_weights": str(args.stage_weights) if args.stage_weights else None,
         "last_best": str(last_best) if last_best else None,
     }
     torch.save(state, str(final_out))

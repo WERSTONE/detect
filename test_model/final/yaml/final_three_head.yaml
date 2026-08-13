@@ -143,6 +143,9 @@ training:
       lr0: 0.0001
       cos_lr: true
       lrf: 0.3
+      val_interval: 1
+      early_stop_patience: 15
+      early_stop_start_epoch: 0
       train_detect: true
       train_attr: true
       train_pose: true
@@ -159,6 +162,9 @@ training:
       lr0: 0.00003
       cos_lr: true
       lrf: 0.2
+      val_interval: 1
+      early_stop_patience: 15
+      early_stop_start_epoch: 0
       train_detect: true
       train_attr: true
       train_pose: true

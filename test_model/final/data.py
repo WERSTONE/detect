@@ -494,6 +494,31 @@ class FinalTaskBatchLoader:
         return None
 
 
+class FinalSequentialValLoader:
+    """Yield each task validation loader once without resampling or balancing."""
+
+    def __init__(self, loaders: dict[str, DataLoader]):
+        self.loaders = loaders
+        self.dataset = self
+        self.samples = []
+
+    def __len__(self):
+        return sum(len(loader) for loader in self.loaders.values())
+
+    def __iter__(self):
+        for name in ("detect", "attr", "pose"):
+            loader = self.loaders.get(name)
+            if loader is None:
+                continue
+            yield from loader
+
+    def set_epoch(self, _epoch: int):
+        return None
+
+    def set_close_mosaic(self, _close: bool = False):
+        return None
+
+
 def merge_batches(parts: list[dict]) -> dict:
     images = torch.cat([part["image"] for part in parts], dim=0)
     merged = {"image": images}
@@ -590,18 +615,17 @@ def _merge_task_cfg(train_cfg: dict, val_cfg: dict) -> dict:
     return merged
 
 
-def build_final_val_loader(cfg: dict) -> FinalTaskBatchLoader:
-    """Build a task-balanced validation loader from data.val sections.
+def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
+    """Build validation loaders from data.val sections.
 
     Only tasks whose validation directories actually exist are included, so the
     local Detect valid/ + Attr val/ runs stand alone and the server COCO val2017
-    is picked up automatically when present. No augmentation or sampling is
-    applied (full coverage, deterministic order).
+    is picked up automatically when present. No augmentation, sampling, or task
+    balancing is applied, so each validation sample is evaluated exactly once.
     """
     data_cfg = cfg["data"]
     train_cfg = data_cfg["train"]
     val_cfg = data_cfg.get("val", {}) or {}
-    batch_cfg = cfg.get("batch_sampling", {})
     input_size = int(data_cfg.get("input_size", 640))
     train_workers = int(cfg["training"].get("workers", 8))
     val_workers = max(1, train_workers // 4)
@@ -648,24 +672,24 @@ def build_final_val_loader(cfg: dict) -> FinalTaskBatchLoader:
             "No validation data sources available. Add data.val in the config."
         )
 
-    ratios = {
-        name: batch_cfg.get("ratios", {}).get(name, 0.0)
-        for name in ratio_names
-    }
-    task_bs = split_batch_size(total_bs, ratios)
     loaders = {
         name: make_loader(
-            tasks[name], task_bs[name], val_workers,
+            tasks[name], total_bs, val_workers,
             shuffle=False, drop_last=False,
         )
         for name in ratio_names
     }
     print(
-        "Final val batch sizes: "
-        + ", ".join(f"{name}={bs}" for name, bs in task_bs.items())
+        "Final val batch size: "
+        + ", ".join(f"{name}={total_bs}" for name in ratio_names)
     )
     print(
         "Final val samples: "
         + ", ".join(f"{name}={len(tasks[name])}" for name in ratio_names)
     )
-    return FinalTaskBatchLoader(loaders)
+    print(
+        "Final val steps: "
+        + ", ".join(f"{name}={len(loaders[name])}" for name in ratio_names)
+        + f" total={sum(len(loaders[name]) for name in ratio_names)}"
+    )
+    return FinalSequentialValLoader(loaders)
