@@ -94,11 +94,11 @@ training:
   grad_clip: 10.0
   log_interval: 50
   save_interval: 50
-  val_interval: 5
-  # Stop a stage after 2 consecutive val rounds (val_interval=5 -> ~10 epochs)
-  # without val-loss improvement. Each stage keeps its own best checkpoint.
+  val_interval: 1
+  # Stop a stage after 15 consecutive val epochs without val-loss improvement.
+  # Each stage keeps its own best checkpoint.
   early_stop_enabled: true
-  early_stop_patience: 10
+  early_stop_patience: 15
   early_stop_min_delta: 0.0
   early_stop_start_epoch: 5
   tensorboard: true
