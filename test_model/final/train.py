@@ -154,6 +154,14 @@ def build_trainer(model, cfg, device, stage, save_dir):
         ema_decay=train_cfg.get("ema_decay", 0.9999),
         use_tensorboard=train_cfg.get("tensorboard", True),
         check_finite_loss=train_cfg.get("check_finite_loss", True),
+        early_stop_enabled=stage.get(
+            "early_stop_enabled", train_cfg.get("early_stop_enabled", False)),
+        early_stop_patience=stage.get(
+            "early_stop_patience", train_cfg.get("early_stop_patience", 0)),
+        early_stop_min_delta=stage.get(
+            "early_stop_min_delta", train_cfg.get("early_stop_min_delta", 0.0)),
+        early_stop_start_epoch=stage.get(
+            "early_stop_start_epoch", train_cfg.get("early_stop_start_epoch", 0)),
     )
 
 

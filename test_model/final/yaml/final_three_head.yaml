@@ -95,12 +95,18 @@ training:
   log_interval: 50
   save_interval: 50
   val_interval: 5
+  # Stop a stage after 2 consecutive val rounds (val_interval=5 -> ~10 epochs)
+  # without val-loss improvement. Each stage keeps its own best checkpoint.
+  early_stop_enabled: true
+  early_stop_patience: 10
+  early_stop_min_delta: 0.0
+  early_stop_start_epoch: 5
   tensorboard: true
   check_finite_loss: true
 
   stages:
     - name: new_heads
-      epochs: 80
+      epochs: 50
       lr0: 0.003
       warmup_epochs: 3
       cos_lr: true
@@ -117,7 +123,7 @@ training:
         trainable_modules: [domain_det_head, attr_head]
 
     - name: adapters
-      epochs: 80
+      epochs: 40
       lr0: 0.0003
       cos_lr: true
       lrf: 0.1
