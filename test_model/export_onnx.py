@@ -1,16 +1,20 @@
 """Export trained BiFPN models to inference-only ONNX graphs."""
 
 import argparse
+import sys
 from pathlib import Path
 
 import torch
 import torch.nn as nn
 import yaml
 
-from test_model.model import create_model
-
-
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
+from test_model.model import create_model
+from test_model.final.model import create_final_model
+from test_model.final_pose_attr.model import create_final_pose_attr_model
 
 
 class RawBiFPNDualExport(nn.Module):
@@ -43,7 +47,8 @@ class RawBiFPNDomainAttrExport(nn.Module):
         outs = self.model(images)
         domain_out = outs["domain_det"]
         pose_out = outs["pose"]
-        attr_out = outs["attr"]
+        attr_out = outs.get("attr")
+        attr_feats = attr_out["attr"] if attr_out is not None else pose_out["attr"]
         return (
             domain_out["cls"][0], domain_out["reg"][0],
             domain_out["cls"][1], domain_out["reg"][1],
@@ -51,7 +56,7 @@ class RawBiFPNDomainAttrExport(nn.Module):
             pose_out["cls"][0], pose_out["reg"][0], pose_out["kpt"][0],
             pose_out["cls"][1], pose_out["reg"][1], pose_out["kpt"][1],
             pose_out["cls"][2], pose_out["reg"][2], pose_out["kpt"][2],
-            attr_out["attr"][0], attr_out["attr"][1], attr_out["attr"][2],
+            attr_feats[0], attr_feats[1], attr_feats[2],
         )
 
 
@@ -98,7 +103,12 @@ def model_kwargs_from_config(model_name, cfg):
         })
         return common
 
-    if model_name in ("bifpn_dual_domain_attr", "bifpn_domain_attr"):
+    if model_name in (
+        "bifpn_dual_domain_attr",
+        "bifpn_domain_attr",
+        "final_three_head",
+        "bifpn_final_three_head",
+    ):
         domain_cfg = cfg.get("domain_det", {}) or {}
         attr_cfg = cfg.get("attributes", {}) or {}
         common.update({
@@ -118,8 +128,31 @@ def model_kwargs_from_config(model_name, cfg):
         })
         return common
 
+    if model_name in ("final_pose_attr", "bifpn_final_pose_attr"):
+        domain_cfg = cfg.get("domain_det", {}) or {}
+        attr_cfg = cfg.get("pose_attr", {}) or {}
+        loss_cfg = cfg.get("loss", {}) or {}
+        common.update({
+            "num_kpts": cfg.get("num_kpts", 17),
+            "reg_max": cfg.get("reg_max", 16),
+            "neck_use_p2_context": neck_cfg.get("use_p2_context", False),
+            "neck_downsample": neck_cfg.get("downsample", "conv"),
+            "neck_out_channels": neck_cfg.get("out_channels", None),
+            "domain_num_classes": domain_cfg.get("num_classes", 4),
+            "domain_class_map": domain_cfg.get("class_map", None),
+            "num_attrs": attr_cfg.get(
+                "num_attrs",
+                len(attr_cfg.get("names", [])) if attr_cfg.get("names") else 4,
+            ),
+            "attr_names": attr_cfg.get("names", None),
+            "attr_dropout": attr_cfg.get("attr_dropout", 0.0),
+            "attr_consistency_weight": loss_cfg.get("attr_consistency_weight", 0.0),
+        })
+        return common
+
     raise ValueError(
-        "This exporter supports bifpn_dual and bifpn_dual_domain_attr only.")
+        "This exporter supports bifpn_dual, bifpn_dual_domain_attr, "
+        "final_three_head, and final_pose_attr only.")
 
 
 def extract_state_dict(checkpoint):
@@ -148,7 +181,12 @@ def main():
 
     device = torch.device(args.device if args.device == "cuda" and torch.cuda.is_available() else "cpu")
     print(f"Creating model: {model_name}")
-    model = create_model(model_name, **model_kwargs_from_config(model_name, cfg))
+    if model_name in ("final_three_head", "bifpn_final_three_head"):
+        model = create_final_model(model_name, **model_kwargs_from_config(model_name, cfg))
+    elif model_name in ("final_pose_attr", "bifpn_final_pose_attr"):
+        model = create_final_pose_attr_model(model_name, **model_kwargs_from_config(model_name, cfg))
+    else:
+        model = create_model(model_name, **model_kwargs_from_config(model_name, cfg))
 
     print(f"Loading checkpoint: {weights}")
     checkpoint = torch.load(str(weights), map_location="cpu", weights_only=False)
@@ -160,8 +198,16 @@ def main():
         print(f"WARNING: unexpected keys: {len(unexpected)}; first: {unexpected[:5]}")
 
     model.eval().to(device)
-    if model_name in ("bifpn_dual_domain_attr", "bifpn_domain_attr"):
+    if model_name in (
+        "bifpn_dual_domain_attr",
+        "bifpn_domain_attr",
+        "final_three_head",
+        "bifpn_final_three_head",
+        "final_pose_attr",
+        "bifpn_final_pose_attr",
+    ):
         wrapper = RawBiFPNDomainAttrExport(model).eval().to(device)
+        attr_prefix = "pose_attr" if model_name in ("final_pose_attr", "bifpn_final_pose_attr") else "attr"
         output_names = [
             "domain_cls_s8", "domain_reg_s8",
             "domain_cls_s16", "domain_reg_s16",
@@ -169,7 +215,7 @@ def main():
             "pose_cls_s8", "pose_reg_s8", "pose_kpt_s8",
             "pose_cls_s16", "pose_reg_s16", "pose_kpt_s16",
             "pose_cls_s32", "pose_reg_s32", "pose_kpt_s32",
-            "attr_s8", "attr_s16", "attr_s32",
+            f"{attr_prefix}_s8", f"{attr_prefix}_s16", f"{attr_prefix}_s32",
         ]
     else:
         wrapper = RawBiFPNDualExport(model).eval().to(device)

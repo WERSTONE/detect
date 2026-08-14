@@ -374,6 +374,11 @@ class Trainer:
             ]),
             ('attr', [
                 ('attr_bce', 'bce'),
+                ('attr_smoking', 'smoking'),
+                ('attr_falling', 'falling'),
+                ('attr_waving', 'waving'),
+                ('attr_helmet_on', 'helmet'),
+                ('attr_consistency', 'cons'),
                 ('attr_total', 'total'),
                 ('attr_count', 'count'),
                 ('task_w_attr', 'w'),
@@ -950,6 +955,7 @@ class Trainer:
                     'kpts': batch['kpts'][i],
                     'attrs': batch.get('attrs', [None] * len(images))[i],
                     'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
+                    'task': batch.get('task', [None] * len(images))[i],
                 })
 
             if self.use_amp:
@@ -1061,6 +1067,7 @@ class Trainer:
                         'kpts': batch['kpts'][i],
                         'attrs': batch.get('attrs', [None] * len(images))[i],
                         'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
+                        'task': batch.get('task', [None] * len(images))[i],
                     })
 
                 if self.use_amp:

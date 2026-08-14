@@ -100,6 +100,7 @@ def empty_preds():
         "scores": np.zeros((0,), dtype=np.float32),
         "classes": np.zeros((0,), dtype=np.int32),
         "kpts": np.zeros((0, 17, 3), dtype=np.float32),
+        "attrs": np.zeros((0, 4), dtype=np.float32),
     }
 
 
@@ -123,10 +124,12 @@ def decode_det_level(cls_logits, reg_logits, stride, score_thresh,
         "scores": selected_scores.astype(np.float32),
         "classes": (cls_idx + cls_offset).astype(np.int32),
         "kpts": np.zeros((len(anchor_idx), 17, 3), dtype=np.float32),
+        "attrs": np.zeros((len(anchor_idx), 4), dtype=np.float32),
     }
 
 
 def decode_pose_level(cls_logits, reg_logits, kpt_logits, stride, score_thresh,
+                      attr_logits=None,
                       max_candidates=30000):
     scores = sigmoid(cls_logits[0, 0]).reshape(-1)
     keep = np.where(scores > score_thresh)[0]
@@ -141,11 +144,17 @@ def decode_pose_level(cls_logits, reg_logits, kpt_logits, stride, score_thresh,
 
     boxes = dfl_decode(reg_logits, stride)
     kpts = decode_keypoints(kpt_logits, stride)
+    if attr_logits is not None:
+        attrs_all = sigmoid(np.transpose(attr_logits[0], (1, 2, 0)).reshape(-1, attr_logits.shape[1]))
+        attrs = attrs_all[keep].astype(np.float32)
+    else:
+        attrs = np.zeros((len(keep), 4), dtype=np.float32)
     return {
         "boxes": boxes[keep],
         "scores": selected_scores.astype(np.float32),
         "classes": np.zeros(len(keep), dtype=np.int32),
         "kpts": kpts[keep].astype(np.float32),
+        "attrs": attrs,
     }
 
 
@@ -158,6 +167,7 @@ def concat_preds(parts):
         "scores": np.concatenate([p["scores"] for p in non_empty], axis=0),
         "classes": np.concatenate([p["classes"] for p in non_empty], axis=0),
         "kpts": np.concatenate([p["kpts"] for p in non_empty], axis=0),
+        "attrs": np.concatenate([p["attrs"] for p in non_empty], axis=0),
     }
 
 
@@ -217,23 +227,81 @@ def iter_images(path):
             yield item
 
 
-def sample_attrs_for_boxes(attr_maps, boxes, strides=(8, 16, 32), num_attrs=4):
+def _attr_level_for_box(box, strides):
+    wh = np.maximum(0.0, box[2:] - box[:2])
+    max_side = float(wh.max()) if wh.size else 0.0
+    level = 0
+    if max_side >= strides[1] * 8:
+        level = 2
+    elif max_side >= strides[0] * 8:
+        level = 1
+    return level
+
+
+def _sample_attr_point(feat, box, stride, rel_x, rel_y):
+    _, h, w = feat.shape
+    x = box[0] + (box[2] - box[0]) * rel_x
+    y = box[1] + (box[3] - box[1]) * rel_y
+    gx = int(np.clip(x / stride, 0, w - 1))
+    gy = int(np.clip(y / stride, 0, h - 1))
+    return feat[:, gy, gx]
+
+
+def _sample_attr_roi(feat, box, stride, upper_only=False):
+    _, h, w = feat.shape
+    x1, y1, x2, y2 = box.astype(np.float32)
+    if upper_only:
+        y2 = y1 + (y2 - y1) * 0.55
+    gx1 = int(np.clip(np.floor(x1 / stride), 0, w - 1))
+    gy1 = int(np.clip(np.floor(y1 / stride), 0, h - 1))
+    gx2 = int(np.clip(np.ceil(x2 / stride), gx1 + 1, w))
+    gy2 = int(np.clip(np.ceil(y2 / stride), gy1 + 1, h))
+    return feat[:, gy1:gy2, gx1:gx2].reshape(feat.shape[0], -1)
+
+
+def sample_attrs_for_boxes(attr_maps, boxes, strides=(8, 16, 32), num_attrs=4,
+                           mode="center"):
     if len(boxes) == 0:
         return np.zeros((0, num_attrs), dtype=np.float32)
     centers = (boxes[:, :2] + boxes[:, 2:]) * 0.5
-    max_side = np.maximum(0.0, boxes[:, 2:] - boxes[:, :2]).max(axis=1)
     attrs = []
     for i, box in enumerate(boxes):
-        level = 0
-        if max_side[i] >= strides[1] * 8:
-            level = 2
-        elif max_side[i] >= strides[0] * 8:
-            level = 1
+        level = _attr_level_for_box(box, strides)
         feat = attr_maps[level][0]
-        _, h, w = feat.shape
-        gx = int(np.clip(centers[i, 0] / strides[level], 0, w - 1))
-        gy = int(np.clip(centers[i, 1] / strides[level], 0, h - 1))
-        attrs.append(sigmoid(feat[:, gy, gx]))
+        stride = strides[level]
+
+        if mode == "center":
+            _, h, w = feat.shape
+            gx = int(np.clip(centers[i, 0] / stride, 0, w - 1))
+            gy = int(np.clip(centers[i, 1] / stride, 0, h - 1))
+            logits = feat[:, gy, gx]
+        elif mode in ("points-mean", "points-max"):
+            # Probe likely evidence regions: head/face, upper-left/right hands,
+            # upper torso, center, and lower body for falling-like postures.
+            rel_points = (
+                (0.50, 0.18),
+                (0.35, 0.22),
+                (0.65, 0.22),
+                (0.22, 0.36),
+                (0.78, 0.36),
+                (0.50, 0.36),
+                (0.50, 0.50),
+                (0.35, 0.65),
+                (0.65, 0.65),
+            )
+            point_logits = np.stack([
+                _sample_attr_point(feat, box, stride, rx, ry)
+                for rx, ry in rel_points
+            ], axis=0)
+            logits = point_logits.mean(axis=0) if mode == "points-mean" else point_logits.max(axis=0)
+        elif mode in ("box-mean", "box-max", "upper-box-mean", "upper-box-max"):
+            roi = _sample_attr_roi(feat, box, stride, upper_only=mode.startswith("upper"))
+            logits = roi.mean(axis=1) if mode.endswith("mean") else roi.max(axis=1)
+        else:
+            raise ValueError(
+                "attr sampling mode must be one of: center, points-mean, "
+                "points-max, box-mean, box-max, upper-box-mean, upper-box-max")
+        attrs.append(sigmoid(logits))
     return np.stack(attrs).astype(np.float32) if attrs else np.zeros((0, num_attrs), dtype=np.float32)
 
 
@@ -249,8 +317,8 @@ def draw_label(canvas, text, x, y, color, scale=0.55, thickness=2):
 def draw_predictions(frame, pred, attr_names, conf, person_conf, domain_conf,
                      kpt_conf, attr_conf, show_all_attrs):
     canvas = frame.copy()
-    class_names = {0: "person", 1: "fire", 2: "water"}
-    colors = {0: (0, 185, 255), 1: (40, 70, 255), 2: (255, 160, 30)}
+    class_names = {0: "person", 1: "puddle", 2: "fire", 3: "smoke", 4: "other"}
+    colors = {0: (0, 185, 255), 1: (255, 160, 30), 2: (40, 70, 255), 3: (160, 160, 160), 4: (80, 220, 80)}
 
     for box, score, cls_id, kpts, attrs in zip(
             pred["boxes"], pred["scores"], pred["classes"], pred["kpts"], pred["attrs"]):
@@ -292,8 +360,10 @@ def draw_predictions(frame, pred, attr_names, conf, person_conf, domain_conf,
     return canvas
 
 
-def decode_domain_attr_outputs(outputs, score_thresh=0.25, iou_thresh=0.6, max_det=300):
-    names = [
+def decode_domain_attr_outputs(outputs, score_thresh=0.25, iou_thresh=0.6,
+                               max_det=300, attr_sampling="center",
+                               output_names=None):
+    default_names = [
         "domain_cls_s8", "domain_reg_s8",
         "domain_cls_s16", "domain_reg_s16",
         "domain_cls_s32", "domain_reg_s32",
@@ -302,7 +372,9 @@ def decode_domain_attr_outputs(outputs, score_thresh=0.25, iou_thresh=0.6, max_d
         "pose_cls_s32", "pose_reg_s32", "pose_kpt_s32",
         "attr_s8", "attr_s16", "attr_s32",
     ]
+    names = list(output_names or default_names)
     out = dict(zip(names, outputs))
+    pose_attr_aligned = all(f"pose_attr_s{stride}" in out for stride in (8, 16, 32))
     domain_parts = []
     pose_parts = []
     for stride in (8, 16, 32):
@@ -319,14 +391,25 @@ def decode_domain_attr_outputs(outputs, score_thresh=0.25, iou_thresh=0.6, max_d
             out[f"pose_kpt_s{stride}"],
             stride,
             score_thresh,
+            attr_logits=out.get(f"pose_attr_s{stride}"),
         ))
 
     domain = concat_preds(domain_parts)
     pose = concat_preds(pose_parts)
 
-    attr_maps = [out["attr_s8"], out["attr_s16"], out["attr_s32"]]
-    pose_attrs = sample_attrs_for_boxes(attr_maps, pose["boxes"], num_attrs=attr_maps[0].shape[1])
-    domain_attrs = np.zeros((domain["boxes"].shape[0], pose_attrs.shape[1] if len(pose_attrs) else attr_maps[0].shape[1]), dtype=np.float32)
+    if pose_attr_aligned:
+        pose_attrs = pose["attrs"]
+        num_attrs = pose_attrs.shape[1] if pose_attrs.ndim == 2 else 4
+    else:
+        attr_maps = [out["attr_s8"], out["attr_s16"], out["attr_s32"]]
+        pose_attrs = sample_attrs_for_boxes(
+            attr_maps,
+            pose["boxes"],
+            num_attrs=attr_maps[0].shape[1],
+            mode=attr_sampling,
+        )
+        num_attrs = attr_maps[0].shape[1]
+    domain_attrs = np.zeros((domain["boxes"].shape[0], num_attrs), dtype=np.float32)
 
     boxes = np.concatenate([pose["boxes"], domain["boxes"]], axis=0) if len(domain["boxes"]) or len(pose["boxes"]) else np.zeros((0, 4), dtype=np.float32)
     scores = np.concatenate([pose["scores"], domain["scores"]], axis=0) if len(domain["scores"]) or len(pose["scores"]) else np.zeros((0,), dtype=np.float32)
@@ -336,7 +419,7 @@ def decode_domain_attr_outputs(outputs, score_thresh=0.25, iou_thresh=0.6, max_d
 
     if len(scores) == 0:
         pred = empty_preds()
-        pred["attrs"] = np.zeros((0, attr_maps[0].shape[1]), dtype=np.float32)
+        pred["attrs"] = np.zeros((0, num_attrs), dtype=np.float32)
         return pred
 
     class_keep = []
@@ -370,7 +453,7 @@ def predictions_to_jsonable(pred, attr_names):
             pred["boxes"], pred["scores"], pred["classes"], pred["kpts"], pred["attrs"]):
         item = {
             "class_id": int(cls_id),
-            "class_name": {0: "person", 1: "fire", 2: "water"}.get(int(cls_id), str(cls_id)),
+            "class_name": {0: "person", 1: "puddle", 2: "fire", 3: "smoke", 4: "other"}.get(int(cls_id), str(cls_id)),
             "score": float(score),
             "box_xyxy": [float(x) for x in box],
         }
@@ -392,6 +475,19 @@ def parse_args():
     parser.add_argument("--person-conf", type=float, default=0.5)
     parser.add_argument("--domain-conf", type=float, default=0.25)
     parser.add_argument("--attr-conf", type=float, default=0.5)
+    parser.add_argument(
+        "--attr-sampling",
+        default="center",
+        choices=[
+            "center",
+            "points-mean",
+            "points-max",
+            "box-mean",
+            "box-max",
+            "upper-box-mean",
+            "upper-box-max",
+        ],
+        help="How to sample attribute logits from the attr feature maps")
     parser.add_argument("--iou", type=float, default=0.6)
     parser.add_argument("--max-det", type=int, default=300)
     parser.add_argument("--kpt-conf", type=float, default=0.25)
@@ -434,11 +530,14 @@ def main():
             raise RuntimeError(f"Cannot read image: {image_path}")
         inp, scale, pad = preprocess(image_bgr, args.imgsz)
         outputs = session.run(None, {input_name: inp})
+        output_names = [item.name for item in session.get_outputs()]
         pred = decode_domain_attr_outputs(
             outputs,
             score_thresh=args.conf,
             iou_thresh=args.iou,
             max_det=args.max_det,
+            attr_sampling=args.attr_sampling,
+            output_names=output_names,
         )
         pred = restore_to_original(pred, scale, pad, image_bgr.shape[:2])
         all_results[str(image_path)] = predictions_to_jsonable(pred, attr_names)
