@@ -157,6 +157,8 @@ def build_trainer(model, cfg, device, stage, save_dir):
         momentum=train_cfg.get("momentum", 0.937),
         weight_decay=train_cfg.get("weight_decay", 0.0005),
         nesterov=train_cfg.get("nesterov", True),
+        backbone_lr=stage.get("backbone_lr", train_cfg.get("backbone_lr", None)),
+        backbone_lr_mult=stage.get("backbone_lr_mult", train_cfg.get("backbone_lr_mult", 1.0)),
         param_groups=train_cfg.get("param_groups", "yolo"),
         batch_size=train_cfg.get("batch_size", 32),
         nbs=train_cfg.get("nbs", 64),
@@ -313,4 +315,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
