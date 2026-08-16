@@ -1,0 +1,240 @@
+model: final_pose_attr
+num_kpts: 17
+reg_max: 16
+
+domain_det:
+  num_classes: 4
+  names: [puddle, fire, smoke, other]
+  class_map:
+    1: 0
+    2: 1
+    3: 2
+    4: 3
+
+pose_attr:
+  num_attrs: 4
+  names: [smoking, falling, waving, helmet_on]
+  attr_dropout: 0.1
+  action_use_kpt_logits: true
+  detach_kpt_context: true
+  appearance_context_kernel: 5
+
+neck:
+  out_channels: 256
+  use_p2_context: false
+  downsample: conv
+
+assigner:
+  topk: 10
+  alpha: 0.5
+  beta: 6.0
+  eps: 1.0e-9
+
+data:
+  input_size: 640
+  train:
+    detect:
+      root: /root/autodl-tmp/Detect
+      images: train/images
+      labels: train/labels
+    attr:
+      root: /root/autodl-tmp/Attr
+      split: train
+    pose:
+      root: /root/autodl-tmp/coco2017
+      images: train2017
+      labels: labels_person/train2017
+      class_id_format: yolo80
+
+  val:
+    detect:
+      root: /root/autodl-tmp/Detect
+      images: valid/images
+      labels: valid/labels
+    attr:
+      root: /root/autodl-tmp/Attr
+      split: val
+    pose:
+      root: /root/autodl-tmp/coco2017
+      images: val2017
+      labels: labels_person/val2017
+      class_id_format: yolo80
+
+batch_sampling:
+  mode: single_random_concat
+
+training:
+  init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_pose_best.pt
+  skip_init_prefixes: [attr_head]
+  save_dir: checkpoints/final_pose_attr_local_branch_long
+  batch_size: 32
+  workers: 16
+  optimizer: sgd
+  momentum: 0.937
+  weight_decay: 0.0005
+  nesterov: true
+  param_groups: yolo
+  nbs: 64
+  accumulate: auto
+  scale_weight_decay: true
+  amp: true
+  ema_decay: 0.9999
+  grad_clip: 10.0
+  log_interval: 50
+  save_interval: 50
+  val_interval: 1
+  early_stop_enabled: true
+  early_stop_patience: 20
+  early_stop_min_delta: 0.0
+  early_stop_start_epoch: 10
+  tensorboard: true
+  check_finite_loss: true
+
+  stages:
+    - name: new_attr_branches
+      epochs: 120
+      lr0: 0.003
+      warmup_epochs: 3
+      cos_lr: true
+      lrf: 0.1
+      train_detect: true
+      train_attr: true
+      train_pose: false
+      det_weight: 1.0
+      attr_weight: 1.0
+      pose_weight: 0.0
+      attr_person_box_weight: 0.0
+      early_stop_patience: 20
+      early_stop_start_epoch: 20
+      load_best_for_next_stage: true
+      freeze:
+        enabled: true
+        trainable_modules:
+          - domain_det_head
+          - pose_head.appearance_branches
+          - pose_head.action_branches
+
+    - name: adapter_alignment
+      epochs: 100
+      lr0: 0.0005
+      warmup_epochs: 2
+      cos_lr: true
+      lrf: 0.1
+      train_detect: true
+      train_attr: true
+      train_pose: true
+      det_weight: 1.0
+      attr_weight: 1.0
+      pose_weight: 1.0
+      attr_person_box_weight: 0.25
+      early_stop_patience: 20
+      early_stop_start_epoch: 10
+      load_best_for_next_stage: true
+      freeze:
+        enabled: true
+        trainable_modules:
+          - det_adapter
+          - pose_adapter
+          - domain_det_head
+          - pose_head.appearance_branches
+          - pose_head.action_branches
+
+    - name: neck_guarded
+      epochs: 120
+      lr0: 0.0001
+      warmup_epochs: 1
+      cos_lr: true
+      lrf: 0.3
+      val_interval: 1
+      train_detect: true
+      train_attr: true
+      train_pose: true
+      det_weight: 1.0
+      attr_weight: 1.0
+      pose_weight: 1.0
+      attr_person_box_weight: 0.25
+      early_stop_patience: 20
+      early_stop_start_epoch: 10
+      load_best_for_next_stage: true
+      freeze:
+        enabled: true
+        trainable_modules:
+          - neck
+          - det_adapter
+          - pose_adapter
+          - domain_det_head
+          - pose_head.appearance_branches
+          - pose_head.action_branches
+
+    - name: guarded_backbone
+      epochs: 60
+      lr0: 0.00002
+      warmup_epochs: 1
+      cos_lr: true
+      lrf: 0.2
+      val_interval: 1
+      train_detect: true
+      train_attr: true
+      train_pose: true
+      det_weight: 1.0
+      attr_weight: 1.0
+      pose_weight: 1.0
+      attr_person_box_weight: 0.25
+      early_stop_patience: 15
+      early_stop_start_epoch: 5
+      load_best_for_next_stage: false
+      freeze:
+        enabled: false
+
+loss:
+  w_attr: 1.0
+  attr_consistency_weight: 0.05
+  person_box_source_weights:
+    pose: 1.0
+    attr: 0.25
+  attr_pos_weight:
+    smoking: 1.0
+    falling: 1.0
+    waving: 1.0
+    helmet_on: 1.0
+
+eval:
+  enabled: false
+  batch_size: 16
+  score_thresh: 0.01
+  domain_conf: 0.25
+  person_conf: 0.25
+  attr_thresh: 0.5
+  iou_thresh: 0.6
+  match_iou: 0.5
+  max_det: 300
+  output_dir: checkpoints/final_pose_attr_local_branch_long/eval
+  coco_pose: true
+
+augmentation:
+  detect:
+    augment: true
+    hsv_h: 0.015
+    hsv_s: 0.7
+    hsv_v: 0.4
+    translate: 0.08
+    scale: 0.25
+    flip_lr: 0.5
+  attr:
+    augment: true
+    hsv_h: 0.01
+    hsv_s: 0.45
+    hsv_v: 0.3
+    translate: 0.04
+    scale: 0.08
+    flip_lr: 0.5
+  pose:
+    augment: true
+    hsv_h: 0.015
+    hsv_s: 0.5
+    hsv_v: 0.3
+    translate: 0.06
+    scale: 0.2
+    flip_lr: 0.5
+
+device: cuda
