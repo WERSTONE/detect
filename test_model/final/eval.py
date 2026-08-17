@@ -30,6 +30,9 @@ from test_model.final.data import (  # noqa: E402
     AttrDataset,
     DetectDataset,
     PoseDataset,
+    _apply_test_dataset_policy,
+    _attr_dataset_options,
+    _make_optional_dataset,
     _resolve_root,
     make_loader,
 )
@@ -38,11 +41,13 @@ from test_model.final.model import create_final_model  # noqa: E402
 DETECT_DIR_MAP = {
     "train": ("train", "train"),
     "val": ("valid", "valid"),
+    "test": ("test", "test"),
 }
 ATTR_SPLITS = ("train", "val")
 POSE_DIR_MAP = {
     "train": ("train2017", "labels/train2017"),
     "val": ("val2017", "labels/val2017"),
+    "test": ("test2017", "labels_person/test2017"),
 }
 _NO_AUG = dict(
     hsv_h=0.0, hsv_s=0.0, hsv_v=0.0, translate=0.0, scale=0.0, flip_lr=0.0
@@ -58,7 +63,7 @@ def parse_args():
     )
     p.add_argument("--weights", required=True)
     p.add_argument("--device", default="cuda")
-    p.add_argument("--split", default="val", choices=["train", "val", "all"])
+    p.add_argument("--split", default="val", choices=["train", "val", "test", "all"])
     p.add_argument("--batch", type=int, default=None)
     p.add_argument("--workers", type=int, default=None)
     p.add_argument("--input-size", type=int, default=None)
@@ -149,6 +154,7 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
     data_cfg = cfg.get("data", {}) or {}
     train_cfg = data_cfg.get("train", {}) or {}
     val_cfg = data_cfg.get("val", {}) or {}
+    split_policy = data_cfg.get("split_policy", {}) or {}
     loaders = []
 
     def _maybe_trim(ds):
@@ -168,6 +174,17 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                 det_root, img_dir, lbl_dir,
                 input_size=input_size, augment=False, **_NO_AUG,
             )
+            if key in {"train", "val"}:
+                det_test = _make_optional_dataset(
+                    DetectDataset,
+                    det_root,
+                    det_cfg.get("test_images", "test/images"),
+                    det_cfg.get("test_labels", "test/labels"),
+                    input_size=input_size,
+                    augment=False,
+                    **_NO_AUG,
+                )
+                ds = _apply_test_dataset_policy(ds, det_test, key, split_policy, salt="detect")
             ds = _maybe_trim(ds)
             loaders.append(("detect", key, make_loader(
                 ds, batch, workers, shuffle=False, drop_last=False)))
@@ -181,6 +198,7 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
             ds = AttrDataset(
                 attr_root, split=key,
                 input_size=input_size, augment=False, **_NO_AUG,
+                **_attr_dataset_options(attr_cfg, split_policy),
             )
             ds = _maybe_trim(ds)
             loaders.append(("attr", key, make_loader(
@@ -201,6 +219,18 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                 source_class_format=pose_cfg.get("class_id_format", "yolo80"),
                 augment=False, **_NO_AUG,
             )
+            if key in {"train", "val"}:
+                pose_test = _make_optional_dataset(
+                    PoseDataset,
+                    pose_root,
+                    pose_cfg.get("test_images", "test2017"),
+                    pose_cfg.get("test_labels", "labels_person/test2017"),
+                    input_size=input_size,
+                    source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+                    augment=False,
+                    **_NO_AUG,
+                )
+                ds = _apply_test_dataset_policy(ds, pose_test, key, split_policy, salt="pose")
             ds = _maybe_trim(ds)
             loaders.append(("pose", key, make_loader(
                 ds, batch, workers, shuffle=False, drop_last=False)))

@@ -10,6 +10,9 @@ from test_model.final.data import (
     FinalSequentialValLoader,
     PoseDataset,
     _NO_AUG,
+    _apply_test_dataset_policy,
+    _attr_dataset_options,
+    _make_optional_dataset,
     _merge_task_cfg,
     _resolve_root,
     make_loader,
@@ -20,6 +23,7 @@ def build_final_train_loader(cfg: dict):
     """Build the same single random ConcatDataset train loader used by final."""
     data_cfg = cfg["data"]
     train_cfg = data_cfg["train"]
+    split_policy = data_cfg.get("split_policy", {}) or {}
     workers = int(cfg["training"].get("workers", 8))
     input_size = int(data_cfg.get("input_size", 640))
     batch_size = int(cfg["training"]["batch_size"])
@@ -28,26 +32,60 @@ def build_final_train_loader(cfg: dict):
     attr_aug = cfg.get("augmentation", {}).get("attr", {})
     pose_aug = cfg.get("augmentation", {}).get("pose", {})
 
+    det_root = _resolve_root(train_cfg["detect"]["root"])
     detect_ds = DetectDataset(
-        _resolve_root(train_cfg["detect"]["root"]),
+        det_root,
         train_cfg["detect"].get("images", "train/images"),
         train_cfg["detect"].get("labels", "train/labels"),
         input_size=input_size,
         **detect_aug,
     )
+    detect_test_ds = _make_optional_dataset(
+        DetectDataset,
+        det_root,
+        train_cfg["detect"].get("test_images", "test/images"),
+        train_cfg["detect"].get("test_labels", "test/labels"),
+        input_size=input_size,
+        **detect_aug,
+    )
+    detect_ds = _apply_test_dataset_policy(
+        detect_ds,
+        detect_test_ds,
+        "train",
+        split_policy,
+        salt="detect",
+    )
     attr_ds = AttrDataset(
         _resolve_root(train_cfg["attr"]["root"]),
         split=train_cfg["attr"].get("split", "train"),
         input_size=input_size,
+        **_attr_dataset_options(train_cfg["attr"], split_policy),
         **attr_aug,
     )
+    pose_root = _resolve_root(train_cfg["pose"]["root"])
     pose_ds = PoseDataset(
-        _resolve_root(train_cfg["pose"]["root"]),
+        pose_root,
         train_cfg["pose"].get("images", "train2017"),
         train_cfg["pose"].get("labels", "labels/train2017"),
         input_size=input_size,
         source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
         **pose_aug,
+    )
+    pose_test_ds = _make_optional_dataset(
+        PoseDataset,
+        pose_root,
+        train_cfg["pose"].get("test_images", "test2017"),
+        train_cfg["pose"].get("test_labels", "labels_person/test2017"),
+        input_size=input_size,
+        source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
+        **pose_aug,
+    )
+    pose_ds = _apply_test_dataset_policy(
+        pose_ds,
+        pose_test_ds,
+        "train",
+        split_policy,
+        salt="pose",
     )
 
     combined = ConcatDataset([detect_ds, attr_ds, pose_ds])
@@ -76,6 +114,7 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     data_cfg = cfg["data"]
     train_cfg = data_cfg["train"]
     val_cfg = data_cfg.get("val", {}) or {}
+    split_policy = data_cfg.get("split_policy", {}) or {}
     input_size = int(data_cfg.get("input_size", 640))
     train_workers = int(cfg["training"].get("workers", 8))
     val_workers = max(1, train_workers // 4)
@@ -89,13 +128,29 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     det_img = det_cfg.get("images", "valid/images")
     det_lbl = det_cfg.get("labels", "valid/labels")
     if (det_root / det_img).exists() and (det_root / det_lbl).exists():
-        tasks["detect"] = DetectDataset(
+        det_base = DetectDataset(
             det_root,
             det_img,
             det_lbl,
             input_size=input_size,
             augment=False,
             **_NO_AUG,
+        )
+        det_test = _make_optional_dataset(
+            DetectDataset,
+            det_root,
+            det_cfg.get("test_images", "test/images"),
+            det_cfg.get("test_labels", "test/labels"),
+            input_size=input_size,
+            augment=False,
+            **_NO_AUG,
+        )
+        tasks["detect"] = _apply_test_dataset_policy(
+            det_base,
+            det_test,
+            "val",
+            split_policy,
+            salt="detect",
         )
         order.append("detect")
 
@@ -108,6 +163,7 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
             input_size=input_size,
             augment=False,
             **_NO_AUG,
+            **_attr_dataset_options(attr_cfg, split_policy),
         )
         order.append("attr")
 
@@ -116,7 +172,7 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     pose_img = pose_cfg.get("images", "val2017")
     pose_lbl = pose_cfg.get("labels", "labels/val2017")
     if (pose_root / pose_img).exists() and (pose_root / pose_lbl).exists():
-        tasks["pose"] = PoseDataset(
+        pose_base = PoseDataset(
             pose_root,
             pose_img,
             pose_lbl,
@@ -124,6 +180,23 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
             source_class_format=pose_cfg.get("class_id_format", "yolo80"),
             augment=False,
             **_NO_AUG,
+        )
+        pose_test = _make_optional_dataset(
+            PoseDataset,
+            pose_root,
+            pose_cfg.get("test_images", "test2017"),
+            pose_cfg.get("test_labels", "labels_person/test2017"),
+            input_size=input_size,
+            source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+            augment=False,
+            **_NO_AUG,
+        )
+        tasks["pose"] = _apply_test_dataset_policy(
+            pose_base,
+            pose_test,
+            "val",
+            split_policy,
+            salt="pose",
         )
         order.append("pose")
 

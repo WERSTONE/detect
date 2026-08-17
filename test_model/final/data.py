@@ -11,13 +11,14 @@ from __future__ import annotations
 
 import math
 import random
+import hashlib
 from dataclasses import dataclass
 from pathlib import Path
 
 import cv2
 import numpy as np
 import torch
-from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, Subset, WeightedRandomSampler
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
@@ -32,6 +33,12 @@ def _resolve_root(root: str | Path) -> Path:
 
 IMAGE_EXTS = (".jpg", ".jpeg", ".png", ".bmp", ".webp")
 ATTR_NAMES = ("smoking", "falling", "waving", "helmet_on")
+ATTR_MAIN_BY_GROUP = {
+    "smoking": "smoking",
+    "falling": "falling",
+    "waving": "waving",
+    "helmet": "helmet_on",
+}
 KPT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
 
 
@@ -39,6 +46,9 @@ KPT_FLIP_MAP = [0, 2, 1, 4, 3, 6, 5, 8, 7, 10, 9, 12, 11, 14, 13, 16, 15]
 class SampleRef:
     image: Path
     label: Path
+    group: str = ""
+    dataset: str = ""
+    vlm_label: Path | None = None
 
 
 def find_image(image_dir: Path, stem: str) -> Path | None:
@@ -47,6 +57,111 @@ def find_image(image_dir: Path, stem: str) -> Path | None:
         if path.exists():
             return path
     return None
+
+
+def _normal_split_name(split: str) -> str:
+    split = str(split or "").strip().lower()
+    if split in {"valid", "validation"}:
+        return "val"
+    return split
+
+
+def _split_policy_mode(policy: dict | None) -> str:
+    return str((policy or {}).get("mode", "keep")).strip().lower()
+
+
+def _stable_seed(seed: int, salt: str) -> int:
+    digest = hashlib.sha256(f"{int(seed)}:{salt}".encode("utf-8")).hexdigest()
+    return int(digest[:16], 16)
+
+
+def _partition_test_refs(
+    refs: list[SampleRef],
+    train_ratio: float,
+    seed: int,
+    salt: str,
+) -> tuple[list[SampleRef], list[SampleRef]]:
+    refs = list(refs)
+    rng = random.Random(_stable_seed(seed, salt))
+    rng.shuffle(refs)
+    n_train = int(round(len(refs) * float(train_ratio)))
+    n_train = max(0, min(n_train, len(refs)))
+    return refs[:n_train], refs[n_train:]
+
+
+def _partition_indices(
+    n_items: int,
+    train_ratio: float,
+    seed: int,
+    salt: str,
+) -> tuple[list[int], list[int]]:
+    indices = list(range(int(n_items)))
+    rng = random.Random(_stable_seed(seed, salt))
+    rng.shuffle(indices)
+    n_train = int(round(len(indices) * float(train_ratio)))
+    n_train = max(0, min(n_train, len(indices)))
+    return indices[:n_train], indices[n_train:]
+
+
+def _apply_test_split_policy(
+    base_refs: list[SampleRef],
+    test_refs: list[SampleRef],
+    requested_split: str,
+    policy: dict | None,
+    salt: str,
+) -> list[SampleRef]:
+    mode = _split_policy_mode(policy)
+    requested = _normal_split_name(requested_split)
+    if not test_refs or requested not in {"train", "val"}:
+        return base_refs
+    if mode in {"keep", "keep_with_eval_test", ""}:
+        return base_refs
+    if mode == "test_to_train":
+        return base_refs + test_refs if requested == "train" else base_refs
+    if mode == "test_to_val":
+        return base_refs + test_refs if requested == "val" else base_refs
+    if mode == "fold_test":
+        ratio = float(policy.get("test_train_ratio", policy.get("train_ratio", 0.8)))
+        ratio = max(0.0, min(1.0, ratio))
+        seed = int(policy.get("seed", 0))
+        train_refs, val_refs = _partition_test_refs(test_refs, ratio, seed, salt)
+        return base_refs + (train_refs if requested == "train" else val_refs)
+    raise ValueError(
+        "data.split_policy.mode must be one of: keep, keep_with_eval_test, "
+        "fold_test, test_to_train, test_to_val"
+    )
+
+
+def _apply_test_dataset_policy(
+    base_dataset: Dataset,
+    test_dataset: Dataset | None,
+    requested_split: str,
+    policy: dict | None,
+    salt: str,
+) -> Dataset:
+    mode = _split_policy_mode(policy)
+    requested = _normal_split_name(requested_split)
+    if test_dataset is None or len(test_dataset) == 0 or requested not in {"train", "val"}:
+        return base_dataset
+    if mode in {"keep", "keep_with_eval_test", ""}:
+        return base_dataset
+    if mode == "test_to_train":
+        return ConcatDataset([base_dataset, test_dataset]) if requested == "train" else base_dataset
+    if mode == "test_to_val":
+        return ConcatDataset([base_dataset, test_dataset]) if requested == "val" else base_dataset
+    if mode == "fold_test":
+        ratio = float(policy.get("test_train_ratio", policy.get("train_ratio", 0.8)))
+        ratio = max(0.0, min(1.0, ratio))
+        seed = int(policy.get("seed", 0))
+        train_indices, val_indices = _partition_indices(len(test_dataset), ratio, seed, salt)
+        indices = train_indices if requested == "train" else val_indices
+        if not indices:
+            return base_dataset
+        return ConcatDataset([base_dataset, Subset(test_dataset, indices)])
+    raise ValueError(
+        "data.split_policy.mode must be one of: keep, keep_with_eval_test, "
+        "fold_test, test_to_train, test_to_val"
+    )
 
 
 def yolo_xywh_to_xyxy(parts: list[str], width: int, height: int) -> list[float]:
@@ -306,25 +421,158 @@ class DetectDataset(FinalBaseDataset):
 
 
 class AttrDataset(FinalBaseDataset):
-    def __init__(self, root: str | Path, split: str, **kwargs):
+    def __init__(
+        self,
+        root: str | Path,
+        split: str,
+        vlm_label_dirname: str | None = None,
+        mix_vlm_non_main_attrs: bool = False,
+        vlm_missing_policy: str = "error",
+        split_policy: dict | None = None,
+        **kwargs,
+    ):
         self.split = split
         root = Path(root)
+        self.vlm_label_dirname = str(vlm_label_dirname or "").strip()
+        self.mix_vlm_non_main_attrs = bool(mix_vlm_non_main_attrs)
+        self.vlm_missing_policy = str(vlm_missing_policy or "error").strip().lower()
+        self.split_policy = dict(split_policy or {})
+        if self.vlm_missing_policy not in {"error", "zero_mask", "original"}:
+            raise ValueError(
+                "vlm_missing_policy must be one of: error, zero_mask, original"
+            )
         refs: list[SampleRef] = []
+        vlm_missing = 0
+        vlm_expected = 0
+
+        def collect_dataset_split(ds_dir: Path, group_name: str, split_name: str) -> list[SampleRef]:
+            out: list[SampleRef] = []
+            label_dir = ds_dir / "labels" / split_name
+            image_dir = ds_dir / "images" / split_name
+            if not label_dir.exists() or not image_dir.exists():
+                return out
+            for label in sorted(label_dir.glob("*.txt")):
+                image = find_image(image_dir, label.stem)
+                if image is None:
+                    continue
+                vlm_label = None
+                if self.vlm_label_dirname:
+                    vlm_label = ds_dir / self.vlm_label_dirname / split_name / label.name
+                out.append(
+                    SampleRef(
+                        image=image,
+                        label=label,
+                        group=group_name,
+                        dataset=ds_dir.name,
+                        vlm_label=vlm_label,
+                    )
+                )
+            return out
+
         for group_dir in sorted(p for p in root.iterdir() if p.is_dir()):
             for ds_dir in sorted(p for p in group_dir.iterdir() if p.is_dir()):
-                label_dir = ds_dir / "labels" / split
-                image_dir = ds_dir / "images" / split
-                if not label_dir.exists() or not image_dir.exists():
-                    continue
-                for label in sorted(label_dir.glob("*.txt")):
-                    image = find_image(image_dir, label.stem)
-                    if image is not None:
-                        refs.append(SampleRef(image=image, label=label))
+                base_refs = collect_dataset_split(ds_dir, group_dir.name, split)
+                test_refs = collect_dataset_split(ds_dir, group_dir.name, "test")
+                refs.extend(
+                    _apply_test_split_policy(
+                        base_refs,
+                        test_refs,
+                        split,
+                        self.split_policy,
+                        salt=f"attr/{group_dir.name}/{ds_dir.name}",
+                    )
+                )
+        if self.vlm_label_dirname:
+            for ref in refs:
+                if ref.vlm_label is not None:
+                    vlm_expected += 1
+                    if not ref.vlm_label.exists():
+                        vlm_missing += 1
+        if self.mix_vlm_non_main_attrs and not self.vlm_label_dirname:
+            raise ValueError("mix_vlm_non_main_attrs requires vlm_label_dirname")
+        if self.mix_vlm_non_main_attrs and self.vlm_missing_policy == "error" and vlm_missing:
+            raise FileNotFoundError(
+                f"Missing {vlm_missing}/{vlm_expected} VLM label files for Attr split={split} "
+                f"under dirname={self.vlm_label_dirname}"
+            )
+        self._vlm_missing = vlm_missing
+        self._vlm_expected = vlm_expected
         self._precollected_refs = refs
         super().__init__(root=root, image_dir=".", label_dir=".", task="attr", **kwargs)
+        if self.mix_vlm_non_main_attrs:
+            print(
+                "AttrDataset VLM mix: "
+                f"split={split} vlm_dir={self.vlm_label_dirname} "
+                f"missing={self._vlm_missing}/{self._vlm_expected} "
+                f"policy={self.vlm_missing_policy} split_policy={_split_policy_mode(self.split_policy)}"
+            )
 
     def _collect_samples(self) -> list[SampleRef]:
         return list(getattr(self, "_precollected_refs", []))
+
+    def _main_attr_idx(self, ref: SampleRef) -> int | None:
+        name = ATTR_MAIN_BY_GROUP.get(ref.group)
+        if name is None:
+            return None
+        return ATTR_NAMES.index(name)
+
+    def _read_attr_rows(self, label_path: Path) -> list[list[str]]:
+        rows: list[list[str]] = []
+        for line in label_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            parts = line.split()
+            if len(parts) == 13:
+                rows.append(parts)
+        return rows
+
+    def _handle_missing_vlm_rows(
+        self,
+        ref: SampleRef,
+        original_rows: list[list[str]],
+        reason: str,
+    ) -> list[list[str]]:
+        if self.vlm_missing_policy == "error":
+            raise FileNotFoundError(
+                f"{reason}: original={ref.label} vlm={ref.vlm_label}"
+            )
+        if self.vlm_missing_policy == "original":
+            return original_rows
+        main_idx = self._main_attr_idx(ref)
+        merged_rows: list[list[str]] = []
+        for row in original_rows:
+            merged = list(row)
+            for attr_idx in range(len(ATTR_NAMES)):
+                if attr_idx != main_idx:
+                    merged[5 + attr_idx] = "0"
+                    merged[9 + attr_idx] = "0"
+            merged_rows.append(merged)
+        return merged_rows
+
+    def _mixed_attr_rows(self, ref: SampleRef) -> list[list[str]]:
+        original_rows = self._read_attr_rows(ref.label)
+        if not self.mix_vlm_non_main_attrs:
+            return original_rows
+        main_idx = self._main_attr_idx(ref)
+        if main_idx is None:
+            return original_rows
+        if ref.vlm_label is None or not ref.vlm_label.exists():
+            return self._handle_missing_vlm_rows(ref, original_rows, "Missing VLM label")
+        vlm_rows = self._read_attr_rows(ref.vlm_label)
+        if len(vlm_rows) != len(original_rows):
+            return self._handle_missing_vlm_rows(
+                ref,
+                original_rows,
+                f"VLM row count mismatch original={len(original_rows)} vlm={len(vlm_rows)}",
+            )
+        mixed_rows: list[list[str]] = []
+        for original, vlm in zip(original_rows, vlm_rows):
+            merged = list(original)
+            for attr_idx in range(len(ATTR_NAMES)):
+                if attr_idx == main_idx:
+                    continue
+                merged[5 + attr_idx] = vlm[5 + attr_idx]
+                merged[9 + attr_idx] = vlm[9 + attr_idx]
+            mixed_rows.append(merged)
+        return mixed_rows
 
     def sampler_weights(self, target_attrs: tuple[str, ...] = ATTR_NAMES) -> list[float]:
         attr_to_idx = {name: idx for idx, name in enumerate(ATTR_NAMES)}
@@ -332,10 +580,7 @@ class AttrDataset(FinalBaseDataset):
         sample_keys: list[list[tuple[str, str]]] = []
         for ref in self.samples:
             keys: list[tuple[str, str]] = []
-            for line in ref.label.read_text(encoding="utf-8", errors="ignore").splitlines():
-                parts = line.split()
-                if len(parts) != 13:
-                    continue
+            for parts in self._mixed_attr_rows(ref):
                 for name in target_attrs:
                     idx = attr_to_idx[name]
                     value = float(parts[5 + idx])
@@ -360,10 +605,7 @@ class AttrDataset(FinalBaseDataset):
         image = self._load_image(ref.image)
         h, w = image.shape[:2]
         boxes, classes, attrs, attr_mask = [], [], [], []
-        for line in ref.label.read_text(encoding="utf-8", errors="ignore").splitlines():
-            parts = line.split()
-            if len(parts) != 13:
-                continue
+        for parts in self._mixed_attr_rows(ref):
             boxes.append(yolo_xywh_to_xyxy(parts[1:5], w, h))
             classes.append(0)
             attrs.append([float(x) for x in parts[5:9]])
@@ -558,6 +800,7 @@ def build_final_train_loader(cfg: dict):
     """
     data_cfg = cfg["data"]
     train_cfg = data_cfg["train"]
+    split_policy = data_cfg.get("split_policy", {}) or {}
     workers = int(cfg["training"].get("workers", 8))
     input_size = int(data_cfg.get("input_size", 640))
     batch_size = int(cfg["training"]["batch_size"])
@@ -566,26 +809,60 @@ def build_final_train_loader(cfg: dict):
     attr_aug = cfg.get("augmentation", {}).get("attr", {})
     pose_aug = cfg.get("augmentation", {}).get("pose", {})
 
+    det_root = _resolve_root(train_cfg["detect"]["root"])
     detect_ds = DetectDataset(
-        _resolve_root(train_cfg["detect"]["root"]),
+        det_root,
         train_cfg["detect"].get("images", "train/images"),
         train_cfg["detect"].get("labels", "train/labels"),
         input_size=input_size,
         **detect_aug,
     )
+    detect_test_ds = _make_optional_dataset(
+        DetectDataset,
+        det_root,
+        train_cfg["detect"].get("test_images", "test/images"),
+        train_cfg["detect"].get("test_labels", "test/labels"),
+        input_size=input_size,
+        **detect_aug,
+    )
+    detect_ds = _apply_test_dataset_policy(
+        detect_ds,
+        detect_test_ds,
+        "train",
+        split_policy,
+        salt="detect",
+    )
     attr_ds = AttrDataset(
         _resolve_root(train_cfg["attr"]["root"]),
         split=train_cfg["attr"].get("split", "train"),
         input_size=input_size,
+        **_attr_dataset_options(train_cfg["attr"], split_policy),
         **attr_aug,
     )
+    pose_root = _resolve_root(train_cfg["pose"]["root"])
     pose_ds = PoseDataset(
-        _resolve_root(train_cfg["pose"]["root"]),
+        pose_root,
         train_cfg["pose"].get("images", "train2017"),
         train_cfg["pose"].get("labels", "labels/train2017"),
         input_size=input_size,
         source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
         **pose_aug,
+    )
+    pose_test_ds = _make_optional_dataset(
+        PoseDataset,
+        pose_root,
+        train_cfg["pose"].get("test_images", "test2017"),
+        train_cfg["pose"].get("test_labels", "labels_person/test2017"),
+        input_size=input_size,
+        source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
+        **pose_aug,
+    )
+    pose_ds = _apply_test_dataset_policy(
+        pose_ds,
+        pose_test_ds,
+        "train",
+        split_policy,
+        salt="pose",
     )
 
     combined = ConcatDataset([detect_ds, attr_ds, pose_ds])
@@ -615,6 +892,24 @@ def _merge_task_cfg(train_cfg: dict, val_cfg: dict) -> dict:
     return merged
 
 
+def _attr_dataset_options(attr_cfg: dict, split_policy: dict | None = None) -> dict:
+    keys = ("vlm_label_dirname", "mix_vlm_non_main_attrs", "vlm_missing_policy", "split_policy")
+    options = {key: attr_cfg[key] for key in keys if key in attr_cfg}
+    if split_policy is not None and "split_policy" not in options:
+        options["split_policy"] = split_policy
+    return options
+
+
+def _make_optional_dataset(dataset_cls, root: Path, image_dir: str, label_dir: str, **kwargs):
+    if not (root / image_dir).exists() or not (root / label_dir).exists():
+        return None
+    try:
+        return dataset_cls(root, image_dir, label_dir, **kwargs)
+    except RuntimeError:
+        return None
+    return {key: attr_cfg[key] for key in keys if key in attr_cfg}
+
+
 def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     """Build validation loaders from data.val sections.
 
@@ -626,6 +921,7 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     data_cfg = cfg["data"]
     train_cfg = data_cfg["train"]
     val_cfg = data_cfg.get("val", {}) or {}
+    split_policy = data_cfg.get("split_policy", {}) or {}
     input_size = int(data_cfg.get("input_size", 640))
     train_workers = int(cfg["training"].get("workers", 8))
     val_workers = max(1, train_workers // 4)
@@ -639,9 +935,25 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     det_img = det_cfg.get("images", "valid/images")
     det_lbl = det_cfg.get("labels", "valid/labels")
     if (det_root / det_img).exists() and (det_root / det_lbl).exists():
-        tasks["detect"] = DetectDataset(
+        det_base = DetectDataset(
             det_root, det_img, det_lbl,
             input_size=input_size, augment=False, **_NO_AUG,
+        )
+        det_test = _make_optional_dataset(
+            DetectDataset,
+            det_root,
+            det_cfg.get("test_images", "test/images"),
+            det_cfg.get("test_labels", "test/labels"),
+            input_size=input_size,
+            augment=False,
+            **_NO_AUG,
+        )
+        tasks["detect"] = _apply_test_dataset_policy(
+            det_base,
+            det_test,
+            "val",
+            split_policy,
+            salt="detect",
         )
         ratio_names.append("detect")
 
@@ -651,6 +963,7 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
             _resolve_root(attr_cfg.get("root", "")),
             split=attr_cfg.get("split", "val"),
             input_size=input_size, augment=False, **_NO_AUG,
+            **_attr_dataset_options(attr_cfg, split_policy),
         )
         ratio_names.append("attr")
 
@@ -659,11 +972,28 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
     pose_img = pose_cfg.get("images", "val2017")
     pose_lbl = pose_cfg.get("labels", "labels/val2017")
     if (pose_root / pose_img).exists() and (pose_root / pose_lbl).exists():
-        tasks["pose"] = PoseDataset(
+        pose_base = PoseDataset(
             pose_root, pose_img, pose_lbl,
             input_size=input_size,
             source_class_format=pose_cfg.get("class_id_format", "yolo80"),
             augment=False, **_NO_AUG,
+        )
+        pose_test = _make_optional_dataset(
+            PoseDataset,
+            pose_root,
+            pose_cfg.get("test_images", "test2017"),
+            pose_cfg.get("test_labels", "labels_person/test2017"),
+            input_size=input_size,
+            source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+            augment=False,
+            **_NO_AUG,
+        )
+        tasks["pose"] = _apply_test_dataset_policy(
+            pose_base,
+            pose_test,
+            "val",
+            split_policy,
+            salt="pose",
         )
         ratio_names.append("pose")
 
