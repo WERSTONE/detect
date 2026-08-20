@@ -325,11 +325,10 @@ class FinalBaseDataset(Dataset):
             return image
         gains = np.random.uniform(-1, 1, 3) * [self.hsv_h, self.hsv_s, self.hsv_v] + 1
         hue, sat, val = cv2.split(cv2.cvtColor(image, cv2.COLOR_RGB2HSV))
-        dtype = image.dtype
         x = np.arange(0, 256, dtype=gains.dtype)
-        lut_hue = ((x * gains[0]) % 180).astype(dtype)
-        lut_sat = np.clip(x * gains[1], 0, 255).astype(dtype)
-        lut_val = np.clip(x * gains[2], 0, 255).astype(dtype)
+        lut_hue = np.asarray((x * gains[0]) % 180, dtype=np.uint8)
+        lut_sat = np.asarray(np.clip(x * gains[1], 0, 255), dtype=np.uint8)
+        lut_val = np.asarray(np.clip(x * gains[2], 0, 255), dtype=np.uint8)
         return cv2.cvtColor(
             cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val))),
             cv2.COLOR_HSV2RGB,

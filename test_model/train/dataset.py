@@ -841,11 +841,10 @@ class COCOMultiTaskDataset(Dataset):
         """HSV color augmentation."""
         r = np.random.uniform(-1, 1, 3) * [hgain, sgain, vgain] + 1
         hue, sat, val = cv2.split(cv2.cvtColor(img, cv2.COLOR_RGB2HSV))
-        dtype = img.dtype
         x = np.arange(0, 256, dtype=r.dtype)
-        lut_hue = ((x * r[0]) % 180).astype(dtype)
-        lut_sat = np.clip(x * r[1], 0, 255).astype(dtype)
-        lut_val = np.clip(x * r[2], 0, 255).astype(dtype)
+        lut_hue = np.asarray((x * r[0]) % 180, dtype=np.uint8)
+        lut_sat = np.asarray(np.clip(x * r[1], 0, 255), dtype=np.uint8)
+        lut_val = np.asarray(np.clip(x * r[2], 0, 255), dtype=np.uint8)
         img_hsv = cv2.merge((cv2.LUT(hue, lut_hue), cv2.LUT(sat, lut_sat), cv2.LUT(val, lut_val)))
         return cv2.cvtColor(img_hsv, cv2.COLOR_HSV2RGB)
 
