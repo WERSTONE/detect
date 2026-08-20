@@ -17,7 +17,7 @@ pose_attr:
   attr_dropout: 0.05
   action_use_kpt_logits: true
   detach_kpt_context: true
-  appearance_source: person_cls_tower
+  appearance_source: person_cls_logits
 
 neck:
   out_channels: 256
@@ -80,7 +80,7 @@ batch_sampling:
 
 training:
   init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_pose_best.pt
-  skip_init_prefixes: [attr_head, pose_head.cls_attr_preds]
+  skip_init_prefixes: [attr_head]
   save_dir: checkpoints/final_pose_attr_cls_branch_vlm_mix
   batch_size: 32
   workers: 16
@@ -115,10 +115,10 @@ training:
       val_interval: 10
       train_detect: true
       train_attr: true
-      train_pose: false
+      train_pose: true
       det_weight: 1.0
       attr_weight: 3.0
-      pose_weight: 0.0
+      pose_weight: 1.0
       attr_person_box_weight: 0.0
       early_stop_enabled: false
       load_best_for_next_stage: true
@@ -127,7 +127,6 @@ training:
         trainable_modules:
           - domain_det_head
           - pose_head.detect.cls_branches
-          - pose_head.cls_attr_preds
           - pose_head.action_branches
 
     - name: adapter_alignment
@@ -153,7 +152,6 @@ training:
           - pose_adapter
           - domain_det_head
           - pose_head.detect.cls_branches
-          - pose_head.cls_attr_preds
           - pose_head.action_branches
 
     - name: neck_guarded
@@ -181,7 +179,6 @@ training:
           - pose_adapter
           - domain_det_head
           - pose_head.detect.cls_branches
-          - pose_head.cls_attr_preds
           - pose_head.action_branches
 
     - name: guarded_backbone

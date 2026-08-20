@@ -4,8 +4,8 @@ This model keeps domain detection separate, but attaches person attributes to
 the pose anchors. A person prediction therefore carries box, keypoints, and
 attributes from the same feature-map location through NMS.
 
-In this variant, smoking and helmet_on are predicted from the person
-classification tower feature instead of a standalone appearance branch.
+In this variant, smoking and helmet_on are appended to the final person
+classification logits, following YOLO-DPAR's Detect.cv3 layout.
 """
 
 from __future__ import annotations
@@ -28,17 +28,6 @@ from test_model.final.model.loss import (
     _dfl_loss_per_anchor,
 )
 from test_model.final.model.neck import BiFPN
-
-
-class ClsAttrBranch(nn.Module):
-    """Predict appearance attributes from the person classification feature."""
-
-    def __init__(self, in_ch, out_ch=2):
-        super().__init__()
-        self.pred = nn.Conv2d(in_ch, out_ch, 1)
-
-    def forward(self, x):
-        return self.pred(x)
 
 
 class YOLOLikePoseAttrHead(nn.Module):
@@ -70,6 +59,13 @@ class YOLOLikePoseAttrHead(nn.Module):
             strides=strides,
             img_size=img_size,
         )
+        self.cls_attr_nc = 2
+        for cls_branch, stride in zip(self.detect.cls_branches, self.detect.strides):
+            old_pred = cls_branch[-1]
+            cls_branch[-1] = nn.Conv2d(old_pred.in_channels, 1 + self.cls_attr_nc, 1)
+            nn.init.normal_(cls_branch[-1].weight, 0.0, 0.01)
+            cls_branch[-1].bias.data[0] = math.log(5 / (self.detect.img_size / stride) ** 2)
+            cls_branch[-1].bias.data[1:] = CLS_BIAS_INIT
 
         c4 = max(self.channels[0] // 4, self.kpt_dim)
         self.kpt_branches = nn.ModuleList(
@@ -81,10 +77,8 @@ class YOLOLikePoseAttrHead(nn.Module):
             for ch in self.channels
         )
 
-        cls_attr_ch = max(self.channels[0], 1)
         action_mid = max(self.channels[0] // 2, 96)
         self.attr_dropout = nn.Dropout2d(float(attr_dropout)) if attr_dropout > 0 else nn.Identity()
-        self.cls_attr_preds = nn.ModuleList(ClsAttrBranch(cls_attr_ch, out_ch=2) for _ in self.channels)
         self.action_branches = nn.ModuleList(
             nn.Sequential(
                 Conv(ch + self.kpt_dim, action_mid, 3),
@@ -99,31 +93,27 @@ class YOLOLikePoseAttrHead(nn.Module):
         for branch in self.kpt_branches:
             nn.init.normal_(branch[-1].weight, 0.0, 0.01)
             nn.init.constant_(branch[-1].bias, 0.0)
-        for branch in self.cls_attr_preds:
-            nn.init.normal_(branch.pred.weight, 0.0, 0.01)
-            nn.init.constant_(branch.pred.bias, CLS_BIAS_INIT)
         for branch in self.action_branches:
             nn.init.normal_(branch[-1].weight, 0.0, 0.01)
             nn.init.constant_(branch[-1].bias, CLS_BIAS_INIT)
 
     def forward(self, features):
         outs = {"cls": [], "reg": []}
-        cls_features = []
+        cls_attrs = []
         for feat, reg_branch, cls_branch in zip(
             features,
             self.detect.reg_branches,
             self.detect.cls_branches,
         ):
-            cls_feat = cls_branch[1](cls_branch[0](feat))
-            cls_features.append(cls_feat)
             outs["reg"].append(reg_branch(feat))
-            outs["cls"].append(cls_branch[-1](cls_feat))
+            cls_out = cls_branch(feat)
+            outs["cls"].append(cls_out[:, :1])
+            cls_attrs.append(cls_out[:, 1 : 1 + self.cls_attr_nc])
         kpts = [branch(feat) for branch, feat in zip(self.kpt_branches, features)]
         attrs = []
-        for feat, cls_feat, kpt, cls_attr_pred, action_branch in zip(
-            features, cls_features, kpts, self.cls_attr_preds, self.action_branches
+        for feat, cls_attr, kpt, action_branch in zip(
+            features, cls_attrs, kpts, self.action_branches
         ):
-            cls_attr = cls_attr_pred(self.attr_dropout(cls_feat))
             action_feat = torch.cat([feat, kpt.detach()], dim=1)
             action = action_branch(self.attr_dropout(action_feat))
             # Attribute order is fixed: smoking, falling, waving, helmet_on.
