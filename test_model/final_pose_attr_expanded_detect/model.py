@@ -625,6 +625,16 @@ class DomainPoseAttrBiFPN(nn.Module):
                 if 0 <= dst < self.domain_num_classes:
                     keep_boxes.append(boxes[idx])
                     keep_classes.append(dst)
+            class_mask = gt.get("domain_valid_mask")
+            if class_mask is None:
+                class_mask = torch.ones(self.domain_num_classes, device=device)
+            else:
+                class_mask = class_mask.to(device, non_blocking=True).float().flatten()
+                if len(class_mask) != self.domain_num_classes:
+                    raise ValueError(
+                        f"domain_valid_mask length={len(class_mask)} does not match "
+                        f"domain_num_classes={self.domain_num_classes}"
+                    )
             mapped.append({
                 "boxes": torch.stack(keep_boxes) if keep_boxes else torch.zeros((0, 4), device=device),
                 "classes": (
@@ -633,6 +643,7 @@ class DomainPoseAttrBiFPN(nn.Module):
                     else torch.zeros((0,), device=device, dtype=torch.long)
                 ),
                 "kpts": torch.zeros((len(keep_boxes), 17, 3), device=device),
+                "class_valid_mask": class_mask,
             })
         return mapped
 

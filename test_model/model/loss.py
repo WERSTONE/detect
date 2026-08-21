@@ -362,7 +362,27 @@ class YOLODetectionLoss(nn.Module):
         )
         target_scores_sum = torch.clamp(target_scores.sum(), min=1.0)
 
-        loss_cls = self.bce(pred_scores.float(), target_scores.to(dtype).float()).sum() / target_scores_sum
+        raw_cls = self.bce(pred_scores.float(), target_scores.to(dtype).float())
+        valid_masks = []
+        for gt in gt_dict_list:
+            mask = gt.get("class_valid_mask")
+            if mask is None:
+                mask = torch.ones(self.num_classes, device=device, dtype=raw_cls.dtype)
+            else:
+                mask = mask.to(device=device, dtype=raw_cls.dtype).flatten()
+                if len(mask) != self.num_classes:
+                    raise ValueError(
+                        f"class_valid_mask length={len(mask)} does not match "
+                        f"num_classes={self.num_classes}"
+                    )
+            valid_masks.append(mask)
+        if valid_masks:
+            valid = torch.stack(valid_masks, dim=0)[:, None, :]
+            # Keep the expected cls-loss scale comparable when a source defines
+            # fewer than all output classes; invalid channels contribute no BCE.
+            scale = self.num_classes / valid.sum(dim=-1, keepdim=True).clamp(min=1.0)
+            raw_cls = raw_cls * valid * scale
+        loss_cls = raw_cls.sum() / target_scores_sum
         loss_box = torch.zeros((), device=device)
         loss_dfl = torch.zeros((), device=device)
 

@@ -2,21 +2,169 @@
 
 from __future__ import annotations
 
-from torch.utils.data import ConcatDataset, Dataset
+import json
+from pathlib import Path
+
+import torch
+from torch.utils.data import ConcatDataset, DataLoader, Dataset, WeightedRandomSampler
 
 from test_model.final.data import (
-    AttrDataset,
-    DetectDataset,
+    DetectDataset as BaseDetectDataset,
     FinalSequentialValLoader,
-    PoseDataset,
+    AttrDataset as BaseAttrDataset,
+    PoseDataset as BasePoseDataset,
     _NO_AUG,
     _apply_test_dataset_policy,
     _attr_dataset_options,
     _make_optional_dataset,
     _merge_task_cfg,
     _resolve_root,
-    make_loader,
 )
+
+
+def _class_mask(class_ids, num_classes=7):
+    mask = torch.zeros(int(num_classes), dtype=torch.float32)
+    for class_id in class_ids or ():
+        index = int(class_id) - 1
+        if 0 <= index < len(mask):
+            mask[index] = 1.0
+    return mask
+
+
+def _resolve_manifest(root: Path, value):
+    if not value:
+        return None
+    path = Path(value)
+    if not path.is_absolute():
+        path = root / path
+    return path
+
+
+def _load_manifest(root: Path, value):
+    path = _resolve_manifest(root, value)
+    if path is None:
+        return {}
+    if not path.exists():
+        raise FileNotFoundError(
+            f"Supervision manifest not found: {path}. "
+            "Run scripts/build_expanded_detect_supervision_manifest.py first."
+        )
+    records = {}
+    for line in path.read_text(encoding="utf-8").splitlines():
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        records[str(record["image"]).replace("\\", "/")] = record
+    return records
+
+
+def _relative_image(root: Path, image_path) -> str:
+    return str(Path(image_path).resolve().relative_to(root.resolve())).replace("\\", "/")
+
+
+class DetectDataset(BaseDetectDataset):
+    def __init__(self, *args, domain_valid_class_ids=None,
+                 supervision_manifest=None, domain_num_classes=7, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.domain_num_classes = int(domain_num_classes)
+        self._static_domain_mask = _class_mask(domain_valid_class_ids or [1, 2, 3, 4, 7], self.domain_num_classes)
+        self._supervision_manifest = _load_manifest(self.root, supervision_manifest)
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        record = self._supervision_manifest.get(_relative_image(self.root, self.samples[idx].image))
+        if record is None:
+            if self._supervision_manifest:
+                raise KeyError(
+                    f"No supervision-manifest record for {self.samples[idx].image}. "
+                    "Regenerate the manifest for this dataset root."
+                )
+            item["domain_valid_mask"] = self._static_domain_mask.clone()
+        else:
+            item["domain_valid_mask"] = _class_mask(
+                record.get("valid_class_ids", []), self.domain_num_classes
+            )
+        return item
+
+
+class AttrDataset(BaseAttrDataset):
+    def __init__(self, *args, domain_valid_class_ids=None,
+                 supervision_manifest=None, domain_num_classes=7, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.domain_num_classes = int(domain_num_classes)
+        self._static_domain_mask = _class_mask(domain_valid_class_ids or [1, 2, 3, 4, 7], self.domain_num_classes)
+        self._supervision_manifest = _load_manifest(self.root, supervision_manifest)
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        record = self._supervision_manifest.get(_relative_image(self.root, self.samples[idx].image))
+        if record is None:
+            if self._supervision_manifest:
+                raise KeyError(
+                    f"No supervision-manifest record for {self.samples[idx].image}. "
+                    "Regenerate the manifest for this dataset root."
+                )
+            item["domain_valid_mask"] = self._static_domain_mask.clone()
+        else:
+            item["domain_valid_mask"] = _class_mask(
+                record.get("valid_class_ids", []), self.domain_num_classes
+            )
+        return item
+
+
+class PoseDataset(BasePoseDataset):
+    def __init__(self, *args, domain_valid_class_ids=None,
+                 domain_num_classes=7, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.domain_valid_class_mask = _class_mask(
+            domain_valid_class_ids or [1, 2, 3, 4, 7], domain_num_classes
+        )
+
+    def __getitem__(self, idx):
+        item = super().__getitem__(idx)
+        item["domain_valid_mask"] = self.domain_valid_class_mask.clone()
+        return item
+
+
+def final_collate(batch):
+    return {
+        "image": torch.stack([item["image"] for item in batch]),
+        "boxes": [item["boxes"] for item in batch],
+        "classes": [item["classes"] for item in batch],
+        "kpts": [item["kpts"] for item in batch],
+        "attrs": [item["attrs"] for item in batch],
+        "attr_mask": [item["attr_mask"] for item in batch],
+        "domain_valid_mask": [item["domain_valid_mask"] for item in batch],
+        "task": [item["task"] for item in batch],
+        "scale": [item.get("scale", 1.0) for item in batch],
+        "pad": [item.get("pad", (0, 0)) for item in batch],
+        "img_path": [item.get("img_path", "") for item in batch],
+        "orig_shape": [item.get("orig_shape", None) for item in batch],
+        "image_id": [item.get("image_id", None) for item in batch],
+    }
+
+
+def make_loader(dataset, batch_size, workers, shuffle=True, weights=None, drop_last=True):
+    sampler = None
+    if weights is not None:
+        sampler = WeightedRandomSampler(
+            weights=torch.as_tensor(weights, dtype=torch.double),
+            num_samples=max(len(dataset), int(batch_size)),
+            replacement=True,
+        )
+        shuffle = False
+    return DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=shuffle,
+        sampler=sampler,
+        num_workers=workers,
+        collate_fn=final_collate,
+        pin_memory=True,
+        drop_last=drop_last,
+        persistent_workers=workers > 0,
+        prefetch_factor=2 if workers > 0 else None,
+    )
 
 
 def _detect_source_configs(detect_cfg: dict) -> list[dict]:
@@ -34,6 +182,9 @@ def _build_detect_dataset(source_cfg: dict, input_size: int, augment_cfg: dict, 
         source_cfg.get("labels", "train/labels" if split == "train" else "valid/labels"),
         input_size=input_size,
         class_offset=source_cfg.get("class_offset", 1),
+        domain_valid_class_ids=source_cfg.get("valid_class_ids", [1, 2, 3, 4, 7]),
+        supervision_manifest=source_cfg.get("supervision_manifest"),
+        domain_num_classes=7,
         **augment_cfg,
     )
     test_ds = _make_optional_dataset(
@@ -43,6 +194,9 @@ def _build_detect_dataset(source_cfg: dict, input_size: int, augment_cfg: dict, 
         source_cfg.get("test_labels", "test/labels"),
         input_size=input_size,
         class_offset=source_cfg.get("class_offset", 1),
+        domain_valid_class_ids=source_cfg.get("valid_class_ids", [1, 2, 3, 4, 7]),
+        supervision_manifest=source_cfg.get("supervision_manifest"),
+        domain_num_classes=7,
         **augment_cfg,
     )
     return _apply_test_dataset_policy(
@@ -78,6 +232,9 @@ def build_final_train_loader(cfg: dict):
         split=train_cfg["attr"].get("split", "train"),
         input_size=input_size,
         **_attr_dataset_options(train_cfg["attr"], split_policy),
+        domain_valid_class_ids=train_cfg["attr"].get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+        supervision_manifest=train_cfg["attr"].get("domain_supervision_manifest"),
+        domain_num_classes=7,
         **attr_aug,
     )
     pose_root = _resolve_root(train_cfg["pose"]["root"])
@@ -87,6 +244,8 @@ def build_final_train_loader(cfg: dict):
         train_cfg["pose"].get("labels", "labels/train2017"),
         input_size=input_size,
         source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
+        domain_valid_class_ids=train_cfg["pose"].get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+        domain_num_classes=7,
         **pose_aug,
     )
     pose_test_ds = _make_optional_dataset(
@@ -96,6 +255,8 @@ def build_final_train_loader(cfg: dict):
         train_cfg["pose"].get("test_labels", "labels_person/test2017"),
         input_size=input_size,
         source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
+        domain_valid_class_ids=train_cfg["pose"].get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+        domain_num_classes=7,
         **pose_aug,
     )
     pose_ds = _apply_test_dataset_policy(
@@ -176,6 +337,9 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
             split=attr_cfg.get("split", "val"),
             input_size=input_size,
             augment=False,
+            domain_valid_class_ids=attr_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+            supervision_manifest=attr_cfg.get("domain_supervision_manifest"),
+            domain_num_classes=7,
             **_NO_AUG,
             **_attr_dataset_options(attr_cfg, split_policy),
         )
@@ -192,6 +356,8 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
             pose_lbl,
             input_size=input_size,
             source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+            domain_valid_class_ids=pose_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+            domain_num_classes=7,
             augment=False,
             **_NO_AUG,
         )
@@ -202,6 +368,8 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
             pose_cfg.get("test_labels", "labels_person/test2017"),
             input_size=input_size,
             source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+            domain_valid_class_ids=pose_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+            domain_num_classes=7,
             augment=False,
             **_NO_AUG,
         )

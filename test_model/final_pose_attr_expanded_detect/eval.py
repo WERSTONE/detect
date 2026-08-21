@@ -178,6 +178,9 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                     det_root, img_dir, lbl_dir,
                     input_size=input_size,
                     class_offset=source.get("class_offset", 1),
+                    domain_valid_class_ids=source.get("valid_class_ids", [1, 2, 3, 4, 7]),
+                    supervision_manifest=source.get("supervision_manifest"),
+                    domain_num_classes=7,
                     augment=False,
                     **_NO_AUG,
                 )
@@ -189,6 +192,9 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                         source.get("test_labels", "test/labels"),
                         input_size=input_size,
                         class_offset=source.get("class_offset", 1),
+                        domain_valid_class_ids=source.get("valid_class_ids", [1, 2, 3, 4, 7]),
+                        supervision_manifest=source.get("supervision_manifest"),
+                        domain_num_classes=7,
                         augment=False,
                         **_NO_AUG,
                     )
@@ -216,6 +222,9 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                 attr_root, split=key,
                 input_size=input_size, augment=False, **_NO_AUG,
                 **_attr_dataset_options(attr_cfg, split_policy),
+                domain_valid_class_ids=attr_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+                supervision_manifest=attr_cfg.get("domain_supervision_manifest"),
+                domain_num_classes=7,
             )
             ds = _maybe_trim(ds)
             loaders.append(("attr", key, make_loader(
@@ -234,6 +243,8 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                 pose_root, img_dir, lbl_dir,
                 input_size=input_size,
                 source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+                domain_valid_class_ids=pose_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+                domain_num_classes=7,
                 augment=False, **_NO_AUG,
             )
             if key in {"train", "val"}:
@@ -242,9 +253,11 @@ def build_eval_loaders(cfg, split, batch, workers, input_size, max_samples=0):
                     pose_root,
                     pose_cfg.get("test_images", "test2017"),
                     pose_cfg.get("test_labels", "labels_person/test2017"),
-                    input_size=input_size,
-                    source_class_format=pose_cfg.get("class_id_format", "yolo80"),
-                    augment=False,
+                        input_size=input_size,
+                        source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+                        domain_valid_class_ids=pose_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+                        domain_num_classes=7,
+                        augment=False,
                     **_NO_AUG,
                 )
                 ds = _apply_test_dataset_policy(ds, pose_test, key, split_policy, salt="pose")
@@ -546,7 +559,10 @@ def evaluate_checkpoint(cfg, weights, device="cuda", split="val",
                     gt_classes = batch_data["classes"][bi].numpy().astype(int)
 
                     if task == "detect":
+                        domain_mask = batch_data["domain_valid_mask"][bi].numpy() > 0.5
                         for cls_id in domain_pred_classes:
+                            if not domain_mask[cls_id - 1]:
+                                continue
                             gts_by_image_class[(image_idx, cls_id)] = (
                                 gt_boxes[gt_classes == cls_id].astype(np.float32)
                             )
@@ -579,7 +595,12 @@ def evaluate_checkpoint(cfg, weights, device="cuda", split="val",
                         np.zeros((len(p_boxes), len(attr_names)), dtype=np.float32),
                     )
 
-                    for cls_id in domain_pred_classes + [0]:
+                    domain_mask = batch_data["domain_valid_mask"][bi].numpy() > 0.5
+                    valid_domain_classes = [
+                        cls_id for cls_id in domain_pred_classes
+                        if domain_mask[cls_id - 1]
+                    ]
+                    for cls_id in valid_domain_classes + [0]:
                         keep = p_classes == cls_id
                         for box, score in zip(p_boxes[keep], p_scores[keep]):
                             preds_by_class.setdefault(cls_id, []).append({

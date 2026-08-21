@@ -1520,6 +1520,7 @@ def main():
             'kpts': batch['kpts'][i],
             'attrs': batch.get('attrs', [None] * len(images))[i],
             'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
+            'domain_valid_mask': batch.get('domain_valid_mask', [None] * len(images))[i],
         } for i in range(len(images))]
         with torch.no_grad():
             if (not opts['no_amp']) and _is_cuda_device(device):

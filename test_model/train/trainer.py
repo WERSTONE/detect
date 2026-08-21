@@ -955,6 +955,7 @@ class Trainer:
                     'kpts': batch['kpts'][i],
                     'attrs': batch.get('attrs', [None] * len(images))[i],
                     'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
+                    'domain_valid_mask': batch.get('domain_valid_mask', [None] * len(images))[i],
                     'task': batch.get('task', [None] * len(images))[i],
                 })
 
@@ -1067,6 +1068,7 @@ class Trainer:
                         'kpts': batch['kpts'][i],
                         'attrs': batch.get('attrs', [None] * len(images))[i],
                         'attr_mask': batch.get('attr_mask', [None] * len(images))[i],
+                        'domain_valid_mask': batch.get('domain_valid_mask', [None] * len(images))[i],
                         'task': batch.get('task', [None] * len(images))[i],
                     })
 
