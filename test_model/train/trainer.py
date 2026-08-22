@@ -410,6 +410,24 @@ class Trainer:
                     parts.append(f"{key}={cls._format_metric_value(value)}")
             if parts:
                 lines.append(f"{indent}{label}/{group_name}: " + " ".join(parts))
+
+        class_names = [
+            key[len(prefix + 'det_cls_'):]
+            for key in metrics
+            if key.startswith(prefix + 'det_cls_')
+        ]
+        if class_names:
+            parts = []
+            for name in class_names:
+                base = prefix + f'det_cls_{name}'
+                valid = prefix + f'det_valid_images_{name}'
+                positive = prefix + f'det_pos_anchors_{name}'
+                parts.append(
+                    f"{name}(bce={cls._format_metric_value(metrics[base])},"
+                    f"img={cls._format_metric_value(metrics.get(valid, 0))},"
+                    f"pos={cls._format_metric_value(metrics.get(positive, 0))})"
+                )
+            lines.append(f"{indent}{label}/det_classes: " + " ".join(parts))
         return lines
 
     def _collect_task_grads(self, task_loss, params, retain_graph):

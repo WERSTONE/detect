@@ -130,6 +130,7 @@ def build_model(cfg):
         name=cfg.get("model", "final_pose_attr"),
         domain_num_classes=domain_cfg.get("num_classes", 4),
         domain_class_map=domain_cfg.get("class_map", {}),
+        domain_class_names=domain_cfg.get("names", None),
         num_attrs=attr_cfg.get("num_attrs", 4),
         attr_names=attr_cfg.get("names", None),
         num_kpts=cfg.get("num_kpts", 17),

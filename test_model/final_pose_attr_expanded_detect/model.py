@@ -466,6 +466,7 @@ class DomainPoseAttrBiFPN(nn.Module):
         domain_num_classes=4,
         num_attrs=4,
         domain_class_map=None,
+        domain_class_names=None,
         attr_names=None,
         num_kpts=17,
         reg_max=16,
@@ -486,6 +487,13 @@ class DomainPoseAttrBiFPN(nn.Module):
     ):
         super().__init__()
         self.domain_num_classes = int(domain_num_classes)
+        self.domain_class_names = list(
+            domain_class_names or [f"class_{idx}" for idx in range(self.domain_num_classes)]
+        )
+        if len(self.domain_class_names) != self.domain_num_classes:
+            raise ValueError("domain_class_names length must match domain_num_classes")
+        if len(set(self.domain_class_names)) != len(self.domain_class_names):
+            raise ValueError("domain_class_names must be unique")
         self.num_attrs = int(num_attrs)
         self.attr_names = list(attr_names or ["smoking", "falling", "waving", "helmet_on"])
         if len(self.attr_names) != self.num_attrs:
@@ -587,10 +595,9 @@ class DomainPoseAttrBiFPN(nn.Module):
             "pose": self.pose_head(pose_feats),
         }
 
-    @staticmethod
-    def _zero_loss(device):
+    def _zero_loss(self, device):
         zero = torch.zeros((), device=device)
-        return {
+        result = {
             "total": zero,
             "det_total": zero.detach(),
             "det_ciou": zero.detach(),
@@ -610,6 +617,13 @@ class DomainPoseAttrBiFPN(nn.Module):
             "num_pos": zero.detach(),
             "target_scores_sum": zero.detach(),
         }
+        for class_name in self.domain_class_names:
+            result[f"det_cls_{class_name}"] = zero.detach()
+            result[f"det_valid_images_{class_name}"] = zero.detach()
+            result[f"det_valid_logits_{class_name}"] = zero.detach()
+            result[f"det_pos_anchors_{class_name}"] = zero.detach()
+            result[f"det_target_scores_{class_name}"] = zero.detach()
+        return result
 
     def _filter_domain_gt(self, gt_dict_list, device):
         mapped = []
@@ -714,7 +728,9 @@ class DomainPoseAttrBiFPN(nn.Module):
         )
         raw_total = det_losses["total"] + pose_attr_losses["total"]
 
-        return {
+        class_metrics = det_losses.get("_class_metrics", {})
+        class_zero = torch.zeros(self.domain_num_classes, device=device)
+        result = {
             "total": total,
             "loss_total": raw_total.detach(),
             "det_total": det_losses["det_total"].detach(),
@@ -751,6 +767,13 @@ class DomainPoseAttrBiFPN(nn.Module):
             "task_w_pose": torch.tensor(self.pose_task_weight, device=device),
             "task_w_attr": torch.tensor(self.attr_task_weight if self.train_attr else 0.0, device=device),
         }
+        for idx, class_name in enumerate(self.domain_class_names):
+            result[f"det_cls_{class_name}"] = class_metrics.get("cls", class_zero)[idx].detach()
+            result[f"det_valid_images_{class_name}"] = class_metrics.get("valid_images", class_zero)[idx].detach()
+            result[f"det_valid_logits_{class_name}"] = class_metrics.get("valid_logits", class_zero)[idx].detach()
+            result[f"det_pos_anchors_{class_name}"] = class_metrics.get("pos_anchors", class_zero)[idx].detach()
+            result[f"det_target_scores_{class_name}"] = class_metrics.get("target_scores", class_zero)[idx].detach()
+        return result
 
     @staticmethod
     def _decode_kpts(kpt_raw, anchor_idx, grid, stride, num_kpts):

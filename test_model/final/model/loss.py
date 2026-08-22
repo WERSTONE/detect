@@ -362,7 +362,38 @@ class YOLODetectionLoss(nn.Module):
         )
         target_scores_sum = torch.clamp(target_scores.sum(), min=1.0)
 
-        loss_cls = self.bce(pred_scores.float(), target_scores.to(dtype).float()).sum() / target_scores_sum
+        raw_cls = self.bce(pred_scores.float(), target_scores.to(dtype).float())
+        valid_masks = []
+        for gt in gt_dict_list:
+            mask = gt.get('class_valid_mask')
+            if mask is None:
+                mask = torch.ones(self.num_classes, device=device, dtype=raw_cls.dtype)
+            else:
+                mask = mask.to(device=device, dtype=raw_cls.dtype).flatten()
+                if len(mask) != self.num_classes:
+                    raise ValueError(
+                        f"class_valid_mask length={len(mask)} does not match "
+                        f"num_classes={self.num_classes}"
+                    )
+                mask = (mask > 0).to(raw_cls.dtype)
+            valid_masks.append(mask)
+        valid = torch.stack(valid_masks, dim=0)[:, None, :]
+        # Keep the expected cls-loss scale comparable when a source supervises
+        # fewer than all output classes. Invalid channels produce no BCE or gradient.
+        valid_class_count = valid.sum(dim=-1, keepdim=True)
+        class_scale = self.num_classes / valid_class_count.clamp(min=1.0)
+        weighted_cls = raw_cls * valid * class_scale
+        loss_cls = weighted_cls.sum() / target_scores_sum
+
+        # These diagnostics are detached and consumed by multi-source models that
+        # expose named scalar metrics to the trainer.
+        class_metrics = {
+            'cls': self.w_cls * weighted_cls.sum(dim=(0, 1)) / target_scores_sum,
+            'valid_images': valid[:, 0, :].sum(dim=0),
+            'valid_logits': valid[:, 0, :].sum(dim=0) * raw_cls.shape[1],
+            'pos_anchors': ((target_scores > 0).to(raw_cls.dtype) * valid).sum(dim=(0, 1)),
+            'target_scores': (target_scores.to(raw_cls.dtype) * valid).sum(dim=(0, 1)),
+        }
         loss_box = torch.zeros((), device=device)
         loss_dfl = torch.zeros((), device=device)
 
@@ -392,6 +423,7 @@ class YOLODetectionLoss(nn.Module):
             'det_dfl': dfl.detach(),
             'num_pos': fg_mask.sum().detach().float(),
             'target_scores_sum': target_scores_sum.detach(),
+            '_class_metrics': {key: value.detach() for key, value in class_metrics.items()},
         }
 
 
