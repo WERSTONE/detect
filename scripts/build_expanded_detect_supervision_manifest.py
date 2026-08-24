@@ -100,11 +100,15 @@ def _aux_policy(image_path: Path) -> tuple[str, list[int]]:
     name = image_path.name.lower()
     if name.startswith("hardhat1_"):
         return "head_helmet", ALL_CLASSES
-    if name.startswith("cigarette_") or name.startswith("smoke_"):
+    if (
+        name.startswith("cigarette_")
+        or name.startswith("smoke_")
+        or name.startswith("smoking_people_")
+    ):
         return "cigarette", ORIGINAL_VALID
     raise ValueError(
         f"Unknown auxiliary image prefix: {image_path.name}. "
-        "Expected hardhat1_, cigarette_, or smoke_."
+        "Expected hardhat1_, cigarette_, smoke_, or smoking_people_."
     )
 
 

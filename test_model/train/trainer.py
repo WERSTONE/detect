@@ -65,6 +65,9 @@ class Trainer:
                  gradient_projection_method='pcgrad',
                  gradient_projection_scope='all',
                  gradient_projection_eps=1.0e-12,
+                 pomsi_alpha=1.0, pomsi_alpha_lr=1.0e-3,
+                 pomsi_alpha_min=0.0, pomsi_alpha_max=5.0,
+                 pomsi_static=False,
                  cagrad_c=0.5, gradnorm_alpha=1.0,
                  distill_teacher=None, distill_cfg=None):
         self.model = model.to(device)
@@ -149,6 +152,11 @@ class Trainer:
         self.gradient_projection_method = str(gradient_projection_method or 'pcgrad').lower()
         self.gradient_projection_scope = str(gradient_projection_scope or 'all').lower()
         self.gradient_projection_eps = float(gradient_projection_eps)
+        self.pomsi_alpha = torch.tensor(float(pomsi_alpha), device=self.device, requires_grad=True)
+        self.pomsi_alpha_lr = float(pomsi_alpha_lr)
+        self.pomsi_alpha_min = float(pomsi_alpha_min)
+        self.pomsi_alpha_max = float(pomsi_alpha_max)
+        self.pomsi_static = bool(pomsi_static)
         self.cagrad_c = float(cagrad_c)
         self.gradnorm_alpha = float(gradnorm_alpha)
         self.distill_teacher = distill_teacher
@@ -398,6 +406,7 @@ class Trainer:
                 ('total', 'obj'),
                 ('num_pos', 'num_pos'),
                 ('target_scores_sum', 'score_sum'),
+                ('pomsi_alpha', 'pomsi_alpha'),
                 ('skipped', 'skipped'),
             ]),
         ]
@@ -463,6 +472,15 @@ class Trainer:
             return torch.tensor(0.0, device=self.device)
         return norm
 
+    def _grad_cosine(self, grads_a, grads_b):
+        denom = torch.sqrt(
+            self._grad_norm_sq(grads_a) * self._grad_norm_sq(grads_b)
+            + self.gradient_projection_eps
+        )
+        if denom.item() <= self.gradient_projection_eps:
+            return torch.tensor(0.0, device=self.device)
+        return self._grad_dot(grads_a, grads_b) / denom
+
     def _gradient_param_groups(self):
         scoped = []
         other = []
@@ -510,6 +528,70 @@ class Trainer:
                         grads_proj[k] = g_proj - scale * g_ref
             projected.append(grads_proj)
         return projected
+
+    def _pomsi_phi(self, grads_i, grads_j):
+        norm_i = torch.sqrt(self._grad_norm_sq(grads_i) + self.gradient_projection_eps)
+        norm_j = torch.sqrt(self._grad_norm_sq(grads_j) + self.gradient_projection_eps)
+        base = (2.0 * norm_i * norm_j) / (
+            norm_i.pow(2) + norm_j.pow(2) + self.gradient_projection_eps
+        )
+        base = base.clamp(min=self.gradient_projection_eps, max=1.0)
+        return base.pow(self.pomsi_alpha)
+
+    def _update_pomsi_alpha(self, loss_norm):
+        if self.pomsi_static or self.pomsi_alpha_lr <= 0.0:
+            return
+        grad = torch.autograd.grad(
+            loss_norm,
+            self.pomsi_alpha,
+            retain_graph=False,
+            allow_unused=True,
+        )[0]
+        if grad is None or not torch.isfinite(grad.detach()).item():
+            return
+        with torch.no_grad():
+            self.pomsi_alpha.sub_(self.pomsi_alpha_lr * grad)
+            self.pomsi_alpha.clamp_(self.pomsi_alpha_min, self.pomsi_alpha_max)
+        self.pomsi_alpha = self.pomsi_alpha.detach().requires_grad_(True)
+
+    def _pomsi_grads(self, task_grads):
+        """POMSI: PCGrad followed by MSI with a learnable alpha."""
+        if len(task_grads) < 2:
+            return task_grads
+
+        projected = self._pcgrad(task_grads)
+        reference_norms = [
+            torch.sqrt(self._grad_norm_sq(grads) + self.gradient_projection_eps)
+            for grads in projected
+        ]
+        mean_reference_norm = torch.stack(reference_norms).mean().detach()
+
+        scaled_grads = []
+        scaled_norms = []
+        for i, grads_i in enumerate(projected):
+            grads_pm = [None if g is None else g.clone() for g in grads_i]
+            for j, grads_j in enumerate(projected):
+                if i == j:
+                    continue
+                scale = self._pomsi_phi(grads_pm, grads_j)
+                current_norm = torch.sqrt(self._grad_norm_sq(grads_pm) + self.gradient_projection_eps)
+                ref_norm = reference_norms[j]
+                if current_norm.item() >= ref_norm.item():
+                    grads_pm = self._scale_grads(grads_pm, scale)
+                else:
+                    grads_pm = self._scale_grads(
+                        grads_pm,
+                        1.0 / scale.clamp(min=self.gradient_projection_eps),
+                    )
+            scaled_grads.append(grads_pm)
+            scaled_norms.append(torch.sqrt(self._grad_norm_sq(grads_pm) + self.gradient_projection_eps))
+
+        loss_norm = torch.stack([
+            torch.abs(norm - mean_reference_norm)
+            for norm in scaled_norms
+        ]).sum()
+        self._update_pomsi_alpha(loss_norm)
+        return [[None if g is None else g.detach() for g in grads] for grads in scaled_grads]
 
     def _gradnorm_grads(self, task_grads):
         norms = [
@@ -563,25 +645,79 @@ class Trainer:
                 combined.append((1.0 - c) * ga + c * gm)
         return [combined]
 
+    def _aux_to_pose_grads(self, task_grads):
+        """Protect pose by projecting only conflicting auxiliary gradients.
+
+        The last gradient list is treated as the reference pose gradient and
+        kept unchanged. Every preceding task gradient (detection, attributes,
+        or any future auxiliary task) has only its pose-conflicting component
+        removed. Helpful auxiliary components are retained.
+        """
+        if len(task_grads) < 2:
+            return task_grads
+        pose_grads = task_grads[-1]
+        pose_norm_sq = self._grad_norm_sq(pose_grads)
+        safe_aux_grads = []
+        for aux_grads in task_grads[:-1]:
+            dot = self._grad_dot(aux_grads, pose_grads)
+            if dot.item() < 0 and pose_norm_sq.item() > self.gradient_projection_eps:
+                scale = dot / (pose_norm_sq + self.gradient_projection_eps)
+                aux_grads = [
+                    None if ga is None else (
+                        ga - scale * gp if gp is not None else ga
+                    )
+                    for ga, gp in zip(aux_grads, pose_grads)
+                ]
+            safe_aux_grads.append(aux_grads)
+
+        combined = [None if g is None else g.clone() for g in pose_grads]
+        for aux_grads in safe_aux_grads:
+            for idx, grad in enumerate(aux_grads):
+                if grad is None:
+                    continue
+                combined[idx] = grad if combined[idx] is None else combined[idx] + grad
+        return [combined]
+
     def _combine_task_grads(self, task_grads):
         method = self.gradient_projection_method
         if method == 'pcgrad':
             return self._pcgrad(task_grads)
+        if method == 'pomsi':
+            return self._pomsi_grads(task_grads)
         if method == 'gradnorm':
             return self._gradnorm_grads(task_grads)
         if method == 'cagrad':
             return self._cagrad_grads(task_grads)
+        if method in ('det_to_pose', 'attr_det_to_pose', 'aux_to_pose', 'pose_guard', 'asymmetric_pcgrad'):
+            return self._aux_to_pose_grads(task_grads)
         raise ValueError(
             f"Unsupported gradient projection method: {method}. "
-            "Use pcgrad, gradnorm, or cagrad.")
+            "Use pcgrad, pomsi, gradnorm, cagrad, or aux_to_pose.")
 
     def _apply_gradient_projection(self, losses, total_loss):
         det_loss = losses.get('_gp_det_loss')
+        attr_loss = losses.get('_gp_attr_loss')
         pose_loss = losses.get('_gp_pose_loss')
-        task_losses = [
-            loss for loss in (det_loss, pose_loss)
-            if isinstance(loss, torch.Tensor) and loss.requires_grad
-        ]
+        method = self.gradient_projection_method
+        pose_available = isinstance(pose_loss, torch.Tensor) and pose_loss.requires_grad
+        aux_to_pose = method in ('det_to_pose', 'attr_det_to_pose', 'aux_to_pose', 'pose_guard', 'asymmetric_pcgrad')
+        if aux_to_pose:
+            if not pose_available:
+                if self.scaler:
+                    self.scaler.scale(total_loss).backward()
+                else:
+                    total_loss.backward()
+                return False
+            task_losses = [
+                loss for loss in (det_loss, attr_loss)
+                if isinstance(loss, torch.Tensor) and loss.requires_grad
+            ]
+            task_losses.append(pose_loss)
+        else:
+            task_losses = [
+                loss for loss in (det_loss, attr_loss, pose_loss)
+                if isinstance(loss, torch.Tensor) and loss.requires_grad
+            ]
         if len(task_losses) < 2:
             if self.scaler:
                 self.scaler.scale(total_loss).backward()
@@ -596,6 +732,12 @@ class Trainer:
             else:
                 total_loss.backward()
             return False
+
+        # Preserve gradients from earlier micro-batches. The projection itself
+        # is computed for the current batch, then merged back into the
+        # accumulation buffer below.
+        previous_scoped_grads = self._clone_param_grads(params)
+        previous_other_grads = self._clone_param_grads(other_params)
 
         other_grads = []
         if other_params:
@@ -620,9 +762,18 @@ class Trainer:
                 if grad is None:
                     continue
                 grad_sum = grad if grad_sum is None else grad_sum + grad
+            previous = previous_scoped_grads[param_index]
+            if grad_sum is None:
+                grad_sum = previous
+            elif previous is not None:
+                grad_sum = previous + grad_sum
             if grad_sum is not None:
                 p.grad = grad_sum
-        for p, grad in zip(other_params, other_grads):
+        for p, grad, previous in zip(other_params, other_grads, previous_other_grads):
+            if grad is None:
+                grad = previous
+            elif previous is not None:
+                grad = previous + grad
             if grad is not None:
                 p.grad = grad
         return True
@@ -996,20 +1147,20 @@ class Trainer:
 
             optimizer_stepped = False
             if self.gradient_projection_enabled:
-                self.optimizer.zero_grad(set_to_none=True)
                 self._apply_gradient_projection(losses, total_loss)
-                if self.scaler:
-                    if self.grad_clip > 0:
-                        self.scaler.unscale_(self.optimizer)
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.scaler.step(self.optimizer)
-                    self.scaler.update()
-                else:
-                    if self.grad_clip > 0:
-                        torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
-                    self.optimizer.step()
-                self.optimizer.zero_grad(set_to_none=True)
-                optimizer_stepped = True
+                if seen_step % self.accumulate == 0 or seen_step == n_batches:
+                    if self.scaler:
+                        if self.grad_clip > 0:
+                            self.scaler.unscale_(self.optimizer)
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        self.scaler.step(self.optimizer)
+                        self.scaler.update()
+                    else:
+                        if self.grad_clip > 0:
+                            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.grad_clip)
+                        self.optimizer.step()
+                    self.optimizer.zero_grad(set_to_none=True)
+                    optimizer_stepped = True
             elif self.scaler:
                 self.scaler.scale(total_loss).backward()
                 if seen_step % self.accumulate == 0 or seen_step == n_batches:
@@ -1041,6 +1192,10 @@ class Trainer:
                     value = v.detach()
                     running[k] = running.get(k, torch.zeros_like(value)) + value
                     metrics[k] = metrics.get(k, torch.zeros_like(value)) + value
+            if self.gradient_projection_enabled and self.gradient_projection_method == 'pomsi':
+                value = self.pomsi_alpha.detach()
+                running['pomsi_alpha'] = running.get('pomsi_alpha', torch.zeros_like(value)) + value
+                metrics['pomsi_alpha'] = metrics.get('pomsi_alpha', torch.zeros_like(value)) + value
 
             if step % self.log_interval == 0:
                 pct = step / n_batches * 100
@@ -1122,6 +1277,7 @@ class Trainer:
                     }
                     for i, group in enumerate(self.optimizer.param_groups)
                 ],
+                'pomsi_alpha': float(self.pomsi_alpha.detach()),
                 'metrics': metrics,
             }
             if self.scaler:
@@ -1147,6 +1303,12 @@ class Trainer:
                 )
         if self.scaler and 'scaler_state_dict' in ckpt:
             self.scaler.load_state_dict(ckpt['scaler_state_dict'])
+        if 'pomsi_alpha' in ckpt:
+            self.pomsi_alpha = torch.tensor(
+                float(ckpt['pomsi_alpha']),
+                device=self.device,
+                requires_grad=True,
+            )
         if self.ema_enabled and reset_ema_from_model:
             self.reset_ema_from_model()
             print("  EMA reset from loaded model weights")
@@ -1212,6 +1374,12 @@ class Trainer:
                 "Gradient strategy: "
                 f"method={self.gradient_projection_method} "
                 f"scope={self.gradient_projection_scope}")
+            if self.gradient_projection_method == 'pomsi':
+                print(
+                    "POMSI: "
+                    f"alpha={float(self.pomsi_alpha.detach()):.4g} "
+                    f"alpha_lr={self.pomsi_alpha_lr:.4g} "
+                    f"static={self.pomsi_static}")
         if self.distill_cfg.get('enabled', False):
             print("Distillation: enabled")
         group_parts = []

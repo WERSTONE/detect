@@ -126,6 +126,12 @@ def build_model(cfg):
     neck_cfg = cfg.get("neck", {}) or {}
     assigner_cfg = cfg.get("assigner", {}) or {}
     loss_cfg = cfg.get("loss", {}) or {}
+    domain_class_weights = loss_cfg.get("domain_class_weights")
+    if isinstance(domain_class_weights, dict):
+        domain_class_weights = [
+            float(domain_class_weights.get(name, 1.0))
+            for name in domain_cfg.get("names", [])
+        ]
     return create_final_pose_attr_model(
         name=cfg.get("model", "final_pose_attr"),
         domain_num_classes=domain_cfg.get("num_classes", 4),
@@ -143,6 +149,7 @@ def build_model(cfg):
         assigner_alpha=assigner_cfg.get("alpha", 0.5),
         assigner_beta=assigner_cfg.get("beta", 6.0),
         assigner_eps=assigner_cfg.get("eps", 1.0e-9),
+        domain_class_weights=domain_class_weights,
         attr_consistency_weight=loss_cfg.get("attr_consistency_weight", 0.05),
         attr_dropout=attr_cfg.get("attr_dropout", 0.1),
         appearance_context_kernel=attr_cfg.get("appearance_context_kernel", 5),
@@ -151,6 +158,7 @@ def build_model(cfg):
 
 def build_trainer(model, cfg, device, stage, save_dir):
     train_cfg = cfg["training"]
+    projection_cfg = train_cfg.get("gradient_projection", {}) or {}
     return Trainer(
         model,
         device=device,
@@ -182,6 +190,26 @@ def build_trainer(model, cfg, device, stage, save_dir):
         early_stop_patience=stage.get("early_stop_patience", train_cfg.get("early_stop_patience", 0)),
         early_stop_min_delta=stage.get("early_stop_min_delta", train_cfg.get("early_stop_min_delta", 0.0)),
         early_stop_start_epoch=stage.get("early_stop_start_epoch", train_cfg.get("early_stop_start_epoch", 0)),
+        gradient_projection_enabled=stage.get(
+            "use_gradient_projection",
+            projection_cfg.get("enabled", False),
+        ),
+        gradient_projection_method=stage.get(
+            "gradient_projection_method",
+            projection_cfg.get("method", "pcgrad"),
+        ),
+        gradient_projection_scope=stage.get(
+            "gradient_projection_scope",
+            projection_cfg.get("scope", "shared"),
+        ),
+        gradient_projection_eps=projection_cfg.get("eps", 1.0e-12),
+        pomsi_alpha=projection_cfg.get("alpha", 1.0),
+        pomsi_alpha_lr=projection_cfg.get("alpha_lr", 1.0e-3),
+        pomsi_alpha_min=projection_cfg.get("alpha_min", 0.0),
+        pomsi_alpha_max=projection_cfg.get("alpha_max", 5.0),
+        pomsi_static=projection_cfg.get("static", False),
+        cagrad_c=projection_cfg.get("cagrad_c", 0.5),
+        gradnorm_alpha=projection_cfg.get("gradnorm_alpha", 1.0),
     )
 
 

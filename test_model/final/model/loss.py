@@ -276,7 +276,7 @@ class YOLODetectionLoss(nn.Module):
     def __init__(self, num_classes=80, reg_max=16, strides=(8, 16, 32),
                  w_box=7.5, w_cls=0.5, w_dfl=1.5,
                  assigner_topk=10, assigner_alpha=0.5, assigner_beta=6.0,
-                 assigner_eps=1e-9):
+                 assigner_eps=1e-9, class_weights=None):
         super().__init__()
         self.num_classes = int(num_classes)
         self.reg_max = int(reg_max)
@@ -285,6 +285,20 @@ class YOLODetectionLoss(nn.Module):
         self.w_cls = float(w_cls)
         self.w_dfl = float(w_dfl)
         self.bce = nn.BCEWithLogitsLoss(reduction='none')
+        if class_weights is None:
+            class_weights = torch.ones(self.num_classes, dtype=torch.float32)
+        else:
+            class_weights = torch.as_tensor(class_weights, dtype=torch.float32).flatten()
+            if class_weights.numel() == 1:
+                class_weights = class_weights.repeat(self.num_classes)
+            if class_weights.numel() != self.num_classes:
+                raise ValueError(
+                    f"class_weights has {class_weights.numel()} values, "
+                    f"expected {self.num_classes}"
+                )
+            if torch.any(class_weights < 0):
+                raise ValueError("class_weights must be non-negative")
+        self.register_buffer("class_weights", class_weights, persistent=False)
         self.assigner = YOLOTaskAlignedAssigner(
             topk=assigner_topk,
             num_classes=num_classes,
@@ -382,7 +396,7 @@ class YOLODetectionLoss(nn.Module):
         # fewer than all output classes. Invalid channels produce no BCE or gradient.
         valid_class_count = valid.sum(dim=-1, keepdim=True)
         class_scale = self.num_classes / valid_class_count.clamp(min=1.0)
-        weighted_cls = raw_cls * valid * class_scale
+        weighted_cls = raw_cls * valid * class_scale * self.class_weights.view(1, 1, -1)
         loss_cls = weighted_cls.sum() / target_scores_sum
 
         # These diagnostics are detached and consumed by multi-source models that

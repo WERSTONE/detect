@@ -481,6 +481,7 @@ class DomainPoseAttrBiFPN(nn.Module):
         assigner_alpha=0.5,
         assigner_beta=6.0,
         assigner_eps=1.0e-9,
+        domain_class_weights=None,
         attr_consistency_weight=0.05,
         attr_dropout=0.1,
         appearance_context_kernel=5,
@@ -541,6 +542,7 @@ class DomainPoseAttrBiFPN(nn.Module):
             assigner_alpha=assigner_alpha,
             assigner_beta=assigner_beta,
             assigner_eps=assigner_eps,
+            class_weights=domain_class_weights,
         )
         self.pose_attr_loss = YOLOPoseAttrLoss(
             num_kpts=self.num_kpts,
@@ -671,6 +673,16 @@ class DomainPoseAttrBiFPN(nn.Module):
     def _task_indices(self, gt_dict_list, task):
         return [idx for idx, gt in enumerate(gt_dict_list) if gt.get("task") == task]
 
+    def _compute_pose_attr_loss_for(self, pose_outs, parts, device):
+        if not parts:
+            return self._zero_loss(device)
+        indices = torch.as_tensor([i for i, _ in parts], device=device, dtype=torch.long)
+        return self.pose_attr_loss(
+            self._slice_outs(pose_outs, indices),
+            [gt for _, gt in parts],
+            attr_pos_weight=self.attr_pos_weight,
+        )
+
     def compute_loss(self, images, gt_dict_list):
         device = next(self.parameters()).device
         images = images.to(device, non_blocking=True)
@@ -688,6 +700,8 @@ class DomainPoseAttrBiFPN(nn.Module):
             det_losses = self._zero_loss(device)
 
         pose_attr_parts = []
+        pose_parts = []
+        attr_parts = []
         if self.train_pose:
             for i in pose_idx:
                 gt = dict(gt_dict_list[i])
@@ -695,6 +709,7 @@ class DomainPoseAttrBiFPN(nn.Module):
                 gt["_kpt_weight"] = 1.0
                 gt["_attr_weight"] = 0.0
                 pose_attr_parts.append((i, gt))
+                pose_parts.append((i, gt))
         if self.train_attr:
             for i in attr_idx:
                 gt = dict(gt_dict_list[i])
@@ -702,36 +717,44 @@ class DomainPoseAttrBiFPN(nn.Module):
                 gt["_kpt_weight"] = 0.0
                 gt["_attr_weight"] = 1.0
                 pose_attr_parts.append((i, gt))
+                attr_parts.append((i, gt))
 
-        if pose_attr_parts:
-            pa_indices = torch.as_tensor([i for i, _ in pose_attr_parts], device=device, dtype=torch.long)
-            pa_gt = [gt for _, gt in pose_attr_parts]
-            pose_attr_losses = self.pose_attr_loss(
-                self._slice_outs(outs["pose"], pa_indices),
-                pa_gt,
-                attr_pos_weight=self.attr_pos_weight,
-            )
-        else:
-            pose_attr_losses = self._zero_loss(device)
+        pose_attr_losses = self._compute_pose_attr_loss_for(outs["pose"], pose_attr_parts, device)
+        pose_only_losses = self._compute_pose_attr_loss_for(outs["pose"], pose_parts, device)
+        attr_only_losses = self._compute_pose_attr_loss_for(outs["pose"], attr_parts, device)
 
         pose_raw = pose_attr_losses.get("det_total", torch.zeros((), device=device)) + pose_attr_losses.get(
             "pose_total", torch.zeros((), device=device)
         )
-        pa_person_obj = pose_attr_losses.get("_pa_det_loss", torch.zeros((), device=device)) + pose_attr_losses.get(
+        pose_person_obj = pose_only_losses.get("_pa_det_loss", torch.zeros((), device=device)) + pose_only_losses.get(
             "_pa_pose_loss", torch.zeros((), device=device)
         )
-        pa_attr_obj = pose_attr_losses.get("_pa_attr_loss", torch.zeros((), device=device)) * self.attr_loss_weight
-        total = (
-            self.det_task_weight * det_losses["total"]
-            + self.pose_task_weight * pa_person_obj
-            + self.attr_task_weight * pa_attr_obj
+        attr_obj = (
+            self.pose_task_weight * attr_only_losses.get("_pa_det_loss", torch.zeros((), device=device))
+            + self.attr_task_weight
+            * attr_only_losses.get("_pa_attr_loss", torch.zeros((), device=device))
+            * self.attr_loss_weight
         )
+        det_obj = (
+            self.det_task_weight * det_losses["total"]
+            if self.train_domain_det
+            else torch.zeros((), device=device)
+        )
+        pose_obj = self.pose_task_weight * pose_person_obj
+        total = det_obj + pose_obj + attr_obj
         raw_total = det_losses["total"] + pose_attr_losses["total"]
 
         class_metrics = det_losses.get("_class_metrics", {})
         class_zero = torch.zeros(self.domain_num_classes, device=device)
         result = {
             "total": total,
+            # Trainer uses these graph-connected objectives for stage-specific
+            # gradient projection. The pose objective is intentionally pure
+            # pose data so auxiliary detection/attribute gradients can be
+            # projected away from conflicting with pose on shared parameters.
+            "_gp_det_loss": det_obj,
+            "_gp_attr_loss": attr_obj,
+            "_gp_pose_loss": pose_obj,
             "loss_total": raw_total.detach(),
             "det_total": det_losses["det_total"].detach(),
             "det_ciou": det_losses["det_ciou"].detach(),
