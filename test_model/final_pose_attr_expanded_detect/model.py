@@ -327,9 +327,16 @@ class YOLOPoseAttrLoss(YOLODetectionLoss):
         )
 
         batch_idx = torch.arange(batch_size, device=device)[:, None].expand_as(target_gt_idx)
-        anchor_box_weight = gt_box_weight[batch_idx, target_gt_idx.clamp(min=0)]
-        anchor_kpt_weight = gt_kpt_weight[batch_idx, target_gt_idx.clamp(min=0)]
-        anchor_attr_weight = gt_attr_weight[batch_idx, target_gt_idx.clamp(min=0)]
+        if gt_box_weight.shape[1] == 0:
+            anchor_shape = target_gt_idx.shape
+            anchor_box_weight = torch.zeros(anchor_shape, device=device)
+            anchor_kpt_weight = torch.zeros(anchor_shape, device=device)
+            anchor_attr_weight = torch.zeros(anchor_shape, device=device)
+        else:
+            safe_gt_idx = target_gt_idx.clamp(min=0)
+            anchor_box_weight = gt_box_weight[batch_idx, safe_gt_idx]
+            anchor_kpt_weight = gt_kpt_weight[batch_idx, safe_gt_idx]
+            anchor_attr_weight = gt_attr_weight[batch_idx, safe_gt_idx]
         sample_cls_weight = torch.zeros(batch_size, 1, 1, device=device)
         for b, gt in enumerate(gt_dict_list):
             sample_cls_weight[b] = float(gt.get("_person_box_weight", 1.0))
