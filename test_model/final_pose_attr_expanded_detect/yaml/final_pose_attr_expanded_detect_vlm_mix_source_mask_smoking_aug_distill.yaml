@@ -123,7 +123,7 @@ batch_sampling:
   mode: single_random_concat
 
 training:
-  init_weights: checkpoints/dual_exp_det_distill/bifpn_dual/bifpn_dual_pose_best.pt
+  init_weights: /root/detect/checkpoints/final_pose_attr_expanded_detect_vlm_mix_source_mask/adapter_alignment/final_pose_attr_adapter_alignment_best.pt
   skip_init_prefixes: [attr_head]
   save_dir: checkpoints/final_pose_attr_expanded_detect_vlm_mix_source_mask_smoking_aug_distill
   batch_size: 32
@@ -162,7 +162,7 @@ training:
 
   distillation:
     enabled: true
-    teacher_weights: checkpoints/final_pose_attr_expanded_detect_vlm_mix_source_mask_smoking_gp/adapter_alignment/final_pose_attr_adapter_alignment_best.pt
+    teacher_weights: /root/detect/checkpoints/final_pose_attr_expanded_detect_vlm_mix_source_mask/adapter_alignment/final_pose_attr_adapter_alignment_best.pt
     pose:
       enabled: true
       confidence_threshold: 0.25
