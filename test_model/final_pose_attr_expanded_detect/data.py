@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import random
 from pathlib import Path
 
 import torch
@@ -64,14 +65,60 @@ def _relative_image(root: Path, image_path) -> str:
 
 class DetectDataset(BaseDetectDataset):
     def __init__(self, *args, domain_valid_class_ids=None,
-                 supervision_manifest=None, domain_num_classes=7, **kwargs):
+                 supervision_manifest=None, domain_num_classes=7,
+                 group_augmentation=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.domain_num_classes = int(domain_num_classes)
         self._static_domain_mask = _class_mask(domain_valid_class_ids or [1, 2, 3, 4, 7], self.domain_num_classes)
         self._supervision_manifest = _load_manifest(self.root, supervision_manifest)
+        self._group_augmentation = {
+            str(group): dict(values or {})
+            for group, values in (group_augmentation or {}).items()
+        }
+        self._mosaic_groups = {}
+        for index, sample in enumerate(self.samples):
+            record = self._supervision_manifest.get(_relative_image(self.root, sample.image))
+            if record is not None:
+                self._mosaic_groups.setdefault(str(record.get("source_group", "")), []).append(index)
+
+    def _mosaic_sample_indices(self, idx):
+        if not self._mosaic_groups:
+            return super()._mosaic_sample_indices(idx)
+        record = self._supervision_manifest.get(_relative_image(self.root, self.samples[idx].image))
+        group = str((record or {}).get("source_group", ""))
+        candidates = self._mosaic_groups.get(group) or [idx]
+        return [idx] + [random.choice(candidates) for _ in range(3)]
+
+    def _group_name(self, idx):
+        record = self._supervision_manifest.get(
+            _relative_image(self.root, self.samples[idx].image)
+        )
+        return str((record or {}).get("source_group", ""))
 
     def __getitem__(self, idx):
-        item = super().__getitem__(idx)
+        overrides = self._group_augmentation.get(self._group_name(idx), {})
+        if not overrides:
+            item = super().__getitem__(idx)
+        else:
+            keys = (
+                "mosaic_prob",
+                "zoom_out_prob",
+                "zoom_out_min_scale",
+                "zoom_out_max_scale",
+                "degrees",
+                "translate",
+                "scale",
+                "flip_lr",
+            )
+            original = {key: getattr(self, key) for key in keys}
+            try:
+                for key, value in overrides.items():
+                    if key in original:
+                        setattr(self, key, float(value))
+                item = super().__getitem__(idx)
+            finally:
+                for key, value in original.items():
+                    setattr(self, key, value)
         record = self._supervision_manifest.get(_relative_image(self.root, self.samples[idx].image))
         if record is None:
             if self._supervision_manifest:
@@ -167,6 +214,13 @@ def make_loader(dataset, batch_size, workers, shuffle=True, weights=None, drop_l
     )
 
 
+class CloseMosaicConcatDataset(ConcatDataset):
+    def set_close_mosaic(self, close: bool = False):
+        for dataset in self.datasets:
+            if hasattr(dataset, "set_close_mosaic"):
+                dataset.set_close_mosaic(close)
+
+
 def _detect_source_configs(detect_cfg: dict) -> list[dict]:
     sources = detect_cfg.get("sources")
     if sources:
@@ -176,6 +230,9 @@ def _detect_source_configs(detect_cfg: dict) -> list[dict]:
 
 def _build_detect_dataset(source_cfg: dict, input_size: int, augment_cfg: dict, split_policy: dict, split: str):
     det_root = _resolve_root(source_cfg["root"])
+    source_aug = dict(augment_cfg)
+    source_aug.update(source_cfg.get("augmentation", {}) or {})
+    group_aug = source_cfg.get("group_augmentation")
     dataset = DetectDataset(
         det_root,
         source_cfg.get("images", "train/images" if split == "train" else "valid/images"),
@@ -185,7 +242,8 @@ def _build_detect_dataset(source_cfg: dict, input_size: int, augment_cfg: dict, 
         domain_valid_class_ids=source_cfg.get("valid_class_ids", [1, 2, 3, 4, 7]),
         supervision_manifest=source_cfg.get("supervision_manifest"),
         domain_num_classes=7,
-        **augment_cfg,
+        group_augmentation=group_aug,
+        **source_aug,
     )
     test_ds = _make_optional_dataset(
         DetectDataset,
@@ -197,7 +255,8 @@ def _build_detect_dataset(source_cfg: dict, input_size: int, augment_cfg: dict, 
         domain_valid_class_ids=source_cfg.get("valid_class_ids", [1, 2, 3, 4, 7]),
         supervision_manifest=source_cfg.get("supervision_manifest"),
         domain_num_classes=7,
-        **augment_cfg,
+        group_augmentation=group_aug,
+        **source_aug,
     )
     return _apply_test_dataset_policy(
         dataset,
@@ -226,7 +285,7 @@ def build_final_train_loader(cfg: dict):
         _build_detect_dataset(source, input_size, detect_aug, split_policy, "train")
         for source in detect_sources
     ]
-    detect_ds = detect_parts[0] if len(detect_parts) == 1 else ConcatDataset(detect_parts)
+    detect_ds = detect_parts[0] if len(detect_parts) == 1 else CloseMosaicConcatDataset(detect_parts)
     attr_ds = AttrDataset(
         _resolve_root(train_cfg["attr"]["root"]),
         split=train_cfg["attr"].get("split", "train"),
@@ -237,37 +296,43 @@ def build_final_train_loader(cfg: dict):
         domain_num_classes=7,
         **attr_aug,
     )
-    pose_root = _resolve_root(train_cfg["pose"]["root"])
-    pose_ds = PoseDataset(
-        pose_root,
-        train_cfg["pose"].get("images", "train2017"),
-        train_cfg["pose"].get("labels", "labels/train2017"),
-        input_size=input_size,
-        source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
-        domain_valid_class_ids=train_cfg["pose"].get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
-        domain_num_classes=7,
-        **pose_aug,
-    )
-    pose_test_ds = _make_optional_dataset(
-        PoseDataset,
-        pose_root,
-        train_cfg["pose"].get("test_images", "test2017"),
-        train_cfg["pose"].get("test_labels", "labels_person/test2017"),
-        input_size=input_size,
-        source_class_format=train_cfg["pose"].get("class_id_format", "yolo80"),
-        domain_valid_class_ids=train_cfg["pose"].get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
-        domain_num_classes=7,
-        **pose_aug,
-    )
-    pose_ds = _apply_test_dataset_policy(
-        pose_ds,
-        pose_test_ds,
-        "train",
-        split_policy,
-        salt="pose",
-    )
+    train_parts = [detect_ds, attr_ds]
+    pose_cfg = train_cfg.get("pose", {}) or {}
+    if pose_cfg.get("enabled", True):
+        pose_root = _resolve_root(pose_cfg["root"])
+        pose_ds = PoseDataset(
+            pose_root,
+            pose_cfg.get("images", "train2017"),
+            pose_cfg.get("labels", "labels/train2017"),
+            input_size=input_size,
+            source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+            domain_valid_class_ids=pose_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+            domain_num_classes=7,
+            **pose_aug,
+        )
+        pose_test_ds = _make_optional_dataset(
+            PoseDataset,
+            pose_root,
+            pose_cfg.get("test_images", "test2017"),
+            pose_cfg.get("test_labels", "labels_person/test2017"),
+            input_size=input_size,
+            source_class_format=pose_cfg.get("class_id_format", "yolo80"),
+            domain_valid_class_ids=pose_cfg.get("domain_valid_class_ids", [1, 2, 3, 4, 7]),
+            domain_num_classes=7,
+            **pose_aug,
+        )
+        pose_ds = _apply_test_dataset_policy(
+            pose_ds,
+            pose_test_ds,
+            "train",
+            split_policy,
+            salt="pose",
+        )
+        train_parts.append(pose_ds)
+    else:
+        pose_ds = None
 
-    combined = ConcatDataset([detect_ds, attr_ds, pose_ds])
+    combined = CloseMosaicConcatDataset(train_parts)
     loader = make_loader(
         combined,
         batch_size,
@@ -279,7 +344,7 @@ def build_final_train_loader(cfg: dict):
     print(
         "PoseAttr train samples: "
         f"combined={len(combined)} detect={len(detect_ds)} "
-        f"attr={len(attr_ds)} pose={len(pose_ds)}"
+        f"attr={len(attr_ds)} pose={len(pose_ds) if pose_ds is not None else 0}"
     )
     if len(detect_parts) > 1:
         print(
@@ -326,7 +391,7 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
                 "val",
             ))
     if det_parts:
-        tasks["detect"] = det_parts[0] if len(det_parts) == 1 else ConcatDataset(det_parts)
+        tasks["detect"] = det_parts[0] if len(det_parts) == 1 else CloseMosaicConcatDataset(det_parts)
         order.append("detect")
 
     attr_cfg = _merge_task_cfg(train_cfg.get("attr", {}), val_cfg.get("attr", {}))
@@ -346,10 +411,14 @@ def build_final_val_loader(cfg: dict) -> FinalSequentialValLoader:
         order.append("attr")
 
     pose_cfg = _merge_task_cfg(train_cfg.get("pose", {}), val_cfg.get("pose", {}))
-    pose_root = _resolve_root(pose_cfg.get("root", ""))
-    pose_img = pose_cfg.get("images", "val2017")
-    pose_lbl = pose_cfg.get("labels", "labels/val2017")
-    if (pose_root / pose_img).exists() and (pose_root / pose_lbl).exists():
+    pose_root = None
+    pose_img = None
+    pose_lbl = None
+    if pose_cfg.get("enabled", True):
+        pose_root = _resolve_root(pose_cfg.get("root", ""))
+        pose_img = pose_cfg.get("images", "val2017")
+        pose_lbl = pose_cfg.get("labels", "labels/val2017")
+    if pose_cfg.get("enabled", True) and pose_root is not None and (pose_root / pose_img).exists() and (pose_root / pose_lbl).exists():
         pose_base = PoseDataset(
             pose_root,
             pose_img,

@@ -595,6 +595,19 @@ class DomainPoseAttrBiFPN(nn.Module):
     def _forward_features(self, x):
         return self.neck(self.backbone(x))
 
+    def forward_pose_outputs(self, x, return_features=False):
+        """Run only the person/pose branch used by teacher distillation."""
+        neck_feats = self._forward_features(x)
+        pose_feats = [adapter(feat) for adapter, feat in zip(self.pose_adapter, neck_feats)]
+        out = self.pose_head(pose_feats)
+        if return_features:
+            return {
+                "out": out,
+                "neck_feats": neck_feats,
+                "pose_feats": pose_feats,
+            }
+        return out
+
     def forward(self, x):
         neck_feats = self._forward_features(x)
         det_feats = [adapter(feat) for adapter, feat in zip(self.det_adapter, neck_feats)]
@@ -797,6 +810,10 @@ class DomainPoseAttrBiFPN(nn.Module):
             "task_w_pose": torch.tensor(self.pose_task_weight, device=device),
             "task_w_attr": torch.tensor(self.attr_task_weight if self.train_attr else 0.0, device=device),
         }
+        if self.training:
+            # Reuse the graph-connected pose outputs for teacher distillation;
+            # the trainer will run the frozen teacher only once per batch.
+            result["_distill_pose_out"] = outs["pose"]
         for idx, class_name in enumerate(self.domain_class_names):
             result[f"det_cls_{class_name}"] = class_metrics.get("cls", class_zero)[idx].detach()
             result[f"det_valid_images_{class_name}"] = class_metrics.get("valid_images", class_zero)[idx].detach()

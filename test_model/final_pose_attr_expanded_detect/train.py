@@ -102,6 +102,16 @@ def set_trainable(model, trainable_roots: list[str] | None):
     ]
 
 
+def _deep_merge_dict(base: dict | None, override: dict | None) -> dict:
+    merged = copy.deepcopy(base or {})
+    for key, value in (override or {}).items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_merge_dict(merged[key], value)
+        else:
+            merged[key] = copy.deepcopy(value)
+    return merged
+
+
 def apply_stage(model, stage, cfg):
     model.train_domain_det = bool(stage.get("train_detect", True))
     model.train_det = model.train_domain_det
@@ -156,7 +166,7 @@ def build_model(cfg):
     )
 
 
-def build_trainer(model, cfg, device, stage, save_dir):
+def build_trainer(model, cfg, device, stage, save_dir, distill_teacher=None, distill_cfg=None):
     train_cfg = cfg["training"]
     projection_cfg = train_cfg.get("gradient_projection", {}) or {}
     return Trainer(
@@ -210,6 +220,8 @@ def build_trainer(model, cfg, device, stage, save_dir):
         pomsi_static=projection_cfg.get("static", False),
         cagrad_c=projection_cfg.get("cagrad_c", 0.5),
         gradnorm_alpha=projection_cfg.get("gradnorm_alpha", 1.0),
+        distill_teacher=distill_teacher,
+        distill_cfg=distill_cfg,
     )
 
 
@@ -267,6 +279,19 @@ def main():
     model.set_attr_pos_weight([float(pos_cfg.get(name, 1.0)) for name in names])
     model.attr_loss_weight = float(loss_cfg.get("w_attr", 1.0))
 
+    distill_cfg = copy.deepcopy(cfg["training"].get("distillation", {}) or {})
+    distill_teacher = None
+    if distill_cfg.get("enabled", False):
+        teacher_weights = distill_cfg.get("teacher_weights")
+        if not teacher_weights:
+            raise ValueError("training.distillation.teacher_weights is required when distillation is enabled")
+        distill_teacher = build_model(cfg).to(device)
+        load_model_weights(distill_teacher, teacher_weights, device, skip_prefixes=())
+        for param in distill_teacher.parameters():
+            param.requires_grad = False
+        distill_teacher.eval()
+        print(f"[distill] loaded frozen teacher: {teacher_weights}")
+
     train_loader = build_final_train_loader(cfg)
     val_loader = None
     if cfg.get("data", {}).get("val"):
@@ -287,6 +312,7 @@ def main():
         stage = copy.deepcopy(stage_in)
         name = stage.get("name", f"stage{index}")
         apply_stage(model, stage, cfg)
+        stage_distill_cfg = _deep_merge_dict(distill_cfg, stage.get("distillation", {}) or {})
         trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
         total = sum(p.numel() for p in model.parameters())
         print()
@@ -303,13 +329,24 @@ def main():
         )
         print("=" * 70)
 
-        trainer = build_trainer(model, cfg, device, stage, base_save / name)
+        trainer = build_trainer(
+            model,
+            cfg,
+            device,
+            stage,
+            base_save / name,
+            distill_teacher=distill_teacher,
+            distill_cfg=stage_distill_cfg,
+        )
         trainer.fit(
             epochs=int(stage.get("epochs", 1)),
             train_loader=train_loader,
             val_loader=val_loader,
             save_prefix=f"final_pose_attr_{name}",
-            close_mosaic_epochs=0,
+            close_mosaic_epochs=int(stage.get(
+                "close_mosaic_epochs",
+                cfg["training"].get("close_mosaic_epochs", 0),
+            )),
         )
         best = base_save / name / f"final_pose_attr_{name}_best.pt"
         if best.exists():

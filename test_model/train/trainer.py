@@ -19,6 +19,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+from test_model.final.model.bifpn import _dfl_decode, _make_grid
+
 
 class Trainer:
     """Generic trainer for YOLOv8-based multi-head models.
@@ -400,6 +402,11 @@ class Trainer:
                 ('distill_cls', 'cls'),
                 ('distill_reg', 'reg'),
                 ('distill_feat', 'feat'),
+                ('distill_pose_total', 'pose_total'),
+                ('distill_pose_cls', 'pose_cls'),
+                ('distill_pose_box', 'pose_box'),
+                ('distill_pose_kpt', 'pose_kpt'),
+                ('distill_pose_kpt_obj', 'pose_kobj'),
             ]),
             ('misc', [
                 ('loss_total', 'loss'),
@@ -1030,35 +1037,152 @@ class Trainer:
             return torch.zeros((), device=student_feats[0].device)
         return feat_w * sum(losses) / len(losses)
 
+    @staticmethod
+    def _decode_pose_kpts(kpt_pred, stride):
+        bsz, _, h, w = kpt_pred.shape
+        n = h * w
+        raw = kpt_pred.float().permute(0, 2, 3, 1).reshape(bsz, n, -1, 3)
+        grid = _make_grid(w, h, kpt_pred.device).view(1, n, 1, 2)
+        xy = (raw[..., :2] * 2.0 + grid - 0.5) * stride
+        conf = raw[..., 2:3].sigmoid()
+        return torch.cat((xy, conf), dim=-1), raw
+
+    @staticmethod
+    def _decode_pose_boxes(reg_pred, reg_max, stride):
+        bsz, _, h, w = reg_pred.shape
+        grid = _make_grid(w, h, reg_pred.device) * stride
+        return _dfl_decode(reg_pred.float(), reg_max, stride, grid)
+
+    def _distill_pose_outputs(self, student_out, teacher_out, cfg):
+        cls_w = self._as_loss_weight(cfg, 'cls_weight', 0.0)
+        box_w = self._as_loss_weight(cfg, 'box_weight', self._as_loss_weight(cfg, 'reg_weight', 0.0))
+        kpt_w = self._as_loss_weight(cfg, 'kpt_weight', 0.0)
+        kpt_obj_w = self._as_loss_weight(cfg, 'kpt_obj_weight', 0.0)
+        confidence_threshold = self._as_loss_weight(cfg, 'confidence_threshold', 0.25)
+        if cls_w <= 0.0 and box_w <= 0.0 and kpt_w <= 0.0 and kpt_obj_w <= 0.0:
+            device = student_out['cls'][0].device
+            zero = torch.zeros((), device=device)
+            return zero, zero, zero, zero, zero
+
+        cls_loss = []
+        box_loss = []
+        kpt_loss = []
+        kpt_obj_loss = []
+        num_kpts = int(getattr(self.model, 'num_kpts', 17))
+        reg_max = int(getattr(self.model, 'reg_max', 16))
+        strides = list(getattr(self.model, 'strides', [8, 16, 32]))
+
+        for lvl, (s_cls, t_cls, s_reg, t_reg, s_kpt, t_kpt) in enumerate(zip(
+            student_out['cls'], teacher_out['cls'],
+            student_out['reg'], teacher_out['reg'],
+            student_out['kpt'], teacher_out['kpt'],
+        )):
+            if s_cls.shape != t_cls.shape or s_reg.shape != t_reg.shape or s_kpt.shape != t_kpt.shape:
+                continue
+            stride = float(strides[lvl] if lvl < len(strides) else strides[-1])
+            teacher_prob = t_cls.detach().float().sigmoid()
+            level_weight = (teacher_prob >= confidence_threshold).float() * teacher_prob
+            if level_weight.sum().item() <= 0:
+                continue
+            level_weight_sum = level_weight.sum().clamp(min=1.0)
+            level_weight_flat = level_weight.flatten(1)
+
+            if cls_w > 0.0:
+                cls_raw = F.binary_cross_entropy_with_logits(
+                    s_cls.float(),
+                    teacher_prob,
+                    reduction='none',
+                )
+                cls_loss.append((cls_raw * level_weight).sum() / level_weight_sum)
+
+            if box_w > 0.0:
+                s_box = self._decode_pose_boxes(s_reg, reg_max, stride)
+                t_box = self._decode_pose_boxes(t_reg, reg_max, stride).detach()
+                box_raw = F.smooth_l1_loss(s_box, t_box, reduction='none').mean(dim=-1)
+                box_loss.append((box_raw * level_weight_flat).sum() / level_weight_sum)
+
+            if kpt_w > 0.0 or kpt_obj_w > 0.0:
+                s_kpt_dec, s_kpt_raw = self._decode_pose_kpts(s_kpt, stride)
+                t_kpt_dec, t_kpt_raw = self._decode_pose_kpts(t_kpt, stride)
+                t_kpt_dec = t_kpt_dec.detach()
+                t_kpt_raw = t_kpt_raw.detach()
+                if kpt_w > 0.0:
+                    vis_weight = level_weight_flat.unsqueeze(-1) * t_kpt_dec[..., 2].clamp(min=0.0, max=1.0)
+                    xy_raw = F.smooth_l1_loss(
+                        s_kpt_dec[..., :2],
+                        t_kpt_dec[..., :2],
+                        reduction='none',
+                    ).mean(dim=-1)
+                    kpt_loss.append((xy_raw * vis_weight).sum() / vis_weight.sum().clamp(min=1.0))
+                if kpt_obj_w > 0.0:
+                    obj_raw = F.binary_cross_entropy_with_logits(
+                        s_kpt_raw[..., 2],
+                        t_kpt_raw[..., 2].sigmoid(),
+                        reduction='none',
+                    )
+                    obj_weight = level_weight_flat.unsqueeze(-1).expand_as(obj_raw)
+                    kpt_obj_loss.append((obj_raw * obj_weight).sum() / obj_weight.sum().clamp(min=1.0))
+
+        device = student_out['cls'][0].device
+        zero = torch.zeros((), device=device)
+        cls_loss_t = zero if not cls_loss else sum(cls_loss) / len(cls_loss)
+        box_loss_t = zero if not box_loss else sum(box_loss) / len(box_loss)
+        kpt_loss_t = zero if not kpt_loss else sum(kpt_loss) / len(kpt_loss)
+        kpt_obj_loss_t = zero if not kpt_obj_loss else sum(kpt_obj_loss) / len(kpt_obj_loss)
+        total = cls_w * cls_loss_t + box_w * box_loss_t + kpt_w * kpt_loss_t + kpt_obj_w * kpt_obj_loss_t
+        return total, cls_loss_t.detach(), box_loss_t.detach(), kpt_loss_t.detach(), kpt_obj_loss_t.detach()
+
     def _apply_distillation(self, images, losses):
         cfg = self.distill_cfg or {}
         if not cfg.get('enabled', False) or self.distill_teacher is None:
             return losses
-        if not hasattr(self.model, 'forward_det_outputs'):
-            return losses
-
-        det_cfg = cfg.get('det', {}) or {}
-        if not det_cfg.get('enabled', True):
-            return losses
-
         teacher = self.distill_teacher
         teacher.eval()
-        with torch.no_grad():
-            teacher_data = teacher.forward_det_outputs(images, return_features=True)
-        student_data = {
-            'out': losses.get('_distill_det_out'),
-            'det_feats': losses.get('_distill_det_feats', []),
-        }
-        if student_data['out'] is None:
-            student_data = self.model.forward_det_outputs(images, return_features=True)
-        out_total, cls_loss, reg_loss = self._distill_detect_outputs(
-            student_data['out'], teacher_data['out'], det_cfg)
-        feat_loss = self._distill_features(
-            student_data.get('det_feats', []),
-            teacher_data.get('det_feats', []),
-            det_cfg,
-        )
-        total = (out_total + feat_loss) * max(int(images.shape[0]), 1)
+        batch_size = max(int(images.shape[0]), 1)
+        total = torch.zeros((), device=images.device)
+
+        det_cfg = cfg.get('det', {}) or {}
+        if det_cfg.get('enabled', False) and hasattr(self.model, 'forward_det_outputs') and hasattr(teacher, 'forward_det_outputs'):
+            with torch.no_grad():
+                teacher_data = teacher.forward_det_outputs(images, return_features=True)
+            student_data = {
+                'out': losses.get('_distill_det_out'),
+                'det_feats': losses.get('_distill_det_feats', []),
+            }
+            if student_data['out'] is None:
+                student_data = self.model.forward_det_outputs(images, return_features=True)
+            out_total, cls_loss, reg_loss = self._distill_detect_outputs(
+                student_data['out'], teacher_data['out'], det_cfg)
+            feat_loss = self._distill_features(
+                student_data.get('det_feats', []),
+                teacher_data.get('det_feats', []),
+                det_cfg,
+            )
+            det_total = (out_total + feat_loss) * batch_size
+            if det_total.detach().abs().item() > 0.0:
+                total = total + det_total
+                losses['distill_cls'] = cls_loss.detach()
+                losses['distill_reg'] = reg_loss.detach()
+                losses['distill_feat'] = feat_loss.detach()
+
+        pose_cfg = cfg.get('pose', {}) or {}
+        if pose_cfg.get('enabled', False) and hasattr(self.model, 'forward_pose_outputs') and hasattr(teacher, 'forward_pose_outputs'):
+            with torch.no_grad():
+                teacher_pose = teacher.forward_pose_outputs(images, return_features=False)
+            student_pose = losses.get('_distill_pose_out')
+            if student_pose is None:
+                student_pose = self.model.forward_pose_outputs(images, return_features=False)
+            pose_total, pose_cls, pose_box, pose_kpt, pose_kpt_obj = self._distill_pose_outputs(
+                student_pose, teacher_pose, pose_cfg)
+            pose_total = pose_total * batch_size
+            if pose_total.detach().abs().item() > 0.0:
+                total = total + pose_total
+                losses['distill_pose_total'] = pose_total.detach()
+                losses['distill_pose_cls'] = pose_cls.detach()
+                losses['distill_pose_box'] = pose_box.detach()
+                losses['distill_pose_kpt'] = pose_kpt.detach()
+                losses['distill_pose_kpt_obj'] = pose_kpt_obj.detach()
+
         if total.detach().abs().item() == 0.0:
             return losses
 
@@ -1066,9 +1190,6 @@ class Trainer:
         if isinstance(losses.get('_gp_det_loss'), torch.Tensor):
             losses['_gp_det_loss'] = losses['_gp_det_loss'] + total
         losses['distill_total'] = total.detach()
-        losses['distill_cls'] = cls_loss.detach()
-        losses['distill_reg'] = reg_loss.detach()
-        losses['distill_feat'] = feat_loss.detach()
         return losses
 
     def train_epoch(self, loader, max_epochs, epoch, close_mosaic=None):
