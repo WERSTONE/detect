@@ -195,9 +195,16 @@ class FinalBaseDataset(Dataset):
         hsv_h: float = 0.015,
         hsv_s: float = 0.7,
         hsv_v: float = 0.4,
+        degrees: float = 0.0,
         translate: float = 0.05,
         scale: float = 0.1,
         flip_lr: float = 0.5,
+        require_full_boxes: bool = False,
+        affine_retries: int = 8,
+        zoom_out_prob: float = 0.0,
+        zoom_out_min_scale: float = 1.0,
+        zoom_out_max_scale: float = 1.0,
+        mosaic_prob: float = 0.0,
         task: str = "",
     ):
         self.root = Path(root)
@@ -208,9 +215,17 @@ class FinalBaseDataset(Dataset):
         self.hsv_h = float(hsv_h)
         self.hsv_s = float(hsv_s)
         self.hsv_v = float(hsv_v)
+        self.degrees = float(degrees)
         self.translate = float(translate)
         self.scale = float(scale)
         self.flip_lr = float(flip_lr)
+        self.require_full_boxes = bool(require_full_boxes)
+        self.affine_retries = max(int(affine_retries), 1)
+        self.zoom_out_prob = max(0.0, min(1.0, float(zoom_out_prob)))
+        self.zoom_out_min_scale = max(0.05, min(1.0, float(zoom_out_min_scale)))
+        self.zoom_out_max_scale = max(self.zoom_out_min_scale, min(1.0, float(zoom_out_max_scale)))
+        self.mosaic_prob = max(0.0, min(1.0, float(mosaic_prob)))
+        self._mosaic_enabled = True
         self.task = task
         self.samples = self._collect_samples()
         if not self.samples:
@@ -227,19 +242,23 @@ class FinalBaseDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def set_close_mosaic(self, close: bool = False):
+        self._mosaic_enabled = not bool(close)
+
     def _load_image(self, path: Path) -> np.ndarray:
         image = cv2.imread(str(path))
         if image is None:
             raise RuntimeError(f"Cannot read image: {path}")
         return cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
 
-    def _letterbox(self, image, boxes, kpts):
+    def _letterbox(self, image, boxes, kpts, size=None):
+        size = int(size or self.input_size)
         h, w = image.shape[:2]
-        scale = min(self.input_size / w, self.input_size / h)
+        scale = min(size / w, size / h)
         new_w, new_h = int(round(w * scale)), int(round(h * scale))
         image = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
-        pad_w = self.input_size - new_w
-        pad_h = self.input_size - new_h
+        pad_w = size - new_w
+        pad_h = size - new_h
         pad_l, pad_t = pad_w // 2, pad_h // 2
         image = cv2.copyMakeBorder(
             image,
@@ -260,65 +279,113 @@ class FinalBaseDataset(Dataset):
             kpts[..., 1] = kpts[..., 1] * scale + pad_t
         return image, boxes, kpts, scale, (pad_l, pad_t)
 
-    def _augment_basic(self, image, boxes, kpts, allow_attr_sensitive=True):
-        h, w = image.shape[:2]
-        image, boxes, kpts, scale, pad = self._letterbox(image, boxes, kpts)
-
-        if self.augment:
-            image = self._hsv(image)
-            if self.flip_lr > 0 and random.random() < self.flip_lr:
-                image = image[:, ::-1].copy()
-                if len(boxes):
-                    old_x1 = boxes[:, 0].copy()
-                    old_x2 = boxes[:, 2].copy()
-                    boxes[:, 0] = self.input_size - old_x2
-                    boxes[:, 2] = self.input_size - old_x1
-                if len(kpts):
-                    kpts[..., 0] = self.input_size - kpts[..., 0]
-                    kpts = kpts[:, KPT_FLIP_MAP]
-
-            # Attr samples use only safe, full-image translation/scale. No crop,
-            # CutMix, or object paste is applied here.
-            if allow_attr_sensitive and (self.translate > 0 or self.scale > 0):
-                image, boxes, kpts = self._safe_affine(image, boxes, kpts)
-
+    def _augment_basic(self, image, boxes, kpts, allow_attr_sensitive=True, already_letterboxed=False):
+        if already_letterboxed:
+            scale, pad = 1.0, (0, 0)
+        else:
+            image, boxes, kpts, scale, pad = self._letterbox(image, boxes, kpts)
+        image, boxes, kpts = self._augment_post_letterbox(
+            image, boxes, kpts, allow_attr_sensitive=allow_attr_sensitive
+        )
         return image, boxes, kpts, scale, pad
+
+    def _augment_post_letterbox(self, image, boxes, kpts, allow_attr_sensitive=True):
+        if not self.augment:
+            return image, boxes, kpts
+
+        image = self._hsv(image)
+        if self.flip_lr > 0 and random.random() < self.flip_lr:
+            image = image[:, ::-1].copy()
+            if len(boxes):
+                old_x1 = boxes[:, 0].copy()
+                old_x2 = boxes[:, 2].copy()
+                boxes[:, 0] = self.input_size - old_x2
+                boxes[:, 2] = self.input_size - old_x1
+            if len(kpts):
+                kpts[..., 0] = self.input_size - kpts[..., 0]
+                kpts = kpts[:, KPT_FLIP_MAP]
+
+        if self.zoom_out_prob > 0 and random.random() < self.zoom_out_prob:
+            image, boxes, kpts = self._zoom_out(image, boxes, kpts)
+
+        if allow_attr_sensitive and (
+            self.degrees > 0 or self.translate > 0 or self.scale > 0
+        ):
+            image, boxes, kpts = self._safe_affine(image, boxes, kpts)
+        return image, boxes, kpts
 
     def _safe_affine(self, image, boxes, kpts):
         s = self.input_size
-        scale_factor = random.uniform(1.0 - self.scale, 1.0 + self.scale)
-        tx = random.uniform(-self.translate, self.translate) * s
-        ty = random.uniform(-self.translate, self.translate) * s
-        matrix = cv2.getRotationMatrix2D((s / 2, s / 2), 0.0, scale_factor)
-        matrix[0, 2] += tx
-        matrix[1, 2] += ty
-        image = cv2.warpAffine(image, matrix, (s, s), borderValue=(114, 114, 114))
-        if len(boxes):
-            corners = np.ones((len(boxes) * 4, 3), dtype=np.float32)
-            corners[:, :2] = boxes[:, [0, 1, 2, 1, 2, 3, 0, 3]].reshape(-1, 2)
-            warped = corners @ matrix.T
-            warped = warped.reshape(len(boxes), 8)
-            xs = warped[:, [0, 2, 4, 6]]
-            ys = warped[:, [1, 3, 5, 7]]
-            boxes[:, 0] = np.clip(xs.min(axis=1), 0, s - 1)
-            boxes[:, 1] = np.clip(ys.min(axis=1), 0, s - 1)
-            boxes[:, 2] = np.clip(xs.max(axis=1), 0, s - 1)
-            boxes[:, 3] = np.clip(ys.max(axis=1), 0, s - 1)
-        if len(kpts):
-            pts = np.ones((len(kpts) * 17, 3), dtype=np.float32)
-            pts[:, :2] = kpts[..., :2].reshape(-1, 2)
-            warped = (pts @ matrix.T).reshape(len(kpts), 17, 2)
-            kpts[..., :2] = warped
-            outside = (
-                (kpts[..., 0] < 0)
-                | (kpts[..., 0] > s - 1)
-                | (kpts[..., 1] < 0)
-                | (kpts[..., 1] > s - 1)
+        original = (image, boxes.copy(), kpts.copy())
+        for _ in range(self.affine_retries):
+            scale_factor = random.uniform(max(0.05, 1.0 - self.scale), 1.0 + self.scale)
+            angle = random.uniform(-self.degrees, self.degrees)
+            tx = random.uniform(-self.translate, self.translate) * s
+            ty = random.uniform(-self.translate, self.translate) * s
+            matrix = cv2.getRotationMatrix2D((s / 2, s / 2), angle, scale_factor)
+            matrix[0, 2] += tx
+            matrix[1, 2] += ty
+
+            warped_boxes = boxes.copy()
+            if len(boxes):
+                corners = np.ones((len(boxes) * 4, 3), dtype=np.float32)
+                corners[:, :2] = boxes[:, [0, 1, 2, 1, 2, 3, 0, 3]].reshape(-1, 2)
+                warped = (corners @ matrix.T).reshape(len(boxes), 8)
+                xs = warped[:, [0, 2, 4, 6]]
+                ys = warped[:, [1, 3, 5, 7]]
+                raw = np.stack([xs.min(axis=1), ys.min(axis=1), xs.max(axis=1), ys.max(axis=1)], axis=1)
+                if self.require_full_boxes and (
+                    np.any(raw[:, 0] < 0) or np.any(raw[:, 1] < 0)
+                    or np.any(raw[:, 2] > s - 1) or np.any(raw[:, 3] > s - 1)
+                ):
+                    continue
+                warped_boxes[:, 0] = np.clip(raw[:, 0], 0, s - 1)
+                warped_boxes[:, 1] = np.clip(raw[:, 1], 0, s - 1)
+                warped_boxes[:, 2] = np.clip(raw[:, 2], 0, s - 1)
+                warped_boxes[:, 3] = np.clip(raw[:, 3], 0, s - 1)
+
+            warped_kpts = kpts.copy()
+            if len(kpts):
+                pts = np.ones((len(kpts) * 17, 3), dtype=np.float32)
+                pts[:, :2] = kpts[..., :2].reshape(-1, 2)
+                warped_pts = (pts @ matrix.T).reshape(len(kpts), 17, 2)
+                warped_kpts[..., :2] = warped_pts
+                outside = (
+                    (warped_kpts[..., 0] < 0) | (warped_kpts[..., 0] > s - 1)
+                    | (warped_kpts[..., 1] < 0) | (warped_kpts[..., 1] > s - 1)
+                )
+                warped_kpts[..., 2] = np.where(outside, 0.0, warped_kpts[..., 2])
+                warped_kpts[..., 0] = np.clip(warped_kpts[..., 0], 0, s - 1)
+                warped_kpts[..., 1] = np.clip(warped_kpts[..., 1], 0, s - 1)
+
+            warped_image = cv2.warpAffine(
+                image, matrix, (s, s), borderValue=(114, 114, 114)
             )
-            kpts[..., 2] = np.where(outside, 0.0, kpts[..., 2])
-            kpts[..., 0] = np.clip(kpts[..., 0], 0, s - 1)
-            kpts[..., 1] = np.clip(kpts[..., 1], 0, s - 1)
-        return image, boxes, kpts
+            return warped_image, warped_boxes, warped_kpts
+        return original
+
+    def _zoom_out(self, image, boxes, kpts):
+        s = self.input_size
+        factor = random.uniform(self.zoom_out_min_scale, self.zoom_out_max_scale)
+        resized = cv2.resize(
+            image, (max(1, round(s * factor)), max(1, round(s * factor))),
+            interpolation=cv2.INTER_AREA if factor < 1.0 else cv2.INTER_LINEAR,
+        )
+        h, w = resized.shape[:2]
+        max_x, max_y = s - w, s - h
+        left = random.randint(0, max(max_x, 0))
+        top = random.randint(0, max(max_y, 0))
+        canvas = np.full_like(image, 114)
+        canvas[top:top + h, left:left + w] = resized
+        boxes = boxes.copy()
+        if len(boxes):
+            boxes[:, [0, 2]] = boxes[:, [0, 2]] * factor + left
+            boxes[:, [1, 3]] = boxes[:, [1, 3]] * factor + top
+        kpts = kpts.copy()
+        if len(kpts):
+            kpts[..., 0] = kpts[..., 0] * factor + left
+            kpts[..., 1] = kpts[..., 1] * factor + top
+        return canvas, boxes, kpts
 
     def _hsv(self, image):
         if max(abs(self.hsv_h), abs(self.hsv_s), abs(self.hsv_v)) <= 0:
@@ -399,7 +466,7 @@ class DetectDataset(FinalBaseDataset):
         mean = sum(weights) / max(len(weights), 1)
         return [w / max(mean, 1e-12) for w in weights]
 
-    def __getitem__(self, idx):
+    def _load_detect_arrays(self, idx):
         ref = self.samples[idx]
         image = self._load_image(ref.image)
         h, w = image.shape[:2]
@@ -415,7 +482,60 @@ class DetectDataset(FinalBaseDataset):
         kpts = np.zeros((len(boxes), 17, 3), dtype=np.float32)
         attrs = np.zeros((len(boxes), 4), dtype=np.float32)
         attr_mask = np.zeros((len(boxes), 4), dtype=np.float32)
-        image, boxes, kpts, scale, pad = self._augment_basic(image, boxes, kpts, allow_attr_sensitive=True)
+        return ref, image, boxes, classes, kpts, attrs, attr_mask
+
+    def _mosaic_sample_indices(self, idx) -> list[int]:
+        return [idx] + random.choices(range(len(self.samples)), k=3)
+
+    def _load_mosaic(self, idx):
+        size = self.input_size
+        tile = size // 2
+        canvas = np.full((size, size, 3), 114, dtype=np.uint8)
+        all_boxes, all_classes = [], []
+        offsets = ((0, 0), (tile, 0), (0, tile), (tile, tile))
+        indices = self._mosaic_sample_indices(idx)
+        ref = self.samples[idx]
+        for sample_idx, (off_x, off_y) in zip(indices, offsets):
+            _, image, boxes, classes, kpts, _, _ = self._load_detect_arrays(sample_idx)
+            image, boxes, _kpts, _scale, _pad = self._letterbox(image, boxes, kpts, size=tile)
+            canvas[off_y:off_y + tile, off_x:off_x + tile] = image
+            if len(boxes):
+                boxes = boxes.copy()
+                boxes[:, [0, 2]] += off_x
+                boxes[:, [1, 3]] += off_y
+                all_boxes.append(boxes)
+                all_classes.append(classes)
+        boxes = (
+            np.concatenate(all_boxes, axis=0).astype(np.float32)
+            if all_boxes else np.zeros((0, 4), dtype=np.float32)
+        )
+        classes = (
+            np.concatenate(all_classes, axis=0).astype(np.int64)
+            if all_classes else np.zeros((0,), dtype=np.int64)
+        )
+        kpts = np.zeros((len(boxes), 17, 3), dtype=np.float32)
+        attrs = np.zeros((len(boxes), 4), dtype=np.float32)
+        attr_mask = np.zeros((len(boxes), 4), dtype=np.float32)
+        return ref, canvas, boxes, classes, kpts, attrs, attr_mask
+
+    def __getitem__(self, idx):
+        use_mosaic = (
+            self.augment
+            and self._mosaic_enabled
+            and self.mosaic_prob > 0
+            and len(self.samples) >= 4
+            and random.random() < self.mosaic_prob
+        )
+        if use_mosaic:
+            ref, image, boxes, classes, kpts, attrs, attr_mask = self._load_mosaic(idx)
+            image, boxes, kpts, scale, pad = self._augment_basic(
+                image, boxes, kpts, allow_attr_sensitive=True, already_letterboxed=True
+            )
+        else:
+            ref, image, boxes, classes, kpts, attrs, attr_mask = self._load_detect_arrays(idx)
+            image, boxes, kpts, scale, pad = self._augment_basic(
+                image, boxes, kpts, allow_attr_sensitive=True
+            )
         return self._to_sample(image, boxes, classes, kpts, attrs, attr_mask, ref, scale, pad)
 
 
@@ -882,7 +1002,21 @@ def build_final_train_loader(cfg: dict):
     return loader
 
 
-_NO_AUG = dict(hsv_h=0.0, hsv_s=0.0, hsv_v=0.0, translate=0.0, scale=0.0, flip_lr=0.0)
+_NO_AUG = dict(
+    hsv_h=0.0,
+    hsv_s=0.0,
+    hsv_v=0.0,
+    degrees=0.0,
+    translate=0.0,
+    scale=0.0,
+    flip_lr=0.0,
+    require_full_boxes=False,
+    affine_retries=1,
+    zoom_out_prob=0.0,
+    zoom_out_min_scale=1.0,
+    zoom_out_max_scale=1.0,
+    mosaic_prob=0.0,
+)
 
 
 def _merge_task_cfg(train_cfg: dict, val_cfg: dict) -> dict:
