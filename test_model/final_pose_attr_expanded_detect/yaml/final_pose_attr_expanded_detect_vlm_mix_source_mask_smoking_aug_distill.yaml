@@ -165,11 +165,11 @@ training:
     teacher_weights: /root/detect/checkpoints/final_pose_attr_expanded_detect_vlm_mix_source_mask/adapter_alignment/final_pose_attr_adapter_alignment_best.pt
     pose:
       enabled: true
-      confidence_threshold: 0.25
-      cls_weight: 0.10
-      box_weight: 0.25
-      kpt_weight: 0.25
-      kpt_obj_weight: 0.10
+      confidence_threshold: 0.35
+      cls_weight: 0.03
+      box_weight: 0.08
+      kpt_weight: 0.08
+      kpt_obj_weight: 0.02
 
   stages:
     - name: new_attr_branches
@@ -258,11 +258,11 @@ training:
         enabled: true
         pose:
           enabled: true
-          confidence_threshold: 0.25
-          cls_weight: 0.10
-          box_weight: 0.25
-          kpt_weight: 0.25
-          kpt_obj_weight: 0.10
+          confidence_threshold: 0.35
+          cls_weight: 0.03
+          box_weight: 0.08
+          kpt_weight: 0.08
+          kpt_obj_weight: 0.02
 
     - name: guarded_backbone
       epochs: 50
@@ -289,11 +289,11 @@ training:
         enabled: true
         pose:
           enabled: true
-          confidence_threshold: 0.25
-          cls_weight: 0.08
-          box_weight: 0.20
-          kpt_weight: 0.20
-          kpt_obj_weight: 0.08
+          confidence_threshold: 0.35
+          cls_weight: 0.03
+          box_weight: 0.08
+          kpt_weight: 0.08
+          kpt_obj_weight: 0.02
 
 loss:
   w_attr: 1.0
