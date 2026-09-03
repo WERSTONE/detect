@@ -316,7 +316,7 @@ loss:
     helmet_on: 2.0
 
 eval:
-  enabled: false
+  enabled: true
   batch_size: 16
   score_thresh: 0.01
   domain_conf: 0.25
